@@ -138,3 +138,7 @@ dmypy.json
 .pyre/
 
 .idea/
+
+./models/
+./replays/
+replay_datasets

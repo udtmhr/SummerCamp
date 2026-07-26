@@ -1,13 +1,9 @@
-import sys
-import time
 from functools import partial  # pip install functools
-import copy
-import random
 
 import numpy as np
-from gym import spaces
+from gymnasium import spaces
 
-from luxai2021.env.agent import Agent, AgentWithModel
+from luxai2021.env.agent import AgentWithModel
 from luxai2021.game.actions import *
 from luxai2021.game.game_constants import GAME_CONSTANTS
 from luxai2021.game.position import Position
@@ -572,4 +568,3 @@ class AgentPolicy(AgentWithModel):
         return
 
     
-

@@ -2,8 +2,7 @@ import math
 import random
 from typing import List
 
-from argparse import Namespace
-from ..env.rng.rng import get_n_values
+from ..env.rng.rng import SeededRandom
 from .cell import Cell
 from .constants import Constants
 from .position import Position
@@ -64,22 +63,11 @@ class GameMap:
         :param game:
         """
         
-        def js_rng(seed):
-            idx = 0
-            rng_values = get_n_values(seed, N=1000000)
-            def _rng():
-                nonlocal idx
-                ret = rng_values[idx]
-                idx += 1
-                return ret
-            return Namespace(**dict(random=_rng))
-        
-
         if self.configs["seed"] is not None:
             # Use a random number generator that exactly matches LuxAI. That way
             # the same seeds generate the exact same map.
             seed = self.configs["seed"]
-            rng = js_rng(seed)
+            rng = SeededRandom(seed)
         else:
             rng = random.Random()
 
@@ -618,7 +606,7 @@ class GameMap:
         for y in range(self.height):
             obj.append([])
             for x in range(self.width):
-                cell = self.get_cell(x, y);
+                cell = self.get_cell(x, y)
                 cell_data = {}
                 
                 if cell.get_road() != 0:

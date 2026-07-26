@@ -81,6 +81,7 @@ class MatchController:
         self.action_buffer = []
         self.game = game
         self.agents = agents
+        self.game.agents = agents
         self.replay_validate = replay_validate
 
         if len(agents) != 2:
@@ -91,7 +92,7 @@ class MatchController:
         for i, agent in enumerate(agents):
             if not (issubclass(type(agent), Agent) or isinstance(agent, Agent)):
                 raise ValueError("All agents must inherit from Agent.")
-            if agent.get_agent_type == Constants.AGENT_TYPE.LEARNING:
+            if agent.get_agent_type() == Constants.AGENT_TYPE.LEARNING:
                 self.training_agent_count += 1
 
             # Initialize agent
@@ -110,14 +111,14 @@ class MatchController:
         elif self.training_agent_count == 0:
             print("Running in inference-only mode.", file=sys.stderr)
 
-    def reset(self, reset_game=True, randomize_team_order=True):
+    def reset(self, reset_game=True, randomize_team_order=True, seed=None):
         """
 
         :return:
         """
         # Randomly re-assign teams of the agents
         if randomize_team_order:
-            r = random.randint(0, 1)
+            r = random.Random(seed).randint(0, 1) if seed is not None else random.randint(0, 1)
             self.agents[0].set_team(r)
             self.agents[1].set_team((r + 1) % 2)
 

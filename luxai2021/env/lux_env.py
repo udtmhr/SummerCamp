@@ -2,7 +2,7 @@
 Implements the base class for a Lux environment
 """
 import traceback
-import gym
+import gymnasium as gym
 import os
 from stable_baselines3.common.callbacks import BaseCallback
 
@@ -72,11 +72,12 @@ class SaveReplayAndModelCallback(BaseCallback):
 
 class LuxEnvironment(gym.Env):
     """
-    Custom Environment that follows gym interface
+    Custom Environment that follows the Gymnasium interface.
     """
-    metadata = {'render.modes': ['human']}
+    metadata = {"render_modes": ["human"]}
 
-    def __init__(self, configs, learning_agent, opponent_agent, replay_validate=None, replay_folder=None, replay_prefix="replay"):
+    def __init__(self, configs, learning_agent, opponent_agent, replay_validate=None,
+                 replay_folder=None, replay_prefix="replay", render_mode=None):
         """
         THe initializer
         :param configs:
@@ -84,6 +85,9 @@ class LuxEnvironment(gym.Env):
         :param opponent_agent:
         """
         super(LuxEnvironment, self).__init__()
+        if render_mode not in self.metadata["render_modes"] + [None]:
+            raise ValueError(f"Unsupported render mode: {render_mode}")
+        self.render_mode = render_mode
 
         # Create the game
         self.game = Game(configs)
@@ -109,6 +113,7 @@ class LuxEnvironment(gym.Env):
         self.match_generator = None
 
         self.last_observation_object = None
+        self.last_observation = None
 
     def set_replay_path(self, replay_folder, replay_prefix):
         """
@@ -148,28 +153,36 @@ class LuxEnvironment(gym.Env):
         except StopIteration:
             # The game episode is done.
             is_game_over = True
-            obs = None
+            obs = self.last_observation
         except GameStepFailedException:
             # Game step failed, assign a game lost reward to not incentivise this
             is_game_over = True
-            obs = None
+            obs = self.last_observation
             is_game_error = True
 
         # Calculate reward for this step
         reward = self.learning_agent.get_reward(self.game, is_game_over, is_new_turn, is_game_error)
+        self.last_observation = obs
 
-        return obs, reward, is_game_over, {}
+        return obs, reward, is_game_over, False, {}
 
-    def reset(self):
+    def reset(self, *, seed=None, options=None):
         """
 
         :return:
         """
+        super().reset(seed=seed)
+        if seed is not None:
+            self.game.configs["seed"] = seed
+            if hasattr(self.action_space, "seed"):
+                self.action_space.seed(seed)
+
         self.current_step = 0
         self.last_observation_object = None
+        self.last_observation = None
 
         # Reset game + map
-        self.match_controller.reset()
+        self.match_controller.reset(seed=seed)
         if self.replay_folder:
             # Tell the game to log replays
             self.game.start_replay_logging(stateful=True, replay_folder=self.replay_folder, replay_filename_prefix=self.replay_prefix)
@@ -179,8 +192,9 @@ class LuxEnvironment(gym.Env):
 
         obs = self.learning_agent.get_observation(self.game, unit, city_tile, team, is_new_turn)
         self.last_observation_object = (unit, city_tile, team, is_new_turn)
+        self.last_observation = obs
 
-        return obs
+        return obs, {}
 
     def render(self, **kwargs):
         """

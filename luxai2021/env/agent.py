@@ -2,7 +2,7 @@ import sys
 import time
 
 import numpy as np
-from gym import spaces
+from gymnasium import spaces
 from ..game.constants import Constants
 
 """
@@ -158,7 +158,7 @@ class AgentWithModel(Agent):
         """
         Implements getting a observation from the current game for this unit or city
         """
-        return np.zeros((10,1))
+        return np.zeros((10, 1), dtype=np.float16)
 
     def process_turn(self, game, team):
         """

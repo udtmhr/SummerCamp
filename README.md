@@ -1,5 +1,5 @@
-# Lux AI 2021 python game engine and gym
-This is a replica of the Lux AI 2021 game ported directly over to python. It also sets up a classic Reinforcement Learning gym environment to be used to train RL agents for creating agents.
+# Lux AI 2021 python game engine and Gymnasium
+This is a replica of the Lux AI 2021 game ported directly over to python. It also provides a Gymnasium environment for training RL agents.
 
 
 | **Features**                         | **LuxAi2021** |
@@ -14,15 +14,14 @@ This is a replica of the Lux AI 2021 game ported directly over to python. It als
 | Game engine consistency validation to base game       | :heavy_check_mark: |
 
 # Installation
-This should work cross-platform, but I've only tested Windows 10 and Ubuntu.
+This project uses Python 3.9.25 and [uv](https://docs.astral.sh/uv/).
 
-**Important:** Use Python 3.7.* for training your models. This is required since when you create a Kaggle submission, the Kaggle competition will run the code using Python 3.7.*, and you will get a model deserialization error if you train the model with Python 3.8>=.
+```bash
+uv sync
+uv run pytest -q
+```
 
-Install luxai2021 environment package by running the installer:
-
-```python setup.py install```
-
-You will need Node.js version 12 or above: [here](https://nodejs.org/en/download/)
+Node.js is not required; seeded map generation runs entirely in Python.
 
 
 
@@ -54,9 +53,9 @@ if __name__ == "__main__":
 ```
 
 
-# Python gym environment interface for RL
+# Python Gymnasium environment interface for RL
 
-A gym interface and match controller was created that supports creating custom agents, and a framework to submit them in kaggle submissions. Keep in mind that this framework is built around one action per unit + city_tile that can act each turn. Creating a basic gym interface looks like the following, however you should look at the more complete example in the examples subfolder:
+A Gymnasium interface and match controller was created that supports creating custom agents, and a framework to submit them in kaggle submissions. Keep in mind that this framework is built around one action per unit + city_tile that can act each turn. Creating a basic Gymnasium interface looks like the following, however you should look at the more complete example in the examples subfolder:
 
 ```
 import random
@@ -68,7 +67,7 @@ from luxai2021.game.actions import *
 from luxai2021.game.constants import LuxMatchConfigs_Default
 from functools import partial  # pip install functools
 import numpy as np
-from gym import spaces
+from gymnasium import spaces
 import time
 import sys
 
@@ -225,17 +224,18 @@ if __name__ == "__main__":
     
     # Play 5 games
     env.reset()
-    obs = env.reset()
+    obs, _ = env.reset()
     game_count = 0
     while game_count < 5:
         # Take a random action
         action_code = random.sample(range(player.action_space.n), 1)[0]
-        (obs, reward, is_game_over, state) = env.step( action_code )
+        obs, reward, terminated, truncated, state = env.step(action_code)
+        is_game_over = terminated or truncated
         
         if is_game_over:
             print(f"Game done turn {env.game.state['turn']}, final map:")
             print(env.game.map.get_map_string())
-            obs = env.reset()
+            obs, _ = env.reset()
             game_count += 1
     
     # Attach a ML model from stable_baselines3 and train a RL model
@@ -256,15 +256,16 @@ if __name__ == "__main__":
 
     # Inference the agent for 5 games
     game_count = 0
-    obs = env.reset()
+    obs, _ = env.reset()
     while game_count < 5:
         action_code, _states = model.predict(obs, deterministic=False)
-        (obs, reward, is_game_over, state) = env.step( action_code )
+        obs, reward, terminated, truncated, state = env.step(action_code)
+        is_game_over = terminated or truncated
         
         if is_game_over:
             print(f"Game done turn {env.game.state['turn']}, final map:")
             print(env.game.map.get_map_string())
-            obs = env.reset()
+            obs, _ = env.reset()
             game_count += 1
 
 
@@ -313,4 +314,124 @@ Alternatively to manually generate a replay from a model, you can place your tra
 This will battle your agent against itself and produce a replay match. This requires the official `lux-ai-2021` to be installed, see instructions here:
 https://github.com/Lux-AI-Challenge/Lux-Design-2021
 
+## Behavior cloning from Kaggle replays
 
+Train the shared Residual U-Net and factorized Worker, Cart, and City action heads from official Season 1
+Kaggle replay JSON files. By default, only the winning player from each replay is used:
+
+```bash
+uv run python examples/train_bc.py \
+  --replay-dir replay_datasets \
+  --output-dir models/bc_v2 \
+  --epochs 20
+```
+
+Use `--team-selection all --winner-weight 1.5` only when both players should be retained.
+Training shows tqdm progress bars for class statistics, train, validation, and test phases; use `--no-progress`
+for non-interactive logs.
+
+Class counts are stored in `class_statistics.pt` and in every checkpoint. A resume with the same replay files,
+split, team selection, turn limit, and schemas prints `Class statistics: checkpoint` and skips the dataset scan.
+Use `--recompute-class-statistics` only after intentionally invalidating the cache.
+
+Plot the train/validation loss and the per-head multiclass confusion matrices recorded in `metrics.json`:
+
+```bash
+uv run python examples/visualize_bc_metrics.py \
+  --metrics models/bc_v2/metrics.json
+```
+
+Plots are saved under `models/bc_v2/plots/`. Confusion matrices include both row-normalized rates and raw
+counts. Metrics created by an older trainer contain enough information for the loss curve only; run validation
+with the updated trainer to record confusion matrices.
+
+CUDA is selected automatically. The baseline training defaults are batch size 32, AMP, channels-last convolutions,
+fused AdamW, cuDNN benchmarking, and up to four data-loader workers. If GPU memory is insufficient, reduce
+`--batch-size`; if multiprocessing causes memory pressure, use `--num-workers 0`.
+
+The version 2 hybrid observation uses 55 centered spatial channels. It keeps team-relative units, resources,
+city night-survival information, coordinates, and board masks, while adding stacked-unit counts, cargo-full
+flags, corrected cooldown normalization, and categorical embeddings for the 40-turn cycle, game phase, and
+board size. The encoder masks padding at every U-Net stage and exposes pooled global features for a future
+RL value head.
+
+Training and inference share the same viable-action masks. Off-board moves, enemy-city moves, moves blocked by
+cooldown units, impossible transfers, invalid city construction, exhausted research, and unit-cap production
+are removed before softmax. Replay commands rejected by these masks are learned as their effective no-op result.
+
+Resume while preserving the game-level train/validation/test split:
+
+```bash
+uv run python examples/train_bc.py \
+  --replay-dir replay_datasets \
+  --output-dir models/bc_v2 \
+  --resume models/bc_v2/latest.pt \
+  --epochs 40
+```
+
+Checkpoints produced with the earlier 44-channel feature schema cannot be resumed with this version.
+
+### Team Durrett multi-source profile
+
+The adapted Team Durrett profile keeps the 55-feature observation, factorized action heads, viable-action masks,
+and pooled features for later RL use. It replaces the U-Net with a 384-channel, 18-block FReLU/SE encoder plus a
+masked Transformer layer. The spatial trunk and per-action projections are shared, while the final classifier for
+each action head is specific to the source submission.
+
+The replay directory must contain `agent_info.json` above each source submission's replays and a matching
+`*_info.json` beside every replay. The source player is selected by `submissionId`, independently of who won.
+Source-versus-source self-play contributes both players to the same policy head.
+
+```bash
+uv run python examples/train_bc.py \
+  --training-profile durrett \
+  --replay-dir replay_datasets \
+  --output-dir models/bc_durrett
+```
+
+The profile defaults to 100 epochs, batch size 16 with four-step gradient accumulation, AdamW at `1e-3`,
+weight decay `1e-5`, and learning-rate drops at epochs 50 and 80. Worker/cart `stay` targets receive weight 0.3.
+The source with the highest `lb` in `agent_info.json` is stored as the inference default. Per-source metrics and
+the complete source catalog are written to the checkpoint and `metrics.json`.
+
+Use one replay and one turn per source for a quick CUDA smoke:
+
+```bash
+uv run python examples/train_bc.py \
+  --training-profile durrett \
+  --replay-dir replay_datasets \
+  --output-dir models/bc_durrett_smoke \
+  --max-replays-per-source 1 \
+  --max-turns 1 \
+  --epochs 1 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 1 \
+  --device cuda \
+  --num-workers 0
+```
+
+Resume with the saved split, scheduler, source mapping, optimizer, and cached class statistics:
+
+```bash
+uv run python examples/train_bc.py \
+  --replay-dir replay_datasets \
+  --output-dir models/bc_durrett \
+  --resume models/bc_durrett/latest.pt
+```
+
+Use the best checkpoint in a local match:
+
+```python
+from luxai2021.imitation import BehaviorCloningAgent
+
+agent = BehaviorCloningAgent("models/bc/best.pt", device="auto")
+actions = agent.process_turn(game, team=0)
+```
+
+For a multi-source checkpoint, omit `source_id` to use the saved highest-`lb` source or select one explicitly:
+
+```python
+agent = BehaviorCloningAgent("models/bc_durrett/best.pt", device="auto", source_id=23692494)
+```
+
+The bundled replay fixtures are intended for smoke tests only. Use a larger replay collection for actual training.

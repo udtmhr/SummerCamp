@@ -2,7 +2,6 @@ import os
 from luxai2021.game.replay import Replay
 import math
 import random
-import sys
 import traceback
 
 from luxai2021.game.actions import MoveAction, PillageAction, SpawnCartAction, SpawnCityAction, SpawnWorkerAction, \
@@ -30,6 +29,8 @@ class Game:
         self.configs = dict(LuxMatchConfigs_Default) # Shallow copy
         self.configs.update(configs)  # Override default config from specified config
         self.agents = []
+        self.last_replay_file = None
+        self.last_winning_team = None
         self.stop_replay_logging()
         self.reset()
         self.log_file = None
@@ -526,6 +527,7 @@ class Game:
             if self.replay:
                 # Write the replay to a file
                 self.replay.write(self)
+                self.last_replay_file = self.replay.file
 
                 # Start a new replay file for the next game
                 self.start_replay_logging(self.replay_stateful, self.replay_folder, self.replay_filename_prefix)
@@ -679,7 +681,7 @@ class Game:
                 raise MatchWarn("Agent tried to move unit {} that it does not own".format(cmd.unit_id))
             if not unit.can_move():
                 raise MatchWarn("Agent tried to move unit {} with cooldown: {}".format(cmd.unit_id, unit.cooldown))
-            if not cmd.direction in [ Constants.DIRECTIONS.CENTER,
+            if cmd.direction not in [ Constants.DIRECTIONS.CENTER,
                                      Constants.DIRECTIONS.EAST,
                                      Constants.DIRECTIONS.NORTH,
                                      Constants.DIRECTIONS.SOUTH,
@@ -1138,7 +1140,7 @@ class Game:
         def revert_action(action):
             # reverts a given action such that cellsToActionsToThere has no collisions due to action and all related actions
             self.log(
-                f"turn {{self.state['turn']}} Unit {{action.unit_id}} collided when trying to move {{action.direction}} to ({{action.newcell.pos.x}}, {{action.newcell.pos.y}})")
+                "turn {self.state['turn']} Unit {action.unit_id} collided when trying to move {action.direction} to ({action.newcell.pos.x}, {action.newcell.pos.y})")
 
             original_cell = self.map.get_cell_by_pos(
                 self.get_unit(action.team, action.unit_id).pos

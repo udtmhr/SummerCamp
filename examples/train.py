@@ -26,7 +26,7 @@ def make_env(local_env, rank, seed=0):
     """
 
     def _init():
-        local_env.seed(seed + rank)
+        local_env.reset(seed=seed + rank)
         return local_env
 
     set_random_seed(seed)
@@ -152,17 +152,25 @@ def train(args):
     saves = glob.glob(f'models/rl_model_{run_id}_*_steps.zip')
     latest_save = sorted(saves, key=lambda x: int(x.split('_')[-2]), reverse=True)[0]
     model.load(path=latest_save)
-    obs = env.reset()
+    reset_result = env.reset()
+    obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
     for i in range(600):
         action_code, _states = model.predict(obs, deterministic=True)
-        obs, rewards, done, info = env.step(action_code)
+        transition = env.step(action_code)
+        if len(transition) == 5:
+            obs, rewards, terminated, truncated, info = transition
+            done = terminated or truncated
+        else:
+            # Stable-Baselines3 VecEnv retains its four-value API.
+            obs, rewards, done, info = transition
         if i % 5 == 0:
             print("Turn %i" % i)
             env.render()
 
         if done:
             print("Episode done, resetting.")
-            obs = env.reset()
+            reset_result = env.reset()
+            obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
     print("Done")
 
     '''
