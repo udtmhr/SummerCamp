@@ -2,10 +2,14 @@ from __future__ import annotations
 
 # ruff: noqa: C901, PLR0912, PLR0913, PLR0915, S311
 import json
+import os
+import pickle
 import random
 import re
 from collections import OrderedDict
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -42,6 +46,7 @@ MAX_ENTITIES = BOARD_SIZE * BOARD_SIZE
 _MINIMUM_SPLIT_GAMES = 3
 _TEAM_COUNT = 2
 _TAIL_BYTES = 128 * 1024
+_REPLAY_DISK_CACHE_VERSION = 1
 _STEP_PATTERN = re.compile(rb'"step"\s*:\s*(\d+)')
 _DIRECTION_TO_DELTA = {"n": (-1, 0), "e": (0, 1), "s": (1, 0), "w": (0, -1)}
 _DELTA_TO_DIRECTION = {value: key for key, value in _DIRECTION_TO_DELTA.items()}
@@ -84,9 +89,98 @@ def split_replays(
     }
 
 
+def _replay_disk_cache_path(path: Path, cache_dir: Path) -> Path:
+    source = path.resolve()
+    stat = source.stat()
+    fingerprint = f"{_REPLAY_DISK_CACHE_VERSION}\0{source}\0{stat.st_size}\0{stat.st_mtime_ns}"
+    return cache_dir / f"{sha256(fingerprint.encode()).hexdigest()}.pickle"
+
+
+def _write_replay_disk_cache(cache_path: Path, replay: Mapping[str, object]) -> None:
+    temporary_path = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary_path.open("wb") as cache_file:
+            pickle.dump(replay, cache_file, protocol=pickle.HIGHEST_PROTOCOL)
+        temporary_path.replace(cache_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _load_replay(path: Path, cache_dir: Path | None) -> Mapping[str, object]:
+    cache_path = _replay_disk_cache_path(path, cache_dir) if cache_dir is not None else None
+    if cache_path is not None and cache_path.exists():
+        try:
+            with cache_path.open("rb") as cache_file:
+                replay = pickle.load(cache_file)  # noqa: S301 - locally generated replay cache
+            if isinstance(replay, dict):
+                return replay
+        except (EOFError, OSError, pickle.UnpicklingError):
+            pass
+    with path.open(encoding="utf-8") as replay_file:
+        replay = json.load(replay_file)
+    if cache_path is not None:
+        _write_replay_disk_cache(cache_path, replay)
+    return replay
+
+
+def _prepare_replay_cache_entry(arguments: tuple[str, str]) -> bool:
+    replay_path, cache_dir = arguments
+    path = Path(replay_path)
+    destination = Path(cache_dir)
+    cache_path = _replay_disk_cache_path(path, destination)
+    if cache_path.exists():
+        return False
+    _load_replay(path, destination)
+    return True
+
+
+def prepare_replay_cache(
+    replay_paths: Sequence[Path],
+    cache_dir: Path,
+    *,
+    num_workers: int = 0,
+    show_progress: bool = False,
+) -> dict[str, int]:
+    paths = list(dict.fromkeys(Path(path) for path in replay_paths))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    missing = [path for path in paths if not _replay_disk_cache_path(path, cache_dir).exists()]
+    tasks = [(str(path), str(cache_dir)) for path in missing]
+    if num_workers > 1 and len(tasks) > 1:
+        worker_count = min(num_workers, len(tasks))
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            results = executor.map(_prepare_replay_cache_entry, tasks, chunksize=1)
+            created = sum(
+                tqdm(
+                    results,
+                    total=len(tasks),
+                    desc="Replay JSON cache",
+                    unit="replay",
+                    dynamic_ncols=True,
+                    leave=False,
+                    disable=not show_progress,
+                )
+            )
+    else:
+        created = sum(
+            _prepare_replay_cache_entry(task)
+            for task in tqdm(
+                tasks,
+                desc="Replay JSON cache",
+                unit="replay",
+                dynamic_ncols=True,
+                leave=False,
+                disable=not show_progress,
+            )
+        )
+    return {"replay_count": len(paths), "created_count": created}
+
+
 class _ReplayCache:
-    def __init__(self, max_size: int = 2) -> None:
+    def __init__(self, max_size: int = 2, disk_cache_dir: Path | None = None) -> None:
         self.max_size = max_size
+        self.disk_cache_dir = Path(disk_cache_dir) if disk_cache_dir is not None else None
+        if self.disk_cache_dir is not None:
+            self.disk_cache_dir.mkdir(parents=True, exist_ok=True)
         self.data: OrderedDict[str, Mapping[str, object]] = OrderedDict()
 
     def get(self, path: Path) -> Mapping[str, object]:
@@ -94,8 +188,7 @@ class _ReplayCache:
         if key in self.data:
             self.data.move_to_end(key)
             return self.data[key]
-        with path.open(encoding="utf-8") as replay_file:
-            replay = json.load(replay_file)
+        replay = _load_replay(path, self.disk_cache_dir)
         self.data[key] = replay
         while len(self.data) > self.max_size:
             self.data.popitem(last=False)
@@ -294,6 +387,7 @@ class LuxReplayDataset(Dataset):
         winner_weight: float = 1.5,
         seed: int = 42,
         max_turns: int = 0,
+        replay_cache_dir: Path | None = None,
     ) -> None:
         self.replay_paths = [Path(path) for path in replay_paths]
         self.augment = augment
@@ -303,7 +397,7 @@ class LuxReplayDataset(Dataset):
         self.team_selection = team_selection
         self.winner_weight = winner_weight
         self.seed = seed
-        self.cache = _ReplayCache()
+        self.cache = _ReplayCache(disk_cache_dir=replay_cache_dir)
         self.samples: list[tuple[Path, int, int]] = []
         self.sample_groups: list[list[int]] = []
         for path in self.replay_paths:

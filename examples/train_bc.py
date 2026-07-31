@@ -27,6 +27,7 @@ from luxai2021.imitation.data import (
     ReplayBatchSampler,
     class_counts,
     discover_replays,
+    prepare_replay_cache,
     split_replays,
 )
 from luxai2021.imitation.model import (
@@ -88,7 +89,7 @@ def parse_args() -> argparse.Namespace:
         default=-1,
         help="-1 selects up to 4 workers automatically; use 0 for in-process loading.",
     )
-    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument("--prefetch-factor", type=int, default=1)
     parser.add_argument(
         "--recompute-class-statistics",
         action="store_true",
@@ -97,6 +98,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--class-statistics-path",
         help="Shared class-statistics cache; defaults to <output-dir>/class_statistics.pt.",
+    )
+    parser.add_argument(
+        "--replay-cache-dir",
+        help="Parsed replay cache; defaults beside --class-statistics-path or under <output-dir>.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-turns", type=int, default=0, help="Limit turns per replay; useful for smoke tests.")
@@ -379,12 +384,13 @@ def make_loader(  # noqa: PLR0913
     return DataLoader(dataset, batch_size=batch_size, **options)
 
 
-def make_datasets(
+def make_datasets(  # noqa: PLR0913
     split: Mapping[str, Iterable[str]],
     team_selection: str,
     winner_weight: float,
     seed: int,
     max_turns: int,
+    replay_cache_dir: Path,
 ) -> dict[str, LuxReplayDataset]:
     return {
         "train": LuxReplayDataset(
@@ -394,6 +400,7 @@ def make_datasets(
             winner_weight=winner_weight,
             seed=seed,
             max_turns=max_turns,
+            replay_cache_dir=replay_cache_dir,
         ),
         "train_counting": LuxReplayDataset(
             [Path(path) for path in split["train"]],
@@ -402,6 +409,7 @@ def make_datasets(
             winner_weight=winner_weight,
             seed=seed,
             max_turns=max_turns,
+            replay_cache_dir=replay_cache_dir,
         ),
         "validation": LuxReplayDataset(
             [Path(path) for path in split["validation"]],
@@ -410,6 +418,7 @@ def make_datasets(
             winner_weight=winner_weight,
             seed=seed,
             max_turns=max_turns,
+            replay_cache_dir=replay_cache_dir,
         ),
         "test": LuxReplayDataset(
             [Path(path) for path in split["test"]],
@@ -418,6 +427,7 @@ def make_datasets(
             winner_weight=winner_weight,
             seed=seed,
             max_turns=max_turns,
+            replay_cache_dir=replay_cache_dir,
         ),
     }
 
@@ -454,20 +464,37 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
     if device.type == "cuda":
         model.to(memory_format=torch.channels_last)
 
+    show_progress = not args.no_progress
+    replay_cache_dir = (
+        Path(args.replay_cache_dir)
+        if args.replay_cache_dir
+        else (
+            Path(args.class_statistics_path).parent / "replay_cache"
+            if args.class_statistics_path
+            else output_dir / "replay_cache"
+        )
+    )
+    replay_cache_stats = prepare_replay_cache(
+        [Path(path) for paths in split.values() for path in paths],
+        replay_cache_dir,
+        num_workers=max(1, num_workers),
+        show_progress=show_progress,
+    )
     datasets = make_datasets(
         split,
         args.team_selection,
         args.winner_weight,
         args.seed,
         args.max_turns,
+        replay_cache_dir,
     )
-    show_progress = not args.no_progress
     tqdm.write(
         f"encoder={args.encoder_type} device={device} workers={num_workers} batch_size={args.batch_size} "
         f"effective_batch={args.batch_size * args.gradient_accumulation_steps} "
         f"compile={compile_enabled} compile_mode={args.compile_mode} amp_dtype={args.amp_dtype} "
         f"train={len(datasets['train']):,} validation={len(datasets['validation']):,} "
-        f"test={len(datasets['test']):,}"
+        f"test={len(datasets['test']):,} replay_cache={replay_cache_dir} "
+        f"cache_created={replay_cache_stats['created_count']:,}/{replay_cache_stats['replay_count']:,}"
     )
     train_sampler = ReplayBatchSampler(
         datasets["train"],
@@ -482,7 +509,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             batch_sampler=train_sampler,
             num_workers=num_workers,
             prefetch_factor=args.prefetch_factor,
-            pin_memory=device.type == "cuda",
+            pin_memory=True,
             persistent_workers=True,
         ),
         "validation": make_loader(
@@ -491,7 +518,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             batch_sampler=None,
             num_workers=num_workers,
             prefetch_factor=args.prefetch_factor,
-            pin_memory=device.type == "cuda",
+            pin_memory=True,
             persistent_workers=False,
         ),
         "test": make_loader(
@@ -500,7 +527,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             batch_sampler=None,
             num_workers=num_workers,
             prefetch_factor=args.prefetch_factor,
-            pin_memory=device.type == "cuda",
+            pin_memory=True,
             persistent_workers=False,
         ),
     }
@@ -658,6 +685,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         "compile_mode": args.compile_mode,
         "amp_dtype": args.amp_dtype,
         "compile_warmup_seconds": compile_warmup_seconds,
+        "replay_cache": {"path": str(replay_cache_dir), **replay_cache_stats},
         "data_split_signature": data_split_signature(split),
         "class_statistics_signature": statistics_signature,
         "training_config": {

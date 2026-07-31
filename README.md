@@ -370,12 +370,18 @@ Training stops before an optimizer update when a non-finite loss or gradient is 
 
 Use the same seed, effective batch, and shared class-statistics cache for an architecture comparison:
 
+Replay JSON is parsed only while building a binary cache. Reuse the same `--replay-cache-dir` across runs;
+unchanged replays are loaded from the cache in later epochs and later architecture runs. Source size and
+modification time automatically invalidate stale entries. Training DataLoaders use pinned host memory and
+non-blocking device transfers.
+
 ```bash
 uv run python examples/train_bc.py \
   --encoder-type unet \
   --replay-dir replay_datasets \
   --output-dir models/bc_encoder_compare/unet \
   --class-statistics-path models/bc_encoder_compare/class_statistics.pt \
+  --replay-cache-dir models/bc_encoder_compare/replay_cache \
   --batch-size 8 \
   --gradient-accumulation-steps 4
 
@@ -384,6 +390,7 @@ uv run python examples/train_bc.py \
   --replay-dir replay_datasets \
   --output-dir models/bc_encoder_compare/transformer16 \
   --class-statistics-path models/bc_encoder_compare/class_statistics.pt \
+  --replay-cache-dir models/bc_encoder_compare/replay_cache \
   --batch-size 8 \
   --gradient-accumulation-steps 4
 
@@ -392,6 +399,7 @@ uv run python examples/train_bc.py \
   --replay-dir replay_datasets \
   --output-dir models/bc_encoder_compare/axial32 \
   --class-statistics-path models/bc_encoder_compare/class_statistics.pt \
+  --replay-cache-dir models/bc_encoder_compare/replay_cache \
   --batch-size 8 \
   --gradient-accumulation-steps 4
 ```
@@ -494,3 +502,74 @@ actions = agent.process_turn(game, team=0)
 ```
 
 The bundled replay fixtures are intended for smoke tests only. Use a larger replay collection for actual training.
+
+### Distill the Lux AI 2021 first-place policy
+
+The distillation pipeline ports the first-place 24-block policy and its exact 19/17/4 flat action ordering without
+adding the upstream package as a dependency. It uses offline distillation: the teacher logits, including the original
+180-degree rotation ensemble, are computed once and reused by every student and epoch. For the fixed replay states,
+this preserves the targets that would be recomputed online while avoiding repeated teacher inference.
+
+Download and SHA-256 verify the upstream MIT-licensed checkpoint, then cache logits for both players in every replay:
+
+```bash
+uv run python examples/download_first_place_teacher.py
+
+uv run python examples/precompute_first_place_targets.py \
+  --replay-dir replay_datasets \
+  --teacher-checkpoint models/teachers/lux_2021_first_place/062179520_weights.pt \
+  --output-dir models/teachers/lux_2021_first_place/cache \
+  --replay-cache-dir models/replay_cache \
+  --device cuda
+```
+
+Precompute the compact student inputs once. This moves replay parsing, board encoding, legal-mask construction, and
+target construction out of every training epoch. FP16 observations are converted back to FP32 before the model and
+are suitable for the default BF16 training; use `--observation-dtype float32` for bit-preserving inputs.
+
+```bash
+uv run python examples/precompute_distillation_dataset.py \
+  --replay-dir replay_datasets \
+  --teacher-cache-dir models/teachers/lux_2021_first_place/cache \
+  --replay-cache-dir models/replay_cache \
+  --output-dir models/teachers/lux_2021_first_place/prepared \
+  --observation-dtype float16 \
+  --num-workers 4
+```
+
+Train any of the three student encoders against the shared prepared cache:
+
+```bash
+for encoder in unet transformer16 axial32; do
+  uv run python examples/train_distilled_bc.py \
+    --encoder-type "$encoder" \
+    --replay-dir replay_datasets \
+    --teacher-cache-dir models/teachers/lux_2021_first_place/cache \
+    --prepared-cache-dir models/teachers/lux_2021_first_place/prepared \
+    --output-dir "models/distilled/$encoder" \
+    --batch-size 64 \
+    --num-workers 8 \
+    --prefetch-factor 2 \
+    --device cuda
+done
+```
+
+The student starts from the matching existing BC encoder and replaces only its policy heads with the faithful flat
+schema. Training combines temperature-scaled KL loss with replay hard labels. CUDA training enables BF16, TF32,
+channels-last tensors, fused AdamW, variable-size tail batches without dummy padding, and replay caching. The legacy
+`--no-compile` flag is accepted as a no-op for command compatibility. D4 augmentation runs as one vectorized GPU
+operation, entity targets are padded only to the largest real entity count in each batch, and metric reductions
+synchronize once per epoch instead of once per batch. Distilled checkpoints record
+`inference_augmentation=rot180`, so local play enables the batched
+two-view ensemble automatically. Override it for latency comparisons with `--tta-a none` or `--tta-b none`:
+
+```bash
+uv run python main.py \
+  --model-a models/distilled/axial32/best.pt \
+  --model-b models/distilled/transformer16/best.pt \
+  --tta-a auto --tta-b auto --device cuda
+```
+
+The teacher adapter is pinned to upstream commit `973a6c6c63211b6c7ab6fdf50e026e458d1f6e4e` and checkpoint SHA-256
+`40248f0fbc9b8e1e1b1f7cc6fc674c041d8dac43b964ae45bd976d927cdffd22`. See
+[`docs/THIRD_PARTY_NOTICES.md`](docs/THIRD_PARTY_NOTICES.md) for attribution.

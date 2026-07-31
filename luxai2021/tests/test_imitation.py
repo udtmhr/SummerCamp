@@ -39,6 +39,7 @@ from luxai2021.imitation.data import (
     augment_sample,
     build_targets,
     class_counts,
+    prepare_replay_cache,
 )
 from luxai2021.imitation.masking import (
     apply_legal_action_mask,
@@ -293,6 +294,34 @@ def test_model_loss_and_checkpoint_round_trip(tmp_path):
     restored_counts = checkpoint_class_statistics(checkpoint, statistics_signature)
     assert restored_counts is not None
     assert all(torch.equal(counts[name], restored_counts[name]) for name in counts)
+
+
+def test_replay_disk_cache_avoids_reparsing_json(tmp_path, monkeypatch):
+    replay = {
+        "rewards": [1, 0],
+        "steps": [
+            [
+                {"observation": {"width": 16, "height": 16, "updates": _updates()}},
+                {"observation": {}},
+            ],
+            [{"action": ["m u_1 n"], "step": 1}, {"action": [], "step": 1}],
+        ],
+    }
+    replay_path = tmp_path / "replay.json"
+    replay_path.write_text(json.dumps(replay), encoding="utf-8")
+    cache_dir = tmp_path / "replay_cache"
+
+    result = prepare_replay_cache([replay_path, replay_path], cache_dir)
+    assert result == {"replay_count": 1, "created_count": 1}
+    assert len(list(cache_dir.glob("*.pickle"))) == 1
+
+    def fail_json_load(_file: object) -> None:
+        raise AssertionError("replay JSON was parsed after the cache was prepared")
+
+    monkeypatch.setattr("luxai2021.imitation.data.json.load", fail_json_load)
+    dataset = LuxReplayDataset([replay_path], replay_cache_dir=cache_dir)
+    assert len(dataset) == 1
+    assert dataset[0]["observation"].shape == (55, 32, 32)
 
 
 def test_encoder_masks_padding_and_returns_global_features():

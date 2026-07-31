@@ -8,7 +8,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as nn_functional
 
-from luxai2021.imitation.actions import ACTION_SCHEMA, TARGET_NAMES
+from luxai2021.imitation.actions import ACTION_SCHEMA, FIRST_PLACE_ACTION_SCHEMA, TARGET_NAMES
 from luxai2021.imitation.data import IGNORE_INDEX
 from luxai2021.imitation.masking import LEGAL_MASK_SUFFIX, apply_legal_action_mask
 from luxai2021.imitation.schema import (
@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 CHECKPOINT_SCHEMA_VERSION = 1
+POLICY_SCHEMA_FACTORIZED = "factorized_v1"
+POLICY_SCHEMA_FIRST_PLACE_FLAT = "first_place_flat_v1"
 
 
 def _group_count(channels: int) -> int:
@@ -88,10 +90,14 @@ class ModelConfig:
     transformer_dropout: float = 0.1
     transformer16_layers: int = 8
     axial32_layers: int = 6
+    policy_schema: str = POLICY_SCHEMA_FACTORIZED
 
     def __post_init__(self) -> None:
         if self.encoder_type not in {"unet", "transformer16", "axial32"}:
             msg = f"Unsupported encoder type: {self.encoder_type}"
+            raise ValueError(msg)
+        if self.policy_schema not in {POLICY_SCHEMA_FACTORIZED, POLICY_SCHEMA_FIRST_PLACE_FLAT}:
+            msg = f"Unsupported policy schema: {self.policy_schema}"
             raise ValueError(msg)
         if self.transformer_heads < 1:
             raise ValueError("transformer_heads must be positive")
@@ -444,10 +450,13 @@ class LuxBehaviorCloningModel(nn.Module):
             "axial32": Axial32SpatialEncoder,
         }
         self.encoder = encoder_types[self.config.encoder_type](self.config)
+        action_schema = (
+            ACTION_SCHEMA if self.config.policy_schema == POLICY_SCHEMA_FACTORIZED else FIRST_PLACE_ACTION_SCHEMA
+        )
         self.heads = nn.ModuleDict(
             {
                 name: ActionPredictionHead(self.encoder.output_channels, len(actions))
-                for name, actions in ACTION_SCHEMA.items()
+                for name, actions in action_schema.items()
             }
         )
 
@@ -614,12 +623,16 @@ def save_bc_checkpoint(  # noqa: PLR0913
     class_counts: Mapping[str, Tensor] | None = None,
     class_statistics_signature: str | None = None,
     scaler: torch.amp.GradScaler | None = None,
+    extra_metadata: Mapping[str, object] | None = None,
 ) -> None:
+    action_schema = (
+        ACTION_SCHEMA if model.config.policy_schema == POLICY_SCHEMA_FACTORIZED else FIRST_PLACE_ACTION_SCHEMA
+    )
     checkpoint = {
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "feature_names": FEATURE_NAMES,
-        "action_schema": ACTION_SCHEMA,
+        "action_schema": action_schema,
         "model_config": asdict(model.config),
         "model": model.state_dict(),
         "encoder": model.encoder.state_dict(),
@@ -633,6 +646,8 @@ def save_bc_checkpoint(  # noqa: PLR0913
         ),
         "class_statistics_signature": class_statistics_signature,
     }
+    if extra_metadata:
+        checkpoint.update(dict(extra_metadata))
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, path)
 
@@ -649,7 +664,11 @@ def load_bc_checkpoint(
         raise ValueError("Checkpoint feature schema version does not match this package")
     if tuple(checkpoint.get("feature_names", ())) != FEATURE_NAMES:
         raise ValueError("Checkpoint feature schema does not match this package")
-    if checkpoint.get("action_schema") != ACTION_SCHEMA:
+    config = ModelConfig(**checkpoint["model_config"])
+    expected_action_schema = (
+        ACTION_SCHEMA if config.policy_schema == POLICY_SCHEMA_FACTORIZED else FIRST_PLACE_ACTION_SCHEMA
+    )
+    if checkpoint.get("action_schema") != expected_action_schema:
         raise ValueError("Checkpoint action schema does not match this package")
     nonfinite_parameters = [
         name
@@ -660,7 +679,7 @@ def load_bc_checkpoint(
         preview = ", ".join(nonfinite_parameters[:3])
         message = f"Checkpoint contains non-finite model parameters: {preview}"
         raise ValueError(message)
-    model = LuxBehaviorCloningModel(ModelConfig(**checkpoint["model_config"]))
+    model = LuxBehaviorCloningModel(config)
     model.load_state_dict(checkpoint["model"])
     model.to(device)
     if load_optimizer is not None and checkpoint.get("optimizer") is not None:

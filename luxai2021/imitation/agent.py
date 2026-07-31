@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# ruff: noqa: C901, PLR0913
+# ruff: noqa: C901, PLR0912, PLR0913
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -18,15 +18,31 @@ from luxai2021.game.actions import (
     TransferAction,
 )
 from luxai2021.game.game_constants import GAME_CONSTANTS
-from luxai2021.imitation.actions import CART_ACTIONS, CITY_ACTIONS, DIRECTIONS, RESOURCES, WORKER_ACTIONS
+from luxai2021.imitation.actions import (
+    CART_ACTIONS,
+    CITY_ACTIONS,
+    DIRECTIONS,
+    FIRST_PLACE_ACTION_SCHEMA,
+    RESOURCES,
+    WORKER_ACTIONS,
+    first_place_action_remap,
+)
+from luxai2021.imitation.first_place import first_place_city_legal_mask, first_place_unit_legal_mask
 from luxai2021.imitation.masking import (
     LEGAL_MASK_SUFFIX,
     apply_legal_action_mask,
     city_legal_mask,
     unit_legal_masks,
 )
-from luxai2021.imitation.model import load_bc_checkpoint
-from luxai2021.imitation.schema import BoardSnapshot, UnitSnapshot, encode_snapshot, snapshot_from_game
+from luxai2021.imitation.model import POLICY_SCHEMA_FIRST_PLACE_FLAT, load_bc_checkpoint
+from luxai2021.imitation.schema import (
+    CYCLE_LENGTH,
+    FEATURE_INDEX,
+    BoardSnapshot,
+    UnitSnapshot,
+    encode_snapshot,
+    snapshot_from_game,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -53,13 +69,51 @@ class _Choice:
 
 
 class BehaviorCloningAgent(Agent):
-    def __init__(self, checkpoint_path: str, device: str = "auto") -> None:
+    def __init__(self, checkpoint_path: str, device: str = "auto", tta: str = "auto") -> None:
         super().__init__()
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
         self.model, self.checkpoint = load_bc_checkpoint(checkpoint_path, str(self.device))
         self.model.eval()
+        if tta == "auto":
+            tta = str(self.checkpoint.get("inference_augmentation", "none"))
+        if tta not in {"none", "rot180"}:
+            message = f"Unsupported inference augmentation: {tta}"
+            raise ValueError(message)
+        self.tta = tta
+
+    def _restore_rot180(self, output: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        restored = {}
+        flat_policy = self.model.config.policy_schema == POLICY_SCHEMA_FIRST_PLACE_FLAT
+        directional_heads = {
+            "worker_move",
+            "worker_transfer_dir",
+            "cart_move",
+            "cart_transfer_dir",
+        }
+        for name, source_logits in output.items():
+            restored_logits = torch.rot90(source_logits, 2, dims=(-2, -1))
+            if flat_policy:
+                remap = first_place_action_remap(name, 2)
+                restored_logits = restored_logits[:, [remap[index] for index in range(len(remap))]]
+            elif name in directional_heads:
+                restored_logits = restored_logits[:, (2, 3, 0, 1)]
+            restored[name] = restored_logits
+        return restored
+
+    def _predict(self, observation: torch.Tensor) -> dict[str, torch.Tensor]:
+        if self.tta == "none":
+            return self.model(observation)
+        batch_size = observation.shape[0]
+        rotated_observation = torch.rot90(observation, 2, dims=(-2, -1)).clone()
+        rotated_observation[:, FEATURE_INDEX["x_coordinate"]].neg_()
+        rotated_observation[:, FEATURE_INDEX["y_coordinate"]].neg_()
+        augmented = torch.cat((observation, rotated_observation), dim=0)
+        paired_output = self.model(augmented)
+        rotated_output = {name: logits[batch_size:] for name, logits in paired_output.items()}
+        restored = self._restore_rot180(rotated_output)
+        return {name: (logits[:batch_size] + restored[name]) * 0.5 for name, logits in paired_output.items()}
 
     @staticmethod
     def _cell_logits(
@@ -105,6 +159,8 @@ class BehaviorCloningAgent(Agent):
         x: int,
         y: int,
     ) -> list[_Candidate]:
+        if self.model.config.policy_schema == POLICY_SCHEMA_FIRST_PLACE_FLAT:
+            return self._flat_unit_candidates(game, unit, snapshot, unit_snapshot, output, x, y)
         prefix = "worker" if unit.is_worker() else "cart"
         action_names = WORKER_ACTIONS if unit.is_worker() else CART_ACTIONS
         legal_masks = unit_legal_masks(snapshot, unit_snapshot)
@@ -171,6 +227,36 @@ class BehaviorCloningAgent(Agent):
                     + resource_scores[resource_index]
                 )
                 candidates.append(_Candidate("transfer", float(score), direction, resource))
+        return sorted(candidates, key=lambda candidate: candidate.score, reverse=True)
+
+    def _flat_unit_candidates(
+        self,
+        game: object,
+        unit: object,
+        snapshot: BoardSnapshot,
+        unit_snapshot: UnitSnapshot,
+        output: dict[str, torch.Tensor],
+        x: int,
+        y: int,
+    ) -> list[_Candidate]:
+        entity = "worker" if unit.is_worker() else "cart"
+        action_names = FIRST_PLACE_ACTION_SCHEMA[entity]
+        legal_mask = first_place_unit_legal_mask(snapshot, unit_snapshot)
+        scores = self._cell_logits(output, entity, x, y, legal_mask)
+        candidates = [_Candidate("stay", float(scores[0]))]
+        for action_index, action_name in enumerate(action_names[1:], start=1):
+            if not legal_mask[action_index]:
+                continue
+            if action_name.startswith("move_"):
+                candidates.append(_Candidate("move", float(scores[action_index]), action_name[-1]))
+            elif action_name.startswith("transfer_"):
+                _, resource, direction = action_name.split("_")
+                if self._transfer_targets(game, unit, direction, {}):
+                    candidates.append(_Candidate("transfer", float(scores[action_index]), direction, resource))
+            elif action_name == "pillage":
+                candidates.append(_Candidate("pillage", float(scores[action_index])))
+            elif action_name == "build_city":
+                candidates.append(_Candidate("build_city", float(scores[action_index])))
         return sorted(candidates, key=lambda candidate: candidate.score, reverse=True)
 
     def _choose_units(
@@ -324,7 +410,9 @@ class BehaviorCloningAgent(Agent):
             game.state["teamStates"][team]["units"]
         )
         available_research = max(0, _MAX_RESEARCH - snapshot.research_points[team])
-        legal_mask = city_legal_mask(snapshot, team)
+        flat_policy = self.model.config.policy_schema == POLICY_SCHEMA_FIRST_PLACE_FLAT
+        legal_mask = first_place_city_legal_mask(snapshot, team) if flat_policy else city_legal_mask(snapshot, team)
+        output_name = "city_tile" if flat_policy else "city"
         entries = []
         for city in game.cities.values():
             if city.team != team:
@@ -335,7 +423,7 @@ class BehaviorCloningAgent(Agent):
                     continue
                 scores = self._cell_logits(
                     output,
-                    "city",
+                    output_name,
                     tile.pos.x + x_offset,
                     tile.pos.y + y_offset,
                     legal_mask,
@@ -350,8 +438,12 @@ class BehaviorCloningAgent(Agent):
             for action_index in order:
                 action_name = CITY_ACTIONS[action_index]
                 if action_name == "no_action":
+                    if flat_policy and snapshot.turn >= CYCLE_LENGTH and available_research > 0:
+                        continue
                     break
                 if action_name in {"build_worker", "build_cart"}:
+                    if flat_policy and action_name == "build_cart":
+                        continue
                     if available_units <= 0:
                         continue
                     action_class = SpawnWorkerAction if action_name == "build_worker" else SpawnCartAction
@@ -370,7 +462,7 @@ class BehaviorCloningAgent(Agent):
         snapshot = snapshot_from_game(game)
         observation = torch.from_numpy(encode_snapshot(snapshot, team))[None].to(self.device)
         with torch.inference_mode():
-            output = self.model(observation)
+            output = self._predict(observation)
         x_offset, y_offset = snapshot.padding
         unit_choices = self._choose_units(game, team, snapshot, output, x_offset, y_offset)
         actions = self._choices_to_actions(unit_choices, team)

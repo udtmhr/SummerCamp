@@ -164,9 +164,8 @@ def apply_legal_action_mask(
     # Padded/non-entity rows have no legal actions. Make class zero a harmless
     # fallback so log_softmax remains finite; their targets use IGNORE_INDEX.
     no_legal_action = ~legal_mask.any(dim=-1)
-    if torch.any(no_legal_action):
-        legal_mask = legal_mask.clone()
-        legal_mask[..., 0] |= no_legal_action
+    legal_mask = legal_mask.clone()
+    legal_mask[..., 0] |= no_legal_action
     masked = logits.masked_fill(~legal_mask, torch.finfo(logits.dtype).min)
     return masked.movedim(-1, action_dim)
 

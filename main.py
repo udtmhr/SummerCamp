@@ -60,6 +60,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-a", default="models/bc_v2/best.pt", help="First model checkpoint.")
     parser.add_argument("--model-b", default="models/bc_v2/best.pt", help="Second model checkpoint.")
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"), help="Inference device.")
+    parser.add_argument(
+        "--tta-a",
+        default="auto",
+        choices=("auto", "none", "rot180"),
+        help="Inference augmentation for model A; auto reads the checkpoint metadata.",
+    )
+    parser.add_argument(
+        "--tta-b",
+        default="auto",
+        choices=("auto", "none", "rot180"),
+        help="Inference augmentation for model B; auto reads the checkpoint metadata.",
+    )
     parser.add_argument("--replay-dir", default="replays", help="Replay output directory.")
     return parser
 
@@ -71,9 +83,9 @@ def main() -> None:
     config = dict(LuxMatchConfigs_Default)
     config["seed"] = seed
 
-    agent_a = BehaviorCloningAgent(args.model_a, device=args.device)
+    agent_a = BehaviorCloningAgent(args.model_a, device=args.device, tta=args.tta_a)
     agent_a.replay_name = args.model_a
-    agent_b = BehaviorCloningAgent(args.model_b, device=args.device)
+    agent_b = BehaviorCloningAgent(args.model_b, device=args.device, tta=args.tta_b)
     agent_b.replay_name = args.model_b
 
     match_name = f"{model_label(args.model_a)}-vs-{model_label(args.model_b)}_seed{seed}"
