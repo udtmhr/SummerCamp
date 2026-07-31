@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 CHECKPOINT_SCHEMA_VERSION = 1
 POLICY_SCHEMA_FACTORIZED = "factorized_v1"
 POLICY_SCHEMA_FIRST_PLACE_FLAT = "first_place_flat_v1"
+ENCODER_TYPES = ("unet", "transformer16", "axial32", "axial32_4m5")
 
 
 def _group_count(channels: int) -> int:
@@ -90,10 +91,13 @@ class ModelConfig:
     transformer_dropout: float = 0.1
     transformer16_layers: int = 8
     axial32_layers: int = 6
+    axial32_4m5_dim: int = 192
+    axial32_4m5_ffn_dim: int = 672
+    axial32_4m5_layers: int = 6
     policy_schema: str = POLICY_SCHEMA_FACTORIZED
 
     def __post_init__(self) -> None:
-        if self.encoder_type not in {"unet", "transformer16", "axial32"}:
+        if self.encoder_type not in ENCODER_TYPES:
             msg = f"Unsupported encoder type: {self.encoder_type}"
             raise ValueError(msg)
         if self.policy_schema not in {POLICY_SCHEMA_FACTORIZED, POLICY_SCHEMA_FIRST_PLACE_FLAT}:
@@ -103,11 +107,13 @@ class ModelConfig:
             raise ValueError("transformer_heads must be positive")
         if self.transformer_dim % self.transformer_heads:
             raise ValueError("transformer_dim must be divisible by transformer_heads")
-        if self.transformer_ffn_dim < 1:
-            raise ValueError("transformer_ffn_dim must be positive")
+        if self.axial32_4m5_dim % self.transformer_heads:
+            raise ValueError("axial32_4m5_dim must be divisible by transformer_heads")
+        if self.transformer_ffn_dim < 1 or self.axial32_4m5_ffn_dim < 1:
+            raise ValueError("Transformer FFN dimensions must be positive")
         if not 0 <= self.transformer_dropout < 1:
             raise ValueError("transformer_dropout must be in [0, 1)")
-        if self.transformer16_layers < 1 or self.axial32_layers < 1:
+        if self.transformer16_layers < 1 or self.axial32_layers < 1 or self.axial32_4m5_layers < 1:
             raise ValueError("Transformer layer counts must be positive")
 
 
@@ -301,18 +307,21 @@ class AxisAttention(nn.Module):
             self.head_dim,
         )
         query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
-        # Keep the QK product and softmax in FP32. Long training runs can grow
-        # otherwise-finite FP16 queries enough to overflow the dot product.
-        scores = torch.matmul(query.float(), key.float().transpose(-2, -1)) * self.scale
         indices = self.distance_indices[:length, :length]
-        scores = scores + distance_bias[:, indices].unsqueeze(0).float()
-
         empty_groups = ~flat_mask.any(dim=1)
         first_position = torch.arange(length, device=inputs.device) == 0
         safe_mask = flat_mask | (empty_groups[:, None] & first_position[None])
-        scores = scores.masked_fill(~safe_mask[:, None, None, :], torch.finfo(scores.dtype).min)
-        probabilities = self.dropout(torch.softmax(scores, dim=-1))
-        attended = torch.matmul(probabilities, value.float()).to(dtype=value.dtype)
+        attention_bias = distance_bias[:, indices].unsqueeze(0).to(dtype=query.dtype)
+        attention_bias = attention_bias.expand(batch_size * group_count, -1, -1, -1)
+        attention_bias = attention_bias.masked_fill(~safe_mask[:, None, None, :], float("-inf"))
+        attended = nn_functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_bias,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            scale=self.scale,
+        )
         attended = attended.transpose(1, 2).reshape(batch_size * group_count, length, channels)
         attended = self.projection(attended).reshape(batch_size, group_count, length, channels)
         return attended * valid_mask[..., None]
@@ -364,7 +373,10 @@ class Axial32SpatialEncoder(nn.Module):
         if config.input_channels != len(FEATURE_NAMES):
             msg = f"Expected {len(FEATURE_NAMES)} input channels, got {config.input_channels}"
             raise ValueError(msg)
-        channels = config.transformer_dim
+        compact = config.encoder_type == "axial32_4m5"
+        channels = config.axial32_4m5_dim if compact else config.transformer_dim
+        ffn_dim = config.axial32_4m5_ffn_dim if compact else config.transformer_ffn_dim
+        layer_count = config.axial32_4m5_layers if compact else config.axial32_layers
         self.cycle_embedding = nn.Embedding(CYCLE_LENGTH, config.cycle_embedding_dim)
         self.phase_embedding = nn.Embedding(GAME_PHASE_COUNT, config.phase_embedding_dim)
         self.board_size_embedding = nn.Embedding(len(BOARD_SIZES), config.board_size_embedding_dim)
@@ -379,10 +391,10 @@ class Axial32SpatialEncoder(nn.Module):
             AxialTransformerBlock(
                 channels,
                 config.transformer_heads,
-                config.transformer_ffn_dim,
+                ffn_dim,
                 config.transformer_dropout,
             )
-            for _ in range(config.axial32_layers)
+            for _ in range(layer_count)
         )
         self.output = _EncoderStage(channels, config.feature_channels)
         self.output_channels = config.feature_channels
@@ -448,6 +460,7 @@ class LuxBehaviorCloningModel(nn.Module):
             "unet": LuxSpatialEncoder,
             "transformer16": Transformer16SpatialEncoder,
             "axial32": Axial32SpatialEncoder,
+            "axial32_4m5": Axial32SpatialEncoder,
         }
         self.encoder = encoder_types[self.config.encoder_type](self.config)
         action_schema = (

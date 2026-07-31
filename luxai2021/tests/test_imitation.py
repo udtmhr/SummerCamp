@@ -46,6 +46,7 @@ from luxai2021.imitation.masking import (
     build_legal_masks,
 )
 from luxai2021.imitation.model import (
+    POLICY_SCHEMA_FIRST_PLACE_FLAT,
     AxialTransformerBlock,
     AxisAttention,
     LuxBehaviorCloningModel,
@@ -337,7 +338,7 @@ def test_encoder_masks_padding_and_returns_global_features():
     assert output["global_features"].shape == (1, model.encoder.global_output_channels)
 
 
-@pytest.mark.parametrize("encoder_type", ["unet", "transformer16", "axial32"])
+@pytest.mark.parametrize("encoder_type", ["unet", "transformer16", "axial32", "axial32_4m5"])
 @pytest.mark.parametrize("board_size", BOARD_SIZES)
 def test_all_encoders_mask_padding_and_return_finite_features(encoder_type, board_size):
     offset = (32 - board_size) // 2
@@ -354,6 +355,9 @@ def test_all_encoders_mask_padding_and_return_finite_features(encoder_type, boar
             transformer_ffn_dim=32,
             transformer16_layers=1,
             axial32_layers=1,
+            axial32_4m5_dim=16,
+            axial32_4m5_ffn_dim=32,
+            axial32_4m5_layers=1,
         )
     )
 
@@ -385,7 +389,7 @@ def test_axis_attention_handles_fully_padded_groups_and_ignores_invalid_keys():
     assert torch.allclose(output[:, 0, :2], changed_output[:, 0, :2])
 
 
-def test_axis_attention_uses_finite_fp32_scores_for_fp16_inputs():
+def test_axis_attention_sdpa_is_finite_for_large_fp16_inputs():
     attention = AxisAttention(channels=4, heads=1, dropout=0.0).half()
     with torch.no_grad():
         attention.qkv.weight.zero_()
@@ -425,7 +429,17 @@ def test_default_transformer_parameter_counts_match_unet_budget():
     assert all(0.9 * baseline <= count <= 1.1 * baseline for count in parameter_counts.values())
 
 
-@pytest.mark.parametrize("encoder_type", ["unet", "transformer16", "axial32"])
+def test_compact_axial_has_4m5_parameters_for_flat_distillation_policy():
+    config = ModelConfig(
+        encoder_type="axial32_4m5",
+        policy_schema=POLICY_SCHEMA_FIRST_PLACE_FLAT,
+    )
+    parameter_count = sum(parameter.numel() for parameter in LuxBehaviorCloningModel(config).parameters())
+
+    assert parameter_count == 4_505_692
+
+
+@pytest.mark.parametrize("encoder_type", ["unet", "transformer16", "axial32", "axial32_4m5"])
 def test_encoder_checkpoint_round_trip(tmp_path, encoder_type):
     config = ModelConfig(
         base_channels=8,
@@ -436,6 +450,9 @@ def test_encoder_checkpoint_round_trip(tmp_path, encoder_type):
         transformer_ffn_dim=32,
         transformer16_layers=1,
         axial32_layers=1,
+        axial32_4m5_dim=16,
+        axial32_4m5_ffn_dim=32,
+        axial32_4m5_layers=1,
     )
     model = LuxBehaviorCloningModel(config)
     checkpoint_path = tmp_path / f"{encoder_type}.pt"
@@ -495,6 +512,9 @@ def test_old_unet_checkpoint_without_encoder_config_loads(tmp_path):
         "transformer_dropout",
         "transformer16_layers",
         "axial32_layers",
+        "axial32_4m5_dim",
+        "axial32_4m5_ffn_dim",
+        "axial32_4m5_layers",
     ):
         checkpoint["model_config"].pop(name)
     torch.save(checkpoint, checkpoint_path)

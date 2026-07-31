@@ -27,6 +27,7 @@ from luxai2021.imitation.first_place import FIRST_PLACE_TEACHER_SHA256
 from luxai2021.imitation.model import (
     POLICY_SCHEMA_FIRST_PLACE_FLAT,
     LuxBehaviorCloningModel,
+    ModelConfig,
     load_bc_checkpoint,
     save_bc_checkpoint,
 )
@@ -38,6 +39,7 @@ DEFAULT_STUDENTS = {
     "unet": "models/bc_v2/best.pt",
     "transformer16": "models/bc_encoder_compare/transformer16/best.pt",
     "axial32": "models/bc_encoder_compare/axial32/best.pt",
+    "axial32_4m5": None,
 }
 
 
@@ -248,7 +250,7 @@ def main() -> None:
     source_checkpoint = args.student_checkpoint or DEFAULT_STUDENTS[args.encoder_type]
     if args.resume:
         model, checkpoint = load_bc_checkpoint(args.resume, str(device))
-        source_checkpoint = str(checkpoint.get("source_student_checkpoint", source_checkpoint))
+        source_checkpoint = checkpoint.get("source_student_checkpoint", source_checkpoint)
         if model.config.policy_schema != POLICY_SCHEMA_FIRST_PLACE_FLAT:
             raise ValueError("--resume must be a distilled flat-policy checkpoint")
         if model.config.encoder_type != args.encoder_type:
@@ -257,13 +259,20 @@ def main() -> None:
         split = checkpoint["split"]
         start_epoch = int(checkpoint["epoch"]) + 1
     else:
-        source_model, _ = load_bc_checkpoint(source_checkpoint, "cpu")
-        if source_model.config.encoder_type != args.encoder_type:
-            message = f"Student checkpoint encoder is {source_model.config.encoder_type}, not {args.encoder_type}"
-            raise ValueError(message)
-        config = replace(source_model.config, policy_schema=POLICY_SCHEMA_FIRST_PLACE_FLAT)
-        model = LuxBehaviorCloningModel(config)
-        model.encoder.load_state_dict(source_model.encoder.state_dict(), strict=True)
+        if source_checkpoint is None:
+            config = ModelConfig(
+                encoder_type=args.encoder_type,
+                policy_schema=POLICY_SCHEMA_FIRST_PLACE_FLAT,
+            )
+            model = LuxBehaviorCloningModel(config)
+        else:
+            source_model, _ = load_bc_checkpoint(source_checkpoint, "cpu")
+            if source_model.config.encoder_type != args.encoder_type:
+                message = f"Student checkpoint encoder is {source_model.config.encoder_type}, not {args.encoder_type}"
+                raise ValueError(message)
+            config = replace(source_model.config, policy_schema=POLICY_SCHEMA_FIRST_PLACE_FLAT)
+            model = LuxBehaviorCloningModel(config)
+            model.encoder.load_state_dict(source_model.encoder.state_dict(), strict=True)
         replay_paths = discover_replays(args.replay_dir)
         path_split = split_replays(replay_paths, seed=args.seed)
         split = {name: [str(path) for path in paths] for name, paths in path_split.items()}

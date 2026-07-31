@@ -31,6 +31,7 @@ from luxai2021.imitation.data import (
     split_replays,
 )
 from luxai2021.imitation.model import (
+    ENCODER_TYPES,
     LuxBehaviorCloningModel,
     ModelConfig,
     behavior_cloning_loss,
@@ -50,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replay-dir", required=True, help="Directory containing Kaggle replay JSON files.")
     parser.add_argument("--output-dir", default="models/bc", help="Checkpoint and metrics output directory.")
     parser.add_argument("--resume", help="Checkpoint to resume from.")
-    parser.add_argument("--encoder-type", choices=("unet", "transformer16", "axial32"))
+    parser.add_argument("--encoder-type", choices=ENCODER_TYPES)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=3e-4)

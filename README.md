@@ -355,17 +355,20 @@ flags, corrected cooldown normalization, and categorical embeddings for the 40-t
 board size. The encoder masks padding at every U-Net stage and exposes pooled global features for a future
 RL value head.
 
-Three parameter-matched encoders can be trained with the same observation, action heads, and viable-action
+Four encoders can be trained with the same observation, action heads, and viable-action
 masks:
 
 - `unet` is the default 32x32 residual U-Net.
 - `transformer16` applies an eight-layer Transformer to 16x16 tokens and decodes through a 32x32 skip.
 - `axial32` keeps 32x32 features and alternates row and column attention in six axial blocks.
+- `axial32_4m5` keeps the six axial blocks but uses 192-wide attention and a 672-wide FFN. The flat-policy
+  distillation model has 4,505,692 parameters, versus 7,603,740 for the full `axial32` model.
 
 CUDA training enables `torch.compile(..., mode="max-autotune")` and BF16 autocast by default. The lazy compilation warmup is
 reported separately from epoch throughput and does not alter checkpoint keys; use `--no-compile` for an eager
 baseline, `--compile-mode default|reduce-overhead|max-autotune` to select another mode, or
-`--amp-dtype float16` to explicitly request FP16. Axial attention always computes its score and softmax in FP32.
+`--amp-dtype float16` to explicitly request FP16. Axial attention uses PyTorch scaled-dot-product attention
+kernel dispatch while retaining the learned relative-distance bias and padding mask.
 Training stops before an optimizer update when a non-finite loss or gradient is detected.
 
 Use the same seed, effective batch, and shared class-statistics cache for an architecture comparison:
@@ -537,10 +540,10 @@ uv run python examples/precompute_distillation_dataset.py \
   --num-workers 4
 ```
 
-Train any of the three student encoders against the shared prepared cache:
+Train any student encoder against the shared prepared cache:
 
 ```bash
-for encoder in unet transformer16 axial32; do
+for encoder in unet transformer16 axial32 axial32_4m5; do
   uv run python examples/train_distilled_bc.py \
     --encoder-type "$encoder" \
     --replay-dir replay_datasets \
@@ -554,8 +557,10 @@ for encoder in unet transformer16 axial32; do
 done
 ```
 
-The student starts from the matching existing BC encoder and replaces only its policy heads with the faithful flat
-schema. Training combines temperature-scaled KL loss with replay hard labels. CUDA training enables BF16, TF32,
+The first three students start from the matching existing BC encoder and replace only their policy heads with the
+faithful flat schema. `axial32_4m5` starts directly from distillation unless `--student-checkpoint` supplies a
+matching pretrained checkpoint. Training combines temperature-scaled KL loss with replay hard labels. CUDA
+training enables BF16, TF32,
 channels-last tensors, fused AdamW, variable-size tail batches without dummy padding, and replay caching. The legacy
 `--no-compile` flag is accepted as a no-op for command compatibility. D4 augmentation runs as one vectorized GPU
 operation, entity targets are padded only to the largest real entity count in each batch, and metric reductions
@@ -573,3 +578,23 @@ uv run python main.py \
 The teacher adapter is pinned to upstream commit `973a6c6c63211b6c7ab6fdf50e026e458d1f6e4e` and checkpoint SHA-256
 `40248f0fbc9b8e1e1b1f7cc6fc674c041d8dac43b964ae45bd976d927cdffd22`. See
 [`docs/THIRD_PARTY_NOTICES.md`](docs/THIRD_PARTY_NOTICES.md) for attribution.
+
+### Play against the original first-place model
+
+Use the normal one-on-one CLI with a BC or distilled checkpoint on one side and the original first-place teacher on
+the other:
+
+```bash
+uv run python main.py \
+  --model-a models/bc_v2/best.pt \
+  --type-a bc \
+  --model-b models/teachers/lux_2021_first_place/062179520_weights.pt \
+  --type-b first-place \
+  --tta-b auto \
+  --seed random \
+  --device auto
+```
+
+Set either `--type-a` or `--type-b` to `first-place` for the upstream teacher checkpoint. Ordinary BC and distilled
+checkpoints use `bc`. The first-place model enables its original 180-degree ensemble when TTA is `auto`. The replay
+uses the same timestamp-and-winner filename convention as other one-on-one matches.

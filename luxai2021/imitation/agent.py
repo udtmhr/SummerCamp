@@ -27,7 +27,12 @@ from luxai2021.imitation.actions import (
     WORKER_ACTIONS,
     first_place_action_remap,
 )
-from luxai2021.imitation.first_place import first_place_city_legal_mask, first_place_unit_legal_mask
+from luxai2021.imitation.first_place import (
+    first_place_city_legal_mask,
+    first_place_unit_legal_mask,
+    load_first_place_teacher,
+    predict_first_place,
+)
 from luxai2021.imitation.masking import (
     LEGAL_MASK_SUFFIX,
     apply_legal_action_mask,
@@ -83,9 +88,12 @@ class BehaviorCloningAgent(Agent):
             raise ValueError(message)
         self.tta = tta
 
+    def _uses_first_place_actions(self) -> bool:
+        return self.model.config.policy_schema == POLICY_SCHEMA_FIRST_PLACE_FLAT
+
     def _restore_rot180(self, output: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         restored = {}
-        flat_policy = self.model.config.policy_schema == POLICY_SCHEMA_FIRST_PLACE_FLAT
+        flat_policy = self._uses_first_place_actions()
         directional_heads = {
             "worker_move",
             "worker_transfer_dir",
@@ -159,7 +167,7 @@ class BehaviorCloningAgent(Agent):
         x: int,
         y: int,
     ) -> list[_Candidate]:
-        if self.model.config.policy_schema == POLICY_SCHEMA_FIRST_PLACE_FLAT:
+        if self._uses_first_place_actions():
             return self._flat_unit_candidates(game, unit, snapshot, unit_snapshot, output, x, y)
         prefix = "worker" if unit.is_worker() else "cart"
         action_names = WORKER_ACTIONS if unit.is_worker() else CART_ACTIONS
@@ -410,7 +418,7 @@ class BehaviorCloningAgent(Agent):
             game.state["teamStates"][team]["units"]
         )
         available_research = max(0, _MAX_RESEARCH - snapshot.research_points[team])
-        flat_policy = self.model.config.policy_schema == POLICY_SCHEMA_FIRST_PLACE_FLAT
+        flat_policy = self._uses_first_place_actions()
         legal_mask = first_place_city_legal_mask(snapshot, team) if flat_policy else city_legal_mask(snapshot, team)
         output_name = "city_tile" if flat_policy else "city"
         entries = []
@@ -467,4 +475,53 @@ class BehaviorCloningAgent(Agent):
         unit_choices = self._choose_units(game, team, snapshot, output, x_offset, y_offset)
         actions = self._choices_to_actions(unit_choices, team)
         actions.extend(self._city_actions(game, team, snapshot, output, x_offset, y_offset))
+        return actions
+
+
+class FirstPlaceAgent(BehaviorCloningAgent):
+    """Run the original Lux AI 2021 first-place policy checkpoint."""
+
+    def __init__(self, checkpoint_path: str, device: str = "auto", tta: str = "auto") -> None:
+        Agent.__init__(self)
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device)
+        self.model = load_first_place_teacher(checkpoint_path, self.device)
+        if self.device.type == "cuda":
+            self.model.to(memory_format=torch.channels_last)
+        self.checkpoint = {"source": checkpoint_path, "policy": "lux_ai_2021_first_place"}
+        if tta == "auto":
+            tta = "rot180"
+        if tta not in {"none", "rot180"}:
+            message = f"Unsupported inference augmentation: {tta}"
+            raise ValueError(message)
+        self.tta = tta
+
+    def _uses_first_place_actions(self) -> bool:
+        return True
+
+    @staticmethod
+    def _select_team_output(
+        output: dict[str, torch.Tensor],
+        team: int,
+    ) -> dict[str, torch.Tensor]:
+        # The upstream teacher stores spatial axes as [x, y], while the common
+        # action decoder consumes [y, x].
+        return {
+            name: logits[:, team].transpose(-2, -1).contiguous()
+            for name, logits in output.items()
+        }
+
+    def process_turn(self, game: object, team: int) -> list[object]:
+        snapshot = snapshot_from_game(game)
+        output = predict_first_place(
+            self.model,
+            [snapshot],
+            device=self.device,
+            rot180=self.tta == "rot180",
+        )
+        selected_output = self._select_team_output(output, team)
+        unit_choices = self._choose_units(game, team, snapshot, selected_output, 0, 0)
+        actions = self._choices_to_actions(unit_choices, team)
+        actions.extend(self._city_actions(game, team, snapshot, selected_output, 0, 0))
         return actions

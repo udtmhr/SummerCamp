@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import json
-import re
 import secrets
 from contextlib import suppress
-from datetime import datetime, timezone
-from pathlib import Path
 
 from luxai2021.env.lux_env import LuxEnvironment
 from luxai2021.game.constants import LuxMatchConfigs_Default
-from luxai2021.imitation import BehaviorCloningAgent
+from luxai2021.imitation import BehaviorCloningAgent, FirstPlaceAgent
+from luxai2021.imitation.matches import model_label, rename_replay
 
 
 def parse_seed(value: str) -> int | None:
@@ -25,32 +22,8 @@ def parse_seed(value: str) -> int | None:
     return seed
 
 
-def model_label(model_path: str) -> str:
-    path = Path(model_path)
-    parent = path.parent.name
-    label = f"{parent}_{path.stem}" if parent else path.stem
-    return re.sub(r"[^A-Za-z0-9_.-]+", "-", label)
-
-
-def rename_replay(replay_file: str, winner_name: str) -> Path:
-    source = Path(replay_file)
-    timestamp = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d_%H%M%S")
-    stem = f"{timestamp}_winner-{model_label(winner_name)}"
-    target = source.with_name(f"{stem}.json")
-    suffix = 2
-    while target.exists():
-        target = source.with_name(f"{stem}_{suffix}.json")
-        suffix += 1
-
-    source.rename(target)
-    replay = json.loads(target.read_text(encoding="utf-8"))
-    replay["results"]["replayFile"] = str(target)
-    target.write_text(json.dumps(replay), encoding="utf-8")
-    return target
-
-
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Play a local match between two behavior-cloning models.")
+    parser = argparse.ArgumentParser(description="Play a local match between two Lux AI 2021 models.")
     parser.add_argument(
         "--seed",
         type=parse_seed,
@@ -59,21 +32,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model-a", default="models/bc_v2/best.pt", help="First model checkpoint.")
     parser.add_argument("--model-b", default="models/bc_v2/best.pt", help="Second model checkpoint.")
+    parser.add_argument(
+        "--type-a",
+        default="bc",
+        choices=("bc", "first-place"),
+        help="Model A checkpoint type.",
+    )
+    parser.add_argument(
+        "--type-b",
+        default="bc",
+        choices=("bc", "first-place"),
+        help="Model B checkpoint type.",
+    )
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"), help="Inference device.")
     parser.add_argument(
         "--tta-a",
         default="auto",
         choices=("auto", "none", "rot180"),
-        help="Inference augmentation for model A; auto reads the checkpoint metadata.",
+        help="Inference augmentation for model A; first-place auto uses rot180.",
     )
     parser.add_argument(
         "--tta-b",
         default="auto",
         choices=("auto", "none", "rot180"),
-        help="Inference augmentation for model B; auto reads the checkpoint metadata.",
+        help="Inference augmentation for model B; first-place auto uses rot180.",
     )
     parser.add_argument("--replay-dir", default="replays", help="Replay output directory.")
     return parser
+
+
+def create_agent(checkpoint: str, model_type: str, device: str, tta: str) -> BehaviorCloningAgent:
+    if model_type == "first-place":
+        return FirstPlaceAgent(checkpoint, device=device, tta=tta)
+    return BehaviorCloningAgent(checkpoint, device=device, tta=tta)
 
 
 def main() -> None:
@@ -83,9 +74,9 @@ def main() -> None:
     config = dict(LuxMatchConfigs_Default)
     config["seed"] = seed
 
-    agent_a = BehaviorCloningAgent(args.model_a, device=args.device, tta=args.tta_a)
+    agent_a = create_agent(args.model_a, args.type_a, args.device, args.tta_a)
     agent_a.replay_name = args.model_a
-    agent_b = BehaviorCloningAgent(args.model_b, device=args.device, tta=args.tta_b)
+    agent_b = create_agent(args.model_b, args.type_b, args.device, args.tta_b)
     agent_b.replay_name = args.model_b
 
     match_name = f"{model_label(args.model_a)}-vs-{model_label(args.model_b)}_seed{seed}"
