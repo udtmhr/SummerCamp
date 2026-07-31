@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from math import sqrt
 from typing import TYPE_CHECKING
 
 import torch
@@ -50,50 +51,6 @@ class ResidualBlock(nn.Module):
         return self.activation(inputs + residual) * mask
 
 
-class FReLU(nn.Module):
-    def __init__(self, channels: int) -> None:
-        super().__init__()
-        self.depthwise = nn.Conv2d(
-            channels,
-            channels,
-            kernel_size=3,
-            padding=1,
-            groups=channels,
-            bias=False,
-        )
-        self.norm = nn.GroupNorm(_group_count(channels), channels)
-
-    def forward(self, inputs: Tensor) -> Tensor:
-        return torch.maximum(inputs, self.norm(self.depthwise(inputs)))
-
-
-class SqueezeExcitation(nn.Module):
-    def __init__(self, channels: int, reduction: int) -> None:
-        super().__init__()
-        hidden_channels = max(1, channels // reduction)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.reduce = nn.Conv2d(channels, hidden_channels, kernel_size=1, bias=False)
-        self.expand = nn.Conv2d(hidden_channels, channels, kernel_size=1, bias=False)
-
-    def forward(self, inputs: Tensor) -> Tensor:
-        scale = self.pool(inputs)
-        scale = nn_functional.relu(self.reduce(scale), inplace=True)
-        return inputs * torch.sigmoid(self.expand(scale))
-
-
-class DurrettResidualBlock(nn.Module):
-    def __init__(self, channels: int, se_reduction: int) -> None:
-        super().__init__()
-        self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.norm = nn.GroupNorm(_group_count(channels), channels)
-        self.se = SqueezeExcitation(channels, se_reduction)
-        self.activation = FReLU(channels)
-
-    def forward(self, inputs: Tensor, mask: Tensor) -> Tensor:
-        residual = self.se(self.norm(self.conv(inputs))) * mask
-        return self.activation(inputs + residual) * mask
-
-
 class _EncoderStage(nn.Module):
     def __init__(self, input_channels: int, output_channels: int, stride: int = 1) -> None:
         super().__init__()
@@ -125,21 +82,27 @@ class ModelConfig:
     phase_embedding_dim: int = 4
     board_size_embedding_dim: int = 4
     encoder_type: str = "unet"
-    durrett_layers: int = 18
-    transformer_layers: int = 1
-    transformer_heads: int = 1
-    se_reduction: int = 16
-    source_ids: tuple[int, ...] = ()
+    transformer_dim: int = 256
+    transformer_heads: int = 8
+    transformer_ffn_dim: int = 1024
+    transformer_dropout: float = 0.1
+    transformer16_layers: int = 8
+    axial32_layers: int = 6
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "source_ids", tuple(int(source_id) for source_id in self.source_ids))
-        if self.encoder_type not in {"unet", "durrett"}:
+        if self.encoder_type not in {"unet", "transformer16", "axial32"}:
             msg = f"Unsupported encoder type: {self.encoder_type}"
             raise ValueError(msg)
-        if len(set(self.source_ids)) != len(self.source_ids):
-            raise ValueError("source_ids must be unique")
-        if self.feature_channels % self.transformer_heads:
-            raise ValueError("feature_channels must be divisible by transformer_heads")
+        if self.transformer_heads < 1:
+            raise ValueError("transformer_heads must be positive")
+        if self.transformer_dim % self.transformer_heads:
+            raise ValueError("transformer_dim must be divisible by transformer_heads")
+        if self.transformer_ffn_dim < 1:
+            raise ValueError("transformer_ffn_dim must be positive")
+        if not 0 <= self.transformer_dropout < 1:
+            raise ValueError("transformer_dropout must be in [0, 1)")
+        if self.transformer16_layers < 1 or self.axial32_layers < 1:
+            raise ValueError("Transformer layer counts must be positive")
 
 
 @dataclass(frozen=True)
@@ -215,43 +178,44 @@ class LuxSpatialEncoder(nn.Module):
         return self.forward_features(inputs).spatial
 
 
-class DurrettSpatialEncoder(nn.Module):
+class Transformer16SpatialEncoder(nn.Module):
+    STEM_CHANNELS = 96
+
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         if config.input_channels != len(FEATURE_NAMES):
             msg = f"Expected {len(FEATURE_NAMES)} input channels, got {config.input_channels}"
             raise ValueError(msg)
-        channels = config.feature_channels
+        channels = config.transformer_dim
         self.cycle_embedding = nn.Embedding(CYCLE_LENGTH, config.cycle_embedding_dim)
         self.phase_embedding = nn.Embedding(GAME_PHASE_COUNT, config.phase_embedding_dim)
         self.board_size_embedding = nn.Embedding(len(BOARD_SIZES), config.board_size_embedding_dim)
         categorical_channels = config.cycle_embedding_dim + config.phase_embedding_dim + config.board_size_embedding_dim
         input_channels = len(SPATIAL_FEATURE_NAMES) + categorical_channels
-        self.stem = nn.Sequential(
-            nn.Conv2d(input_channels, channels, kernel_size=3, padding=1, bias=False),
+        self.stem = _EncoderStage(input_channels, self.STEM_CHANNELS)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(self.STEM_CHANNELS, channels, kernel_size=3, stride=2, padding=1, bias=False),
             nn.GroupNorm(_group_count(channels), channels),
-            nn.ReLU(inplace=True),
+            nn.SiLU(),
         )
-        self.blocks = nn.ModuleList(
-            DurrettResidualBlock(channels, config.se_reduction) for _ in range(config.durrett_layers)
-        )
-        encoder_layer = nn.TransformerEncoderLayer(
+        layer = nn.TransformerEncoderLayer(
             d_model=channels,
             nhead=config.transformer_heads,
-            dim_feedforward=channels,
-            dropout=0.1,
+            dim_feedforward=config.transformer_ffn_dim,
+            dropout=config.transformer_dropout,
             activation="gelu",
             batch_first=True,
-            norm_first=False,
+            norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=config.transformer_layers,
+            layer,
+            num_layers=config.transformer16_layers,
+            norm=nn.LayerNorm(channels),
             enable_nested_tensor=False,
         )
-        self.position_embedding = nn.Parameter(torch.randn(1, 32 * 32, channels) * 0.02)
-        self.output_channels = channels
-        self.global_output_channels = channels * 2 + categorical_channels
+        self.decoder = _EncoderStage(channels + self.STEM_CHANNELS, config.feature_channels)
+        self.output_channels = config.feature_channels
+        self.global_output_channels = config.feature_channels * 2 + categorical_channels
         self.register_buffer(
             "spatial_indices",
             torch.tensor([FEATURE_INDEX[name] for name in SPATIAL_FEATURE_NAMES]),
@@ -264,7 +228,7 @@ class DurrettSpatialEncoder(nn.Module):
         return values.round().long().clamp_(0, category_count - 1)
 
     def forward_features(self, inputs: Tensor) -> EncoderFeatures:
-        board_mask = inputs[:, FEATURE_INDEX["board_mask"] : FEATURE_INDEX["board_mask"] + 1]
+        mask0 = inputs[:, FEATURE_INDEX["board_mask"] : FEATURE_INDEX["board_mask"] + 1]
         spatial_inputs = inputs.index_select(1, self.spatial_indices)
         categorical = torch.cat(
             (
@@ -275,22 +239,179 @@ class DurrettSpatialEncoder(nn.Module):
             dim=1,
         )
         categorical_map = categorical[:, :, None, None].expand(-1, -1, inputs.shape[-2], inputs.shape[-1])
-        spatial = self.stem(torch.cat((spatial_inputs, categorical_map), dim=1) * board_mask) * board_mask
-        for block in self.blocks:
-            spatial = block(spatial, board_mask)
+        stem_inputs = torch.cat((spatial_inputs, categorical_map), dim=1) * mask0
+        skip = self.stem(stem_inputs, mask0)
 
-        batch_size, channels, height, width = spatial.shape
-        flattened = spatial.flatten(2).transpose(1, 2)
-        padding_mask = board_mask.flatten(2).squeeze(1) <= 0
-        attended = self.transformer(
-            flattened + self.position_embedding[:, : height * width],
-            src_key_padding_mask=padding_mask,
+        mask1 = nn_functional.max_pool2d(mask0, kernel_size=2, stride=2)
+        tokens_2d = self.downsample(skip) * mask1
+        batch_size, channels, height, width = tokens_2d.shape
+        tokens = tokens_2d.flatten(2).transpose(1, 2)
+        padding_mask = mask1.flatten(1) <= 0
+        tokens = self.transformer(tokens, src_key_padding_mask=padding_mask)
+        tokens_2d = tokens.transpose(1, 2).reshape(batch_size, channels, height, width) * mask1
+
+        upsampled = nn_functional.interpolate(
+            tokens_2d,
+            size=skip.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
         )
-        spatial = (flattened + attended).transpose(1, 2).reshape(batch_size, channels, height, width) * board_mask
+        spatial = self.decoder(torch.cat((upsampled, skip), dim=1), mask0)
+        valid_count = mask0.sum(dim=(-2, -1)).clamp_min(1)
+        pooled_average = (spatial * mask0).sum(dim=(-2, -1)) / valid_count
+        pooled_maximum = spatial.masked_fill(mask0 <= 0, torch.finfo(spatial.dtype).min).amax(dim=(-2, -1))
+        global_features = torch.cat((pooled_average, pooled_maximum, categorical), dim=1)
+        return EncoderFeatures(spatial=spatial, global_features=global_features)
 
-        valid_count = board_mask.sum(dim=(-2, -1)).clamp_min(1)
-        pooled_average = spatial.sum(dim=(-2, -1)) / valid_count
-        pooled_maximum = spatial.masked_fill(board_mask <= 0, torch.finfo(spatial.dtype).min).amax(dim=(-2, -1))
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.forward_features(inputs).spatial
+
+
+class AxisAttention(nn.Module):
+    def __init__(self, channels: int, heads: int, dropout: float, maximum_length: int = 32) -> None:
+        super().__init__()
+        self.heads = heads
+        self.head_dim = channels // heads
+        self.scale = 1 / sqrt(self.head_dim)
+        self.qkv = nn.Linear(channels, channels * 3)
+        self.projection = nn.Linear(channels, channels)
+        self.dropout = nn.Dropout(dropout)
+        positions = torch.arange(maximum_length)
+        self.register_buffer(
+            "distance_indices",
+            (positions[:, None] - positions[None, :]).abs(),
+            persistent=False,
+        )
+
+    def forward(self, inputs: Tensor, valid_mask: Tensor, distance_bias: Tensor) -> Tensor:
+        batch_size, group_count, length, channels = inputs.shape
+        flattened = inputs.reshape(batch_size * group_count, length, channels)
+        flat_mask = valid_mask.reshape(batch_size * group_count, length).bool()
+        qkv = self.qkv(flattened).reshape(
+            batch_size * group_count,
+            length,
+            3,
+            self.heads,
+            self.head_dim,
+        )
+        query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        # Keep the QK product and softmax in FP32. Long training runs can grow
+        # otherwise-finite FP16 queries enough to overflow the dot product.
+        scores = torch.matmul(query.float(), key.float().transpose(-2, -1)) * self.scale
+        indices = self.distance_indices[:length, :length]
+        scores = scores + distance_bias[:, indices].unsqueeze(0).float()
+
+        empty_groups = ~flat_mask.any(dim=1)
+        first_position = torch.arange(length, device=inputs.device) == 0
+        safe_mask = flat_mask | (empty_groups[:, None] & first_position[None])
+        scores = scores.masked_fill(~safe_mask[:, None, None, :], torch.finfo(scores.dtype).min)
+        probabilities = self.dropout(torch.softmax(scores, dim=-1))
+        attended = torch.matmul(probabilities, value.float()).to(dtype=value.dtype)
+        attended = attended.transpose(1, 2).reshape(batch_size * group_count, length, channels)
+        attended = self.projection(attended).reshape(batch_size, group_count, length, channels)
+        return attended * valid_mask[..., None]
+
+
+class AxialTransformerBlock(nn.Module):
+    def __init__(self, channels: int, heads: int, ffn_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.position = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False)
+        self.row_norm = nn.LayerNorm(channels)
+        self.column_norm = nn.LayerNorm(channels)
+        self.ffn_norm = nn.LayerNorm(channels)
+        self.row_attention = AxisAttention(channels, heads, dropout)
+        self.column_attention = AxisAttention(channels, heads, dropout)
+        self.distance_bias = nn.Parameter(torch.zeros(heads, 32))
+        self.ffn = nn.Sequential(
+            nn.Linear(channels, ffn_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, channels),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, inputs: Tensor, mask: Tensor) -> Tensor:
+        output = (inputs + self.position(inputs)) * mask
+        cell_mask = mask[:, 0].bool()
+
+        row_inputs = output.permute(0, 2, 3, 1)
+        row_update = self.row_attention(self.row_norm(row_inputs), cell_mask, self.distance_bias)
+        output = (output + row_update.permute(0, 3, 1, 2)) * mask
+
+        column_inputs = output.permute(0, 3, 2, 1)
+        column_mask = cell_mask.transpose(1, 2)
+        column_update = self.column_attention(
+            self.column_norm(column_inputs),
+            column_mask,
+            self.distance_bias,
+        )
+        output = (output + column_update.permute(0, 3, 2, 1)) * mask
+
+        cell_inputs = output.permute(0, 2, 3, 1)
+        ffn_update = self.ffn(self.ffn_norm(cell_inputs))
+        return (output + ffn_update.permute(0, 3, 1, 2)) * mask
+
+
+class Axial32SpatialEncoder(nn.Module):
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        if config.input_channels != len(FEATURE_NAMES):
+            msg = f"Expected {len(FEATURE_NAMES)} input channels, got {config.input_channels}"
+            raise ValueError(msg)
+        channels = config.transformer_dim
+        self.cycle_embedding = nn.Embedding(CYCLE_LENGTH, config.cycle_embedding_dim)
+        self.phase_embedding = nn.Embedding(GAME_PHASE_COUNT, config.phase_embedding_dim)
+        self.board_size_embedding = nn.Embedding(len(BOARD_SIZES), config.board_size_embedding_dim)
+        categorical_channels = config.cycle_embedding_dim + config.phase_embedding_dim + config.board_size_embedding_dim
+        input_channels = len(SPATIAL_FEATURE_NAMES) + categorical_channels
+        self.stem = nn.Sequential(
+            nn.Conv2d(input_channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_group_count(channels), channels),
+            nn.SiLU(),
+        )
+        self.blocks = nn.ModuleList(
+            AxialTransformerBlock(
+                channels,
+                config.transformer_heads,
+                config.transformer_ffn_dim,
+                config.transformer_dropout,
+            )
+            for _ in range(config.axial32_layers)
+        )
+        self.output = _EncoderStage(channels, config.feature_channels)
+        self.output_channels = config.feature_channels
+        self.global_output_channels = config.feature_channels * 2 + categorical_channels
+        self.register_buffer(
+            "spatial_indices",
+            torch.tensor([FEATURE_INDEX[name] for name in SPATIAL_FEATURE_NAMES]),
+            persistent=False,
+        )
+
+    @staticmethod
+    def _category_index(inputs: Tensor, name: str, category_count: int) -> Tensor:
+        values = inputs[:, FEATURE_INDEX[name]].amax(dim=(-2, -1))
+        return values.round().long().clamp_(0, category_count - 1)
+
+    def forward_features(self, inputs: Tensor) -> EncoderFeatures:
+        mask = inputs[:, FEATURE_INDEX["board_mask"] : FEATURE_INDEX["board_mask"] + 1]
+        spatial_inputs = inputs.index_select(1, self.spatial_indices)
+        categorical = torch.cat(
+            (
+                self.cycle_embedding(self._category_index(inputs, "day_night_cycle", CYCLE_LENGTH)),
+                self.phase_embedding(self._category_index(inputs, "game_phase", GAME_PHASE_COUNT)),
+                self.board_size_embedding(self._category_index(inputs, "board_size", len(BOARD_SIZES))),
+            ),
+            dim=1,
+        )
+        categorical_map = categorical[:, :, None, None].expand(-1, -1, inputs.shape[-2], inputs.shape[-1])
+        spatial = self.stem(torch.cat((spatial_inputs, categorical_map), dim=1) * mask) * mask
+        for block in self.blocks:
+            spatial = block(spatial, mask)
+        spatial = self.output(spatial, mask)
+
+        valid_count = mask.sum(dim=(-2, -1)).clamp_min(1)
+        pooled_average = (spatial * mask).sum(dim=(-2, -1)) / valid_count
+        pooled_maximum = spatial.masked_fill(mask <= 0, torch.finfo(spatial.dtype).min).amax(dim=(-2, -1))
         global_features = torch.cat((pooled_average, pooled_maximum, categorical), dim=1)
         return EncoderFeatures(spatial=spatial, global_features=global_features)
 
@@ -313,72 +434,22 @@ class ActionPredictionHead(nn.Module):
         return self.network(features)
 
 
-class MultiSourceActionPredictionHead(nn.Module):
-    def __init__(self, feature_channels: int, action_count: int, source_count: int) -> None:
-        super().__init__()
-        hidden_channels = max(32, feature_channels // 2)
-        self.projection = nn.Sequential(
-            nn.Conv2d(feature_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(_group_count(hidden_channels), hidden_channels),
-            nn.SiLU(),
-        )
-        self.classifiers = nn.ModuleList(
-            nn.Conv2d(hidden_channels, action_count, kernel_size=1) for _ in range(source_count)
-        )
-
-    def forward(self, features: Tensor, source_index: Tensor | int | None) -> Tensor:
-        projected = self.projection(features)
-        if isinstance(source_index, int):
-            return self.classifiers[source_index](projected)
-        if source_index is None:
-            if len(self.classifiers) != 1:
-                raise ValueError("source_index is required for a multi-source model")
-            return self.classifiers[0](projected)
-        source_index = source_index.to(device=features.device, dtype=torch.long).reshape(-1)
-        if source_index.shape[0] != features.shape[0]:
-            raise ValueError("source_index batch dimension does not match observation")
-        if torch.any((source_index < 0) | (source_index >= len(self.classifiers))):
-            raise ValueError("source_index is outside the configured source range")
-        if torch.all(source_index == source_index[0]):
-            return self.classifiers[int(source_index[0].item())](projected)
-        all_logits = torch.stack([classifier(projected) for classifier in self.classifiers], dim=1)
-        gather_index = source_index[:, None, None, None, None].expand(
-            -1,
-            1,
-            all_logits.shape[2],
-            all_logits.shape[3],
-            all_logits.shape[4],
-        )
-        return all_logits.gather(1, gather_index).squeeze(1)
-
-
 class LuxBehaviorCloningModel(nn.Module):
     def __init__(self, config: ModelConfig | None = None) -> None:
         super().__init__()
         self.config = config or ModelConfig()
-        self.encoder = (
-            DurrettSpatialEncoder(self.config)
-            if self.config.encoder_type == "durrett"
-            else LuxSpatialEncoder(self.config)
+        encoder_types = {
+            "unet": LuxSpatialEncoder,
+            "transformer16": Transformer16SpatialEncoder,
+            "axial32": Axial32SpatialEncoder,
+        }
+        self.encoder = encoder_types[self.config.encoder_type](self.config)
+        self.heads = nn.ModuleDict(
+            {
+                name: ActionPredictionHead(self.encoder.output_channels, len(actions))
+                for name, actions in ACTION_SCHEMA.items()
+            }
         )
-        if self.config.source_ids:
-            self.heads = nn.ModuleDict(
-                {
-                    name: MultiSourceActionPredictionHead(
-                        self.encoder.output_channels,
-                        len(actions),
-                        len(self.config.source_ids),
-                    )
-                    for name, actions in ACTION_SCHEMA.items()
-                }
-            )
-        else:
-            self.heads = nn.ModuleDict(
-                {
-                    name: ActionPredictionHead(self.encoder.output_channels, len(actions))
-                    for name, actions in ACTION_SCHEMA.items()
-                }
-            )
 
     def encode(self, observation: Tensor) -> Tensor:
         return self.encoder(observation)
@@ -390,14 +461,10 @@ class LuxBehaviorCloningModel(nn.Module):
         self,
         observation: Tensor,
         *,
-        source_index: Tensor | int | None = None,
         return_features: bool = False,
     ) -> dict[str, Tensor]:
         encoded = self.encode_with_global(observation)
-        if self.config.source_ids:
-            output = {name: head(encoded.spatial, source_index) for name, head in self.heads.items()}
-        else:
-            output = {name: head(encoded.spatial) for name, head in self.heads.items()}
+        output = {name: head(encoded.spatial) for name, head in self.heads.items()}
         if return_features:
             output["features"] = encoded.spatial
             output["global_features"] = encoded.global_features
@@ -412,7 +479,10 @@ def _safe_cross_entropy(
 ) -> Tensor:
     valid = target != IGNORE_INDEX
     if not torch.any(valid):
-        return logits[:, 0].sum() * 0
+        # Keep a gradient connection without reducing the entire logits tensor.
+        # A large but finite tensor can overflow during sum(), making inf * 0
+        # become NaN on batches that contain no target for this factorized head.
+        return logits.reshape(-1)[0] * 0
     losses = nn_functional.cross_entropy(
         logits,
         target,
@@ -520,7 +590,6 @@ def make_class_weights(
     counts: Mapping[str, Tensor],
     device: torch.device,
     exponent: float = 0.5,
-    stay_weight: float | None = None,
 ) -> dict[str, Tensor]:
     result = {}
     for name, count_values in counts.items():
@@ -531,9 +600,6 @@ def make_class_weights(
             weights[nonzero] = values[nonzero].pow(-exponent)
             weights[nonzero] /= weights[nonzero].mean()
         result[name] = weights
-    if stay_weight is not None:
-        result["worker_type"][0] *= stay_weight
-        result["cart_type"][0] *= stay_weight
     return result
 
 
@@ -547,10 +613,7 @@ def save_bc_checkpoint(  # noqa: PLR0913
     *,
     class_counts: Mapping[str, Tensor] | None = None,
     class_statistics_signature: str | None = None,
-    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
-    training_profile: str = "baseline",
-    source_catalog: tuple[Mapping[str, object], ...] = (),
-    default_source_id: int | None = None,
+    scaler: torch.amp.GradScaler | None = None,
 ) -> None:
     checkpoint = {
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
@@ -561,7 +624,7 @@ def save_bc_checkpoint(  # noqa: PLR0913
         "model": model.state_dict(),
         "encoder": model.encoder.state_dict(),
         "optimizer": None if optimizer is None else optimizer.state_dict(),
-        "scheduler": None if scheduler is None else scheduler.state_dict(),
+        "scaler": None if scaler is None else scaler.state_dict(),
         "epoch": epoch,
         "metrics": dict(metrics),
         "split": dict(split),
@@ -569,9 +632,6 @@ def save_bc_checkpoint(  # noqa: PLR0913
             None if class_counts is None else {name: values.detach().cpu() for name, values in class_counts.items()}
         ),
         "class_statistics_signature": class_statistics_signature,
-        "training_profile": training_profile,
-        "source_catalog": tuple(dict(source) for source in source_catalog),
-        "default_source_id": default_source_id,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, path)
@@ -591,6 +651,15 @@ def load_bc_checkpoint(
         raise ValueError("Checkpoint feature schema does not match this package")
     if checkpoint.get("action_schema") != ACTION_SCHEMA:
         raise ValueError("Checkpoint action schema does not match this package")
+    nonfinite_parameters = [
+        name
+        for name, value in checkpoint["model"].items()
+        if torch.is_floating_point(value) and not torch.isfinite(value).all()
+    ]
+    if nonfinite_parameters:
+        preview = ", ".join(nonfinite_parameters[:3])
+        message = f"Checkpoint contains non-finite model parameters: {preview}"
+        raise ValueError(message)
     model = LuxBehaviorCloningModel(ModelConfig(**checkpoint["model_config"]))
     model.load_state_dict(checkpoint["model"])
     model.to(device)

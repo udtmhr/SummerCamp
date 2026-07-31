@@ -11,7 +11,7 @@ from luxai2021.imitation.actions import ACTION_SCHEMA, TARGET_NAMES
 from luxai2021.imitation.masking import LEGAL_MASK_SCHEMA_VERSION
 from luxai2021.imitation.schema import FEATURE_SCHEMA_VERSION
 
-CLASS_STATISTICS_SCHEMA_VERSION = 2
+CLASS_STATISTICS_SCHEMA_VERSION = 1
 
 
 def class_statistics_signature(
@@ -19,21 +19,12 @@ def class_statistics_signature(
     *,
     team_selection: str,
     max_turns: int,
-    source_ids: Sequence[int] = (),
 ) -> str:
     files = []
     seen_paths = set()
     for replay_path in replay_paths:
         path = Path(replay_path).resolve()
-        agent_info_path = next(
-            (
-                parent / "agent_info.json"
-                for parent in (path.parent, *path.parents)
-                if (parent / "agent_info.json").exists()
-            ),
-            None,
-        )
-        related_paths = (path, path.with_name(f"{path.stem}_info.json"), agent_info_path)
+        related_paths = (path, path.with_name(f"{path.stem}_info.json"))
         for related in related_paths:
             if related is not None and related.exists() and related not in seen_paths:
                 seen_paths.add(related)
@@ -52,7 +43,6 @@ def class_statistics_signature(
         "action_schema": ACTION_SCHEMA,
         "team_selection": team_selection,
         "max_turns": max_turns,
-        "source_ids": [int(source_id) for source_id in source_ids],
         "files": files,
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 # ruff: noqa: INP001
 import argparse
+import hashlib
 import json
 import os
 import random
+import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -24,8 +27,6 @@ from luxai2021.imitation.data import (
     ReplayBatchSampler,
     class_counts,
     discover_replays,
-    discover_sources,
-    limit_replays_per_source,
     split_replays,
 )
 from luxai2021.imitation.model import (
@@ -48,21 +49,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replay-dir", required=True, help="Directory containing Kaggle replay JSON files.")
     parser.add_argument("--output-dir", default="models/bc", help="Checkpoint and metrics output directory.")
     parser.add_argument("--resume", help="Checkpoint to resume from.")
-    parser.add_argument("--training-profile", choices=("baseline", "durrett"))
-    parser.add_argument("--epochs", type=int)
-    parser.add_argument("--batch-size", type=int)
-    parser.add_argument("--learning-rate", type=float)
-    parser.add_argument("--weight-decay", type=float)
+    parser.add_argument("--encoder-type", choices=("unet", "transformer16", "axial32"))
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--winner-weight", type=float, default=1.5)
     parser.add_argument(
         "--team-selection",
-        choices=("winner", "all", "source"),
-        help="Select winner, both players, or the source submission represented by each replay directory.",
+        choices=("winner", "all"),
+        default="winner",
+        help="Train on the winner only (default), or retain both players.",
     )
-    parser.add_argument("--class-weight-exponent", type=float)
-    parser.add_argument("--stay-weight", type=float)
+    parser.add_argument("--class-weight-exponent", type=float, default=0.5)
     parser.add_argument("--gradient-clip", type=float, default=1.0)
-    parser.add_argument("--gradient-accumulation-steps", type=int)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Compile the model; enabled by default on CUDA.",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+        default="max-autotune",
+    )
+    parser.add_argument(
+        "--amp-dtype",
+        choices=("bfloat16", "float16", "float32"),
+        default="bfloat16",
+        help="CUDA compute dtype; bfloat16 is the stable default for Transformer training.",
+    )
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or an explicit torch device.")
     parser.add_argument(
         "--num-workers",
@@ -76,57 +94,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Ignore cached class counts and scan the training split again.",
     )
+    parser.add_argument(
+        "--class-statistics-path",
+        help="Shared class-statistics cache; defaults to <output-dir>/class_statistics.pt.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-turns", type=int, default=0, help="Limit turns per replay; useful for smoke tests.")
-    parser.add_argument(
-        "--max-replays-per-source",
-        type=int,
-        default=0,
-        help="Limit each source submission to this many replays; zero keeps all replays.",
-    )
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
     return parser.parse_args()
-
-
-def apply_profile_defaults(args: argparse.Namespace, checkpoint: Mapping[str, object] | None) -> None:
-    checkpoint_profile = None if checkpoint is None else str(checkpoint.get("training_profile", "baseline"))
-    if args.training_profile is None:
-        args.training_profile = checkpoint_profile or "baseline"
-    elif checkpoint_profile is not None and args.training_profile != checkpoint_profile:
-        msg = f"Checkpoint profile is {checkpoint_profile}, not {args.training_profile}"
-        raise ValueError(msg)
-
-    if args.training_profile == "durrett":
-        defaults = {
-            "epochs": 100,
-            "batch_size": 16,
-            "learning_rate": 1e-3,
-            "weight_decay": 1e-5,
-            "team_selection": "source",
-            "class_weight_exponent": 0.0,
-            "stay_weight": 0.3,
-            "gradient_accumulation_steps": 4,
-        }
-        if args.team_selection not in {None, "source"}:
-            raise ValueError("The durrett profile requires --team-selection source")
-    else:
-        defaults = {
-            "epochs": 20,
-            "batch_size": 32,
-            "learning_rate": 3e-4,
-            "weight_decay": 1e-4,
-            "team_selection": "winner",
-            "class_weight_exponent": 0.5,
-            "stay_weight": None,
-            "gradient_accumulation_steps": 1,
-        }
-        if args.team_selection == "source":
-            raise ValueError("--team-selection source requires --training-profile durrett")
-    for name, value in defaults.items():
-        if getattr(args, name) is None:
-            setattr(args, name, value)
-    if args.gradient_accumulation_steps < 1:
-        raise ValueError("--gradient-accumulation-steps must be at least 1")
 
 
 def resolve_device(device: str) -> torch.device:
@@ -140,6 +115,35 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.gradient_accumulation_steps < 1:
+        raise ValueError("--gradient-accumulation-steps must be at least 1")
+
+
+def resolve_compile(*, enabled: bool | None, device: torch.device) -> bool:
+    return device.type == "cuda" if enabled is None else enabled
+
+
+def resolve_amp_dtype(name: str, device: torch.device) -> torch.dtype:
+    dtype = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }[name]
+    if device.type == "cuda" and dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        raise ValueError("This CUDA device does not support bfloat16; use --amp-dtype float16")
+    return dtype
+
+
+def data_split_signature(split: Mapping[str, Iterable[str]]) -> str:
+    serialized = json.dumps(
+        {name: list(paths) for name, paths in sorted(split.items())},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(serialized).hexdigest()
 
 
 def resolve_num_workers(num_workers: int) -> int:
@@ -200,7 +204,7 @@ def merge_confusion_matrices(totals: dict[str, torch.Tensor], matrices: Mapping[
         totals[name] = detached if name not in totals else totals[name] + detached
 
 
-def run_epoch(  # noqa: C901, PLR0913
+def run_epoch(  # noqa: C901, PLR0913, PLR0915
     model: LuxBehaviorCloningModel,
     loader: DataLoader,
     device: torch.device,
@@ -213,17 +217,20 @@ def run_epoch(  # noqa: C901, PLR0913
     show_progress: bool = True,
     collect_confusion: bool = False,
     gradient_accumulation_steps: int = 1,
-    source_ids: tuple[int, ...] = (),
+    amp_dtype: torch.dtype = torch.bfloat16,
 ) -> dict[str, object]:
     training = optimizer is not None
     model.train(training)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+    started_at = time.perf_counter()
     loss_total = torch.zeros((), device=device)
+    sample_count = 0
+    optimizer_steps = 0
     metric_totals: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     confusion_totals: dict[str, torch.Tensor] = {}
-    source_metric_totals: dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]] = {}
-    source_loss_totals: dict[int, float] = {}
-    source_batch_counts: dict[int, int] = {}
-    amp_enabled = device.type == "cuda"
+    amp_enabled = device.type == "cuda" and amp_dtype != torch.float32
     progress = tqdm(
         loader,
         desc=description,
@@ -236,10 +243,26 @@ def run_epoch(  # noqa: C901, PLR0913
         optimizer.zero_grad(set_to_none=True)
     for batch_index, raw_batch in enumerate(progress, start=1):
         batch = move_batch(raw_batch, device)
-        source_index = batch["source_index"] if source_ids else None
-        with torch.set_grad_enabled(training), torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
-            output = model(batch["observation"], source_index=source_index)
+        sample_count += int(batch["observation"].shape[0])
+        with (
+            torch.set_grad_enabled(training),
+            torch.amp.autocast(
+                device_type=device.type,
+                enabled=amp_enabled,
+                dtype=amp_dtype,
+            ),
+        ):
+            output = model(batch["observation"])
             losses = behavior_cloning_loss(output, batch, class_weights)
+        if not bool(torch.isfinite(losses["loss"]).detach()):
+            phase = description or ("training" if training else "evaluation")
+            nonfinite_outputs = [name for name, value in output.items() if not bool(torch.isfinite(value).all())]
+            nonfinite_losses = [name for name, value in losses.items() if not bool(torch.isfinite(value).all())]
+            message = (
+                f"Non-finite loss in {phase} at batch {batch_index}; "
+                f"outputs={nonfinite_outputs}, losses={nonfinite_losses}"
+            )
+            raise FloatingPointError(message)
         if training:
             group_start = ((batch_index - 1) // gradient_accumulation_steps) * gradient_accumulation_steps
             group_size = min(gradient_accumulation_steps, len(loader) - group_start)
@@ -247,42 +270,91 @@ def run_epoch(  # noqa: C901, PLR0913
             should_step = batch_index % gradient_accumulation_steps == 0 or batch_index == len(loader)
             if should_step:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    gradient_clip,
+                    error_if_nonfinite=True,
+                )
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                optimizer_steps += 1
         loss_total += losses["loss"].detach()
         merge_metrics(metric_totals, compute_metrics(output, batch))
-        if source_ids:
-            with torch.no_grad():
-                for source_index_value in torch.unique(batch["source_index"]).tolist():
-                    selection = batch["source_index"] == source_index_value
-                    source_output = {name: value[selection].detach().float() for name, value in output.items()}
-                    source_batch = {name: value[selection] for name, value in batch.items()}
-                    source_losses = behavior_cloning_loss(source_output, source_batch, class_weights)
-                    source_loss_totals[source_index_value] = source_loss_totals.get(source_index_value, 0.0) + float(
-                        source_losses["loss"]
-                    )
-                    source_batch_counts[source_index_value] = source_batch_counts.get(source_index_value, 0) + 1
-                    source_totals = source_metric_totals.setdefault(source_index_value, {})
-                    merge_metrics(source_totals, compute_metrics(source_output, source_batch))
         if collect_confusion:
             merge_confusion_matrices(confusion_totals, compute_confusion_matrices(output, batch))
         if batch_index % 20 == 0 or batch_index == len(loader):
             progress.set_postfix(loss=f"{float(loss_total.cpu()) / batch_index:.4f}")
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    duration_seconds = time.perf_counter() - started_at
     result = finalized_metrics(float(loss_total.cpu()), len(loader), metric_totals)
-    if source_ids:
-        result["sources"] = {
-            str(source_ids[source_index_value]): finalized_metrics(
-                source_loss_totals[source_index_value],
-                source_batch_counts[source_index_value],
-                source_metric_totals[source_index_value],
-            )
-            for source_index_value in sorted(source_metric_totals)
+    result.update(
+        {
+            "duration_seconds": duration_seconds,
+            "samples": sample_count,
+            "samples_per_second": sample_count / max(duration_seconds, 1e-9),
+            "optimizer_steps": optimizer_steps,
+            "peak_cuda_memory_allocated_bytes": (
+                int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else None
+            ),
         }
+    )
     if collect_confusion:
         result["confusion_matrices"] = {name: matrix.cpu().tolist() for name, matrix in confusion_totals.items()}
     return result
+
+
+def warm_up_compiled_model(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    scaler: torch.amp.GradScaler,
+    amp_dtype: torch.dtype,
+) -> float:
+    model.train()
+    model.zero_grad(set_to_none=True)
+    batch = move_batch(next(iter(loader)), device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    started_at = time.perf_counter()
+    with torch.amp.autocast(
+        device_type=device.type,
+        enabled=device.type == "cuda" and amp_dtype != torch.float32,
+        dtype=amp_dtype,
+    ):
+        output = model(batch["observation"])
+        warmup_loss = torch.stack(tuple(value.float().mean() for value in output.values())).sum()
+    scaler.scale(warmup_loss).backward()
+    model.zero_grad(set_to_none=True)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return time.perf_counter() - started_at
+
+
+def warm_up_compiled_inference(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+) -> float:
+    model.eval()
+    batch = move_batch(next(iter(loader)), device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    started_at = time.perf_counter()
+    with (
+        torch.inference_mode(),
+        torch.amp.autocast(
+            device_type=device.type,
+            enabled=device.type == "cuda" and amp_dtype != torch.float32,
+            dtype=amp_dtype,
+        ),
+    ):
+        model(batch["observation"])
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return time.perf_counter() - started_at
 
 
 def make_loader(  # noqa: PLR0913
@@ -307,13 +379,12 @@ def make_loader(  # noqa: PLR0913
     return DataLoader(dataset, batch_size=batch_size, **options)
 
 
-def make_datasets(  # noqa: PLR0913
+def make_datasets(
     split: Mapping[str, Iterable[str]],
     team_selection: str,
     winner_weight: float,
     seed: int,
     max_turns: int,
-    source_ids: tuple[int, ...],
 ) -> dict[str, LuxReplayDataset]:
     return {
         "train": LuxReplayDataset(
@@ -323,7 +394,6 @@ def make_datasets(  # noqa: PLR0913
             winner_weight=winner_weight,
             seed=seed,
             max_turns=max_turns,
-            source_ids=source_ids,
         ),
         "train_counting": LuxReplayDataset(
             [Path(path) for path in split["train"]],
@@ -332,7 +402,6 @@ def make_datasets(  # noqa: PLR0913
             winner_weight=winner_weight,
             seed=seed,
             max_turns=max_turns,
-            source_ids=source_ids,
         ),
         "validation": LuxReplayDataset(
             [Path(path) for path in split["validation"]],
@@ -341,7 +410,6 @@ def make_datasets(  # noqa: PLR0913
             winner_weight=winner_weight,
             seed=seed,
             max_turns=max_turns,
-            source_ids=source_ids,
         ),
         "test": LuxReplayDataset(
             [Path(path) for path in split["test"]],
@@ -350,63 +418,39 @@ def make_datasets(  # noqa: PLR0913
             winner_weight=winner_weight,
             seed=seed,
             max_turns=max_turns,
-            source_ids=source_ids,
         ),
     }
 
 
 def main() -> None:  # noqa: C901, PLR0912, PLR0915
     args = parse_args()
+    validate_args(args)
     seed_everything(args.seed)
     device = resolve_device(args.device)
+    amp_dtype = resolve_amp_dtype(args.amp_dtype, device)
+    compile_enabled = resolve_compile(enabled=args.compile, device=device)
     configure_device(device)
     num_workers = resolve_num_workers(args.num_workers)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = None
-    source_catalog: tuple[Mapping[str, object], ...] = ()
-    default_source_id = None
 
     if args.resume:
         model, checkpoint = load_bc_checkpoint(args.resume, str(device))
-        apply_profile_defaults(args, checkpoint)
+        checkpoint_encoder_type = model.config.encoder_type
+        if args.encoder_type is not None and args.encoder_type != checkpoint_encoder_type:
+            msg = f"Checkpoint encoder is {checkpoint_encoder_type}, not {args.encoder_type}"
+            raise ValueError(msg)
+        args.encoder_type = checkpoint_encoder_type
         split = checkpoint["split"]
-        source_catalog = tuple(checkpoint.get("source_catalog") or ())
-        default_source_id = checkpoint.get("default_source_id")
         start_epoch = int(checkpoint["epoch"]) + 1
     else:
-        apply_profile_defaults(args, None)
+        args.encoder_type = args.encoder_type or "unet"
         replay_paths = discover_replays(args.replay_dir)
-        if args.training_profile == "durrett":
-            replay_paths = limit_replays_per_source(replay_paths, args.max_replays_per_source)
-            sources = discover_sources(replay_paths)
-            if not sources:
-                raise ValueError("No source submissions were discovered")
-            source_catalog = tuple(
-                {
-                    "source_id": source.source_id,
-                    "lb": source.lb,
-                    "index": index,
-                }
-                for index, source in enumerate(sources)
-            )
-            default_source_id = max(sources, key=lambda source: (source.lb, -source.source_id)).source_id
-            source_ids = tuple(source.source_id for source in sources)
-            model_config = ModelConfig(
-                base_channels=384,
-                feature_channels=384,
-                encoder_type="durrett",
-                source_ids=source_ids,
-            )
-        else:
-            if args.max_replays_per_source:
-                raise ValueError("--max-replays-per-source requires --training-profile durrett")
-            model_config = ModelConfig()
         path_split = split_replays(replay_paths, seed=args.seed)
         split = {name: [str(path) for path in paths] for name, paths in path_split.items()}
-        model = LuxBehaviorCloningModel(model_config).to(device)
+        model = LuxBehaviorCloningModel(ModelConfig(encoder_type=args.encoder_type)).to(device)
         start_epoch = 0
-    source_ids = tuple(model.config.source_ids)
     if device.type == "cuda":
         model.to(memory_format=torch.channels_last)
 
@@ -416,13 +460,14 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         args.winner_weight,
         args.seed,
         args.max_turns,
-        source_ids,
     )
     show_progress = not args.no_progress
     tqdm.write(
-        f"profile={args.training_profile} device={device} workers={num_workers} batch_size={args.batch_size} "
-        f"effective_batch={args.batch_size * args.gradient_accumulation_steps} train={len(datasets['train']):,} "
-        f"validation={len(datasets['validation']):,} test={len(datasets['test']):,} sources={len(source_ids)}"
+        f"encoder={args.encoder_type} device={device} workers={num_workers} batch_size={args.batch_size} "
+        f"effective_batch={args.batch_size * args.gradient_accumulation_steps} "
+        f"compile={compile_enabled} compile_mode={args.compile_mode} amp_dtype={args.amp_dtype} "
+        f"train={len(datasets['train']):,} validation={len(datasets['validation']):,} "
+        f"test={len(datasets['test']):,}"
     )
     train_sampler = ReplayBatchSampler(
         datasets["train"],
@@ -463,9 +508,10 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         split["train"],
         team_selection=args.team_selection,
         max_turns=args.max_turns,
-        source_ids=source_ids,
     )
-    statistics_path = output_dir / "class_statistics.pt"
+    statistics_path = (
+        Path(args.class_statistics_path) if args.class_statistics_path else output_dir / "class_statistics.pt"
+    )
     counts = None
     statistics_source = None
     if not args.recompute_class_statistics:
@@ -488,7 +534,6 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         counts,
         device,
         exponent=args.class_weight_exponent,
-        stay_weight=args.stay_weight,
     )
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -498,12 +543,24 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
     )
     if args.resume and checkpoint.get("optimizer") is not None:
         optimizer.load_state_dict(checkpoint["optimizer"])
-    scheduler = None
-    if args.training_profile == "durrett":
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=(50, 80), gamma=0.1)
-        if args.resume and checkpoint.get("scheduler") is not None:
-            scheduler.load_state_dict(checkpoint["scheduler"])
-    scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
+    scaler = torch.amp.GradScaler(
+        device.type,
+        enabled=device.type == "cuda" and amp_dtype == torch.float16,
+    )
+    if args.resume and checkpoint.get("scaler") is not None and scaler.is_enabled():
+        scaler.load_state_dict(checkpoint["scaler"])
+    execution_model = torch.compile(model, mode=args.compile_mode) if compile_enabled else model
+    compile_warmup_seconds = 0.0
+    if compile_enabled:
+        compile_warmup_seconds = warm_up_compiled_model(
+            execution_model,
+            loaders["validation"],
+            device,
+            scaler,
+            amp_dtype,
+        )
+        seed_everything(args.seed)
+        tqdm.write(f"torch.compile warmup: {compile_warmup_seconds:.2f}s")
 
     best_loss = float(checkpoint["metrics"]["validation"]["loss"]) if args.resume else float("inf")
     history = []
@@ -516,7 +573,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
     )
     for epoch in epoch_progress:
         train_metrics = run_epoch(
-            model,
+            execution_model,
             loaders["train"],
             device,
             weights,
@@ -526,21 +583,28 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             description=f"Train {epoch + 1}/{args.epochs}",
             show_progress=show_progress,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
-            source_ids=source_ids,
+            amp_dtype=amp_dtype,
         )
+        if compile_enabled and epoch == start_epoch:
+            inference_warmup_seconds = warm_up_compiled_inference(
+                execution_model,
+                loaders["validation"],
+                device,
+                amp_dtype,
+            )
+            compile_warmup_seconds += inference_warmup_seconds
+            tqdm.write(f"torch.compile inference warmup: {inference_warmup_seconds:.2f}s")
         with torch.inference_mode():
             validation_metrics = run_epoch(
-                model,
+                execution_model,
                 loaders["validation"],
                 device,
                 weights,
                 description=f"Validation {epoch + 1}/{args.epochs}",
                 show_progress=show_progress,
                 collect_confusion=True,
-                source_ids=source_ids,
+                amp_dtype=amp_dtype,
             )
-        if scheduler is not None:
-            scheduler.step()
         epoch_metrics = {"epoch": epoch, "train": train_metrics, "validation": validation_metrics}
         history.append(epoch_metrics)
         tqdm.write(json.dumps(epoch_metrics, sort_keys=True))
@@ -553,10 +617,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             split,
             class_counts=counts,
             class_statistics_signature=statistics_signature,
-            scheduler=scheduler,
-            training_profile=args.training_profile,
-            source_catalog=source_catalog,
-            default_source_id=default_source_id,
+            scaler=scaler,
         )
         if validation_metrics["loss"] < best_loss:
             best_loss = validation_metrics["loss"]
@@ -569,10 +630,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 split,
                 class_counts=counts,
                 class_statistics_signature=statistics_signature,
-                scheduler=scheduler,
-                training_profile=args.training_profile,
-                source_catalog=source_catalog,
-                default_source_id=default_source_id,
+                scaler=scaler,
             )
         epoch_progress.set_postfix(
             train=f"{train_metrics['loss']:.4f}",
@@ -582,20 +640,43 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
 
     with torch.inference_mode():
         test_metrics = run_epoch(
-            model,
+            execution_model,
             loaders["test"],
             device,
             weights,
             description="Test",
             show_progress=show_progress,
             collect_confusion=True,
-            source_ids=source_ids,
+            amp_dtype=amp_dtype,
         )
     summary = {
         "device": str(device),
-        "training_profile": args.training_profile,
-        "source_catalog": source_catalog,
-        "default_source_id": default_source_id,
+        "model_config": asdict(model.config),
+        "model_parameter_count": sum(parameter.numel() for parameter in model.parameters()),
+        "encoder_parameter_count": sum(parameter.numel() for parameter in model.encoder.parameters()),
+        "compile_enabled": compile_enabled,
+        "compile_mode": args.compile_mode,
+        "amp_dtype": args.amp_dtype,
+        "compile_warmup_seconds": compile_warmup_seconds,
+        "data_split_signature": data_split_signature(split),
+        "class_statistics_signature": statistics_signature,
+        "training_config": {
+            "seed": args.seed,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "effective_batch_size": args.batch_size * args.gradient_accumulation_steps,
+            "compile_enabled": compile_enabled,
+            "compile_mode": args.compile_mode,
+            "amp_dtype": args.amp_dtype,
+            "learning_rate": args.learning_rate,
+            "weight_decay": args.weight_decay,
+            "winner_weight": args.winner_weight,
+            "team_selection": args.team_selection,
+            "class_weight_exponent": args.class_weight_exponent,
+            "gradient_clip": args.gradient_clip,
+            "max_turns": args.max_turns,
+        },
         "action_schema": {name: list(actions) for name, actions in ACTION_SCHEMA.items()},
         "test": test_metrics,
         "history": history,

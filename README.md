@@ -355,6 +355,119 @@ flags, corrected cooldown normalization, and categorical embeddings for the 40-t
 board size. The encoder masks padding at every U-Net stage and exposes pooled global features for a future
 RL value head.
 
+Three parameter-matched encoders can be trained with the same observation, action heads, and viable-action
+masks:
+
+- `unet` is the default 32x32 residual U-Net.
+- `transformer16` applies an eight-layer Transformer to 16x16 tokens and decodes through a 32x32 skip.
+- `axial32` keeps 32x32 features and alternates row and column attention in six axial blocks.
+
+CUDA training enables `torch.compile(..., mode="max-autotune")` and BF16 autocast by default. The lazy compilation warmup is
+reported separately from epoch throughput and does not alter checkpoint keys; use `--no-compile` for an eager
+baseline, `--compile-mode default|reduce-overhead|max-autotune` to select another mode, or
+`--amp-dtype float16` to explicitly request FP16. Axial attention always computes its score and softmax in FP32.
+Training stops before an optimizer update when a non-finite loss or gradient is detected.
+
+Use the same seed, effective batch, and shared class-statistics cache for an architecture comparison:
+
+```bash
+uv run python examples/train_bc.py \
+  --encoder-type unet \
+  --replay-dir replay_datasets \
+  --output-dir models/bc_encoder_compare/unet \
+  --class-statistics-path models/bc_encoder_compare/class_statistics.pt \
+  --batch-size 8 \
+  --gradient-accumulation-steps 4
+
+uv run python examples/train_bc.py \
+  --encoder-type transformer16 \
+  --replay-dir replay_datasets \
+  --output-dir models/bc_encoder_compare/transformer16 \
+  --class-statistics-path models/bc_encoder_compare/class_statistics.pt \
+  --batch-size 8 \
+  --gradient-accumulation-steps 4
+
+uv run python examples/train_bc.py \
+  --encoder-type axial32 \
+  --replay-dir replay_datasets \
+  --output-dir models/bc_encoder_compare/axial32 \
+  --class-statistics-path models/bc_encoder_compare/class_statistics.pt \
+  --batch-size 8 \
+  --gradient-accumulation-steps 4
+```
+
+Compare best validation loss, active-action accuracy, training throughput, peak CUDA memory, and parameter
+counts:
+
+```bash
+uv run python examples/compare_bc_architectures.py \
+  --run unet=models/bc_encoder_compare/unet/metrics.json \
+  --run transformer16=models/bc_encoder_compare/transformer16/metrics.json \
+  --run axial32=models/bc_encoder_compare/axial32/metrics.json \
+  --output-dir models/bc_encoder_compare/comparison
+```
+
+The comparison rejects runs with different splits, class-statistics signatures, or training settings. It writes
+`architecture_comparison.json`, `validation_loss_comparison.png`, and `resource_comparison.png`.
+
+Evaluate selected best checkpoints on the exact same test split in FP32:
+
+```bash
+uv run python examples/evaluate_bc_checkpoints.py \
+  --checkpoint unet=models/bc_v2/best.pt \
+  --checkpoint transformer16=models/bc_encoder_compare/transformer16/best.pt \
+  --checkpoint axial32=models/bc_encoder_compare/axial32/best.pt \
+  --output models/bc_encoder_compare/evaluation.json \
+  --device cuda
+```
+
+The evaluator rejects non-finite checkpoints and mismatched splits or class-statistics signatures. Its throughput
+numbers use eager FP32 execution so that loss comparison is independent of AMP and compilation settings.
+By default, `--match-seeds 0` preserves the test-loss-only evaluation.
+
+After the test-split evaluation, run a parallel round robin with 50 seeds and both team assignments:
+
+```bash
+uv run python examples/evaluate_bc_checkpoints.py \
+  --checkpoint unet=models/bc_v2/best.pt \
+  --checkpoint transformer16=models/bc_encoder_compare/transformer16/best.pt \
+  --checkpoint axial32=models/bc_encoder_compare/axial32/best.pt \
+  --output models/bc_encoder_compare/evaluation.json \
+  --device cuda \
+  --match-seeds 50 \
+  --match-workers auto
+```
+
+On CUDA, `--match-workers auto` uses two spawned processes sharing the GPU; on CPU it uses at most four, and
+the worker count is always capped by the number of seeds. Three checkpoints produce 300 games
+(`3 pairs x 50 seeds x 2 team assignments`). Replays are not written. With matches enabled, `winner` is ranked
+by round-robin score rate while `test_winner` preserves the test-loss winner.
+
+For a short CUDA smoke, replace `replay_datasets` with
+`luxai2021/tests/replays_for_test/27095556.json`, add `--max-turns 8 --epochs 1 --device cuda`, and run each
+encoder command above. Resume a run with its existing encoder:
+
+```bash
+uv run python examples/train_bc.py \
+  --replay-dir replay_datasets \
+  --output-dir models/bc_encoder_compare/axial32 \
+  --resume models/bc_encoder_compare/axial32/latest.pt \
+  --epochs 40
+```
+
+GradScaler state is saved and restored for FP16 runs. Older checkpoints without scaler state remain loadable.
+A checkpoint containing non-finite model parameters is rejected; recover a failed Transformer run from its
+finite `best.pt` checkpoint using the default BF16 mode:
+
+```bash
+uv run python examples/train_bc.py \
+  --replay-dir replay_datasets \
+  --output-dir models/bc_encoder_compare/axial32 \
+  --resume models/bc_encoder_compare/axial32/best.pt \
+  --epochs 20 \
+  --amp-dtype bfloat16
+```
+
 Training and inference share the same viable-action masks. Off-board moves, enemy-city moves, moves blocked by
 cooldown units, impossible transfers, invalid city construction, exhausted research, and unit-cap production
 are removed before softmax. Replay commands rejected by these masks are learned as their effective no-op result.
@@ -371,54 +484,6 @@ uv run python examples/train_bc.py \
 
 Checkpoints produced with the earlier 44-channel feature schema cannot be resumed with this version.
 
-### Team Durrett multi-source profile
-
-The adapted Team Durrett profile keeps the 55-feature observation, factorized action heads, viable-action masks,
-and pooled features for later RL use. It replaces the U-Net with a 384-channel, 18-block FReLU/SE encoder plus a
-masked Transformer layer. The spatial trunk and per-action projections are shared, while the final classifier for
-each action head is specific to the source submission.
-
-The replay directory must contain `agent_info.json` above each source submission's replays and a matching
-`*_info.json` beside every replay. The source player is selected by `submissionId`, independently of who won.
-Source-versus-source self-play contributes both players to the same policy head.
-
-```bash
-uv run python examples/train_bc.py \
-  --training-profile durrett \
-  --replay-dir replay_datasets \
-  --output-dir models/bc_durrett
-```
-
-The profile defaults to 100 epochs, batch size 16 with four-step gradient accumulation, AdamW at `1e-3`,
-weight decay `1e-5`, and learning-rate drops at epochs 50 and 80. Worker/cart `stay` targets receive weight 0.3.
-The source with the highest `lb` in `agent_info.json` is stored as the inference default. Per-source metrics and
-the complete source catalog are written to the checkpoint and `metrics.json`.
-
-Use one replay and one turn per source for a quick CUDA smoke:
-
-```bash
-uv run python examples/train_bc.py \
-  --training-profile durrett \
-  --replay-dir replay_datasets \
-  --output-dir models/bc_durrett_smoke \
-  --max-replays-per-source 1 \
-  --max-turns 1 \
-  --epochs 1 \
-  --batch-size 1 \
-  --gradient-accumulation-steps 1 \
-  --device cuda \
-  --num-workers 0
-```
-
-Resume with the saved split, scheduler, source mapping, optimizer, and cached class statistics:
-
-```bash
-uv run python examples/train_bc.py \
-  --replay-dir replay_datasets \
-  --output-dir models/bc_durrett \
-  --resume models/bc_durrett/latest.pt
-```
-
 Use the best checkpoint in a local match:
 
 ```python
@@ -426,12 +491,6 @@ from luxai2021.imitation import BehaviorCloningAgent
 
 agent = BehaviorCloningAgent("models/bc/best.pt", device="auto")
 actions = agent.process_turn(game, team=0)
-```
-
-For a multi-source checkpoint, omit `source_id` to use the saved highest-`lb` source or select one explicitly:
-
-```python
-agent = BehaviorCloningAgent("models/bc_durrett/best.pt", device="auto", source_id=23692494)
 ```
 
 The bundled replay fixtures are intended for smoke tests only. Use a larger replay collection for actual training.

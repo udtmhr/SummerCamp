@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# ruff: noqa: C901, PLR0912, PLR0913
+# ruff: noqa: C901, PLR0913
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -53,27 +53,13 @@ class _Choice:
 
 
 class BehaviorCloningAgent(Agent):
-    def __init__(self, checkpoint_path: str, device: str = "auto", source_id: int | None = None) -> None:
+    def __init__(self, checkpoint_path: str, device: str = "auto") -> None:
         super().__init__()
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
         self.model, self.checkpoint = load_bc_checkpoint(checkpoint_path, str(self.device))
         self.model.eval()
-        self.training_profile = str(self.checkpoint.get("training_profile", "baseline"))
-        source_ids = tuple(self.model.config.source_ids)
-        self.source_id = source_id
-        self.source_index = None
-        if source_ids:
-            if self.source_id is None:
-                self.source_id = self.checkpoint.get("default_source_id")
-            if self.source_id not in source_ids:
-                available = ", ".join(str(value) for value in source_ids)
-                msg = f"Unknown source_id={self.source_id}; available source IDs: {available}"
-                raise ValueError(msg)
-            self.source_index = source_ids.index(self.source_id)
-        elif self.source_id is not None:
-            raise ValueError("This checkpoint does not contain source-specific policy heads")
 
     @staticmethod
     def _cell_logits(
@@ -356,25 +342,11 @@ class BehaviorCloningAgent(Agent):
                 )
                 order = torch.argsort(scores, descending=True).tolist()
                 margin = float(scores[order[0]] - scores[order[1]])
-                entries.append((margin, tile.get_tile_id(), tile, order, scores))
+                entries.append((margin, tile.get_tile_id(), tile, order))
         entries.sort(key=lambda item: (-item[0], item[1]))
 
         actions = []
-        used_tiles = set()
-        if self.training_profile == "durrett" and available_units > 0:
-            build_worker_index = CITY_ACTIONS.index("build_worker")
-            build_candidates = sorted(
-                entries,
-                key=lambda item: (-float(item[4][build_worker_index]), item[1]),
-            )
-            for _, tile_id, tile, _, _ in build_candidates[:available_units]:
-                actions.append(SpawnWorkerAction(team, None, tile.pos.x, tile.pos.y))
-                used_tiles.add(tile_id)
-            available_units -= len(used_tiles)
-
-        for _, tile_id, tile, order, _ in entries:
-            if tile_id in used_tiles:
-                continue
+        for _, _, tile, order in entries:
             for action_index in order:
                 action_name = CITY_ACTIONS[action_index]
                 if action_name == "no_action":
@@ -398,7 +370,7 @@ class BehaviorCloningAgent(Agent):
         snapshot = snapshot_from_game(game)
         observation = torch.from_numpy(encode_snapshot(snapshot, team))[None].to(self.device)
         with torch.inference_mode():
-            output = self.model(observation, source_index=self.source_index)
+            output = self.model(observation)
         x_offset, y_offset = snapshot.padding
         unit_choices = self._choose_units(game, team, snapshot, output, x_offset, y_offset)
         actions = self._choices_to_actions(unit_choices, team)

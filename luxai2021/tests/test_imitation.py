@@ -1,14 +1,27 @@
-# ruff: noqa: ANN001, ANN201, ANN202, PLR2004, S101, SLF001
+# ruff: noqa: ANN001, ANN201, ANN202, PLR2004, S101
 
+import argparse
 import json
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from luxai2021.game.actions import SpawnWorkerAction
+from examples.compare_bc_architectures import build_comparison
+from examples.evaluate_bc_checkpoints import (
+    aggregate_match_results,
+    expected_match_game_count,
+    match_pair_orientations,
+    parse_checkpoint,
+    parse_match_workers,
+    resolve_match_workers,
+    select_evaluation_winner,
+    shard_match_seeds,
+    sort_match_games,
+)
+from examples.train_bc import main as train_main
+from examples.train_bc import resolve_amp_dtype, resolve_compile, run_epoch
 from luxai2021.game.constants import LuxMatchConfigs_Default
 from luxai2021.game.game import Game
 from luxai2021.imitation.actions import CITY_ACTIONS, DIRECTIONS, RESOURCES, WORKER_ACTIONS
@@ -26,15 +39,17 @@ from luxai2021.imitation.data import (
     augment_sample,
     build_targets,
     class_counts,
-    discover_sources,
 )
 from luxai2021.imitation.masking import (
     apply_legal_action_mask,
     build_legal_masks,
 )
 from luxai2021.imitation.model import (
+    AxialTransformerBlock,
+    AxisAttention,
     LuxBehaviorCloningModel,
     ModelConfig,
+    _safe_cross_entropy,
     behavior_cloning_loss,
     compute_confusion_matrices,
     load_bc_checkpoint,
@@ -184,6 +199,19 @@ def test_illegal_replay_command_becomes_noop_and_masked_logits_are_finite():
     assert torch.isfinite(torch.log_softmax(masked, dim=-1)).all()
 
 
+def test_empty_target_loss_does_not_overflow_when_logits_are_large():
+    logits = torch.full((2, 1024, 4), 1e38, requires_grad=True)
+    target = torch.full((2, 1024), IGNORE_INDEX)
+    sample_weight = torch.ones(2)
+
+    loss = _safe_cross_entropy(logits, target, sample_weight, None)
+    loss.backward()
+
+    assert loss.item() == 0
+    assert torch.isfinite(logits.grad).all()
+    assert not logits.grad.any()
+
+
 def test_augmentation_rotates_direction_masks():
     updates = ["u 0 0 u_worker 1 0 0 0 0 0", "D_DONE"]
     snapshot = snapshot_from_updates(updates, width=16, height=16, turn=0)
@@ -267,80 +295,6 @@ def test_model_loss_and_checkpoint_round_trip(tmp_path):
     assert all(torch.equal(counts[name], restored_counts[name]) for name in counts)
 
 
-def test_source_dataset_selects_source_submission_even_when_it_loses(tmp_path):
-    source_id = 12345
-    source_root = tmp_path / str(source_id)
-    replay_root = source_root / "game"
-    replay_root.mkdir(parents=True)
-    (source_root / "agent_info.json").write_text(
-        json.dumps({"agent_id": source_id, "lb": 1900.0}),
-        encoding="utf-8",
-    )
-    replay = {
-        "rewards": [1, 0],
-        "steps": [
-            [
-                {"observation": {"width": 16, "height": 16, "updates": _updates()}},
-                {"observation": {}},
-            ],
-            [{"action": ["m u_1 n"], "step": 1}, {"action": ["m u_3 s"], "step": 1}],
-        ],
-    }
-    replay_path = replay_root / "game.json"
-    replay_path.write_text(json.dumps(replay), encoding="utf-8")
-    (replay_root / "game_info.json").write_text(
-        json.dumps(
-            {
-                "agents": [
-                    {"index": 0, "submissionId": 999, "reward": 1},
-                    {"index": 1, "submissionId": source_id, "reward": 0},
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    sources = discover_sources([replay_path])
-    dataset = LuxReplayDataset(
-        [replay_path],
-        team_selection="source",
-        source_ids=(source_id,),
-        max_turns=1,
-    )
-
-    assert [(source.source_id, source.lb) for source in sources] == [(source_id, 1900.0)]
-    assert dataset.samples[0][2:] == (1, 0)
-    assert dataset[0]["source_index"].item() == 0
-    assert (dataset[0]["worker_type"] == WORKER_ACTIONS.index("move")).sum() == 1
-
-
-def test_source_dataset_uses_both_players_for_source_self_play(tmp_path):
-    source_id = 12345
-    source_root = tmp_path / str(source_id)
-    replay_root = source_root / "game"
-    replay_root.mkdir(parents=True)
-    (source_root / "agent_info.json").write_text(
-        json.dumps({"agent_id": source_id, "lb": 1900.0}),
-        encoding="utf-8",
-    )
-    replay_path = replay_root / "game.json"
-    replay_path.write_text(json.dumps({"steps": [], "step": 1}), encoding="utf-8")
-    (replay_root / "game_info.json").write_text(
-        json.dumps(
-            {
-                "agents": [
-                    {"index": 0, "submissionId": source_id, "reward": 1},
-                    {"index": 1, "submissionId": source_id, "reward": 0},
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    dataset = LuxReplayDataset([replay_path], team_selection="source", source_ids=(source_id,))
-    assert [sample[2] for sample in dataset.samples] == [0, 1]
-
-
 def test_encoder_masks_padding_and_returns_global_features():
     snapshot = snapshot_from_updates(_updates(), width=16, height=16, turn=30)
     observation = torch.from_numpy(encode_snapshot(snapshot, 0))[None]
@@ -354,46 +308,119 @@ def test_encoder_masks_padding_and_returns_global_features():
     assert output["global_features"].shape == (1, model.encoder.global_output_channels)
 
 
-def test_durrett_encoder_masks_padding_and_routes_source_heads():
-    snapshot = snapshot_from_updates(_updates(), width=16, height=16, turn=30)
-    observation = torch.from_numpy(encode_snapshot(snapshot, 0))[None]
-    config = ModelConfig(
-        feature_channels=16,
-        encoder_type="durrett",
-        durrett_layers=1,
-        transformer_layers=1,
-        transformer_heads=1,
-        source_ids=(11, 22),
-    )
-    model = LuxBehaviorCloningModel(config)
-    output = model(observation, source_index=torch.tensor([0]), return_features=True)
-
-    assert output["worker_type"].shape == (1, len(WORKER_ACTIONS), 32, 32)
-    assert output["features"].shape == (1, 16, 32, 32)
-    assert not output["features"][:, :, :8].any()
-    assert not output["features"][:, :, 24:].any()
-    output["worker_type"].sum().backward()
-    classifiers = model.heads["worker_type"].classifiers
-    assert classifiers[0].weight.grad is not None
-    assert classifiers[1].weight.grad is None
-
-    model.zero_grad(set_to_none=True)
-    mixed_output = model(observation.repeat(2, 1, 1, 1), source_index=torch.tensor([0, 1]))
-    mixed_output["worker_type"].sum().backward()
-    assert classifiers[0].weight.grad is not None
-    assert classifiers[1].weight.grad is not None
-
-
-def test_source_checkpoint_agent_default_and_override(tmp_path):
+@pytest.mark.parametrize("encoder_type", ["unet", "transformer16", "axial32"])
+@pytest.mark.parametrize("board_size", BOARD_SIZES)
+def test_all_encoders_mask_padding_and_return_finite_features(encoder_type, board_size):
+    offset = (32 - board_size) // 2
+    observation = torch.zeros(1, len(FEATURE_NAMES), 32, 32)
+    observation[:, FEATURE_INDEX["board_mask"], offset : offset + board_size, offset : offset + board_size] = 1
+    observation[:, FEATURE_INDEX["own_worker"], offset, offset] = 1
     model = LuxBehaviorCloningModel(
         ModelConfig(
+            base_channels=8,
             feature_channels=16,
-            encoder_type="durrett",
-            durrett_layers=1,
-            source_ids=(11, 22),
+            encoder_type=encoder_type,
+            transformer_dim=16,
+            transformer_heads=4,
+            transformer_ffn_dim=32,
+            transformer16_layers=1,
+            axial32_layers=1,
         )
     )
-    checkpoint_path = tmp_path / "durrett.pt"
+
+    output = model(observation, return_features=True)
+    features = output["features"]
+    mask = observation[:, FEATURE_INDEX["board_mask"] : FEATURE_INDEX["board_mask"] + 1]
+
+    assert features.shape == (1, 16, 32, 32)
+    assert torch.isfinite(features).all()
+    assert torch.isfinite(output["global_features"]).all()
+    assert not features.masked_select(mask == 0).any()
+    output["worker_type"].sum().backward()
+    assert any(parameter.grad is not None for parameter in model.encoder.parameters())
+
+
+def test_axis_attention_handles_fully_padded_groups_and_ignores_invalid_keys():
+    attention = AxisAttention(channels=16, heads=4, dropout=0.0)
+    distance_bias = torch.zeros(4, 32)
+    inputs = torch.randn(1, 2, 4, 16)
+    valid_mask = torch.tensor([[[True, True, False, False], [False, False, False, False]]])
+
+    output = attention(inputs, valid_mask, distance_bias)
+    changed = inputs.clone()
+    changed[:, 0, 2:] = 1e6
+    changed_output = attention(changed, valid_mask, distance_bias)
+
+    assert torch.isfinite(output).all()
+    assert not output[:, 1].any()
+    assert torch.allclose(output[:, 0, :2], changed_output[:, 0, :2])
+
+
+def test_axis_attention_uses_finite_fp32_scores_for_fp16_inputs():
+    attention = AxisAttention(channels=4, heads=1, dropout=0.0).half()
+    with torch.no_grad():
+        attention.qkv.weight.zero_()
+        attention.qkv.bias.zero_()
+        identity = torch.eye(4, dtype=torch.float16)
+        for offset in (0, 4, 8):
+            attention.qkv.weight[offset : offset + 4].copy_(identity)
+        attention.projection.weight.copy_(identity)
+        attention.projection.bias.zero_()
+
+    inputs = torch.full((1, 1, 2, 4), 300.0, dtype=torch.float16)
+    output = attention(
+        inputs,
+        torch.ones(1, 1, 2, dtype=torch.bool),
+        torch.zeros(1, 32),
+    )
+
+    assert torch.isfinite(output).all()
+
+
+def test_axial_block_shares_one_distance_bias_between_axes():
+    block = AxialTransformerBlock(channels=16, heads=4, ffn_dim=32, dropout=0.0)
+    distance_bias_names = [name for name, _ in block.named_parameters() if "distance_bias" in name]
+    assert distance_bias_names == ["distance_bias"]
+
+
+def test_default_transformer_parameter_counts_match_unet_budget():
+    parameter_counts = {
+        encoder_type: sum(
+            parameter.numel()
+            for parameter in LuxBehaviorCloningModel(ModelConfig(encoder_type=encoder_type)).parameters()
+        )
+        for encoder_type in ("unet", "transformer16", "axial32")
+    }
+    baseline = parameter_counts["unet"]
+    assert baseline == 8_383_254
+    assert all(0.9 * baseline <= count <= 1.1 * baseline for count in parameter_counts.values())
+
+
+@pytest.mark.parametrize("encoder_type", ["unet", "transformer16", "axial32"])
+def test_encoder_checkpoint_round_trip(tmp_path, encoder_type):
+    config = ModelConfig(
+        base_channels=8,
+        feature_channels=16,
+        encoder_type=encoder_type,
+        transformer_dim=16,
+        transformer_heads=4,
+        transformer_ffn_dim=32,
+        transformer16_layers=1,
+        axial32_layers=1,
+    )
+    model = LuxBehaviorCloningModel(config)
+    checkpoint_path = tmp_path / f"{encoder_type}.pt"
+    save_bc_checkpoint(checkpoint_path, model, None, 0, {}, {"train": []})
+
+    restored, _ = load_bc_checkpoint(str(checkpoint_path))
+
+    assert restored.config == config
+
+
+def test_checkpoint_saves_scaler_state_and_old_checkpoint_may_omit_it(tmp_path):
+    model = LuxBehaviorCloningModel(ModelConfig(base_channels=8, feature_channels=16))
+    scaler = torch.amp.GradScaler("cpu", enabled=True, init_scale=128.0)
+    checkpoint_path = tmp_path / "with_scaler.pt"
     save_bc_checkpoint(
         checkpoint_path,
         model,
@@ -401,59 +428,277 @@ def test_source_checkpoint_agent_default_and_override(tmp_path):
         0,
         {},
         {"train": []},
-        training_profile="durrett",
-        source_catalog=(
-            {"source_id": 11, "lb": 1800.0, "index": 0},
-            {"source_id": 22, "lb": 1900.0, "index": 1},
-        ),
-        default_source_id=22,
+        scaler=scaler,
     )
 
-    default_agent = BehaviorCloningAgent(str(checkpoint_path), device="cpu")
-    override_agent = BehaviorCloningAgent(str(checkpoint_path), device="cpu", source_id=11)
-    assert (default_agent.source_id, default_agent.source_index) == (22, 1)
-    assert (override_agent.source_id, override_agent.source_index) == (11, 0)
-    with pytest.raises(ValueError, match="available source IDs"):
-        BehaviorCloningAgent(str(checkpoint_path), device="cpu", source_id=99)
+    _, checkpoint = load_bc_checkpoint(str(checkpoint_path))
+    assert checkpoint["scaler"] == scaler.state_dict()
+
+    checkpoint.pop("scaler")
+    torch.save(checkpoint, checkpoint_path)
+    _, restored_old_checkpoint = load_bc_checkpoint(str(checkpoint_path))
+    assert "scaler" not in restored_old_checkpoint
 
 
-def test_durrett_city_interpreter_prioritizes_worker_builds():
-    tiles = []
-    city_cells = []
-    for x in (1, 2):
-        tile = SimpleNamespace(
-            pos=SimpleNamespace(x=x, y=1),
-            can_act=lambda: True,
-            get_tile_id=lambda x=x: f"c_{x}_1",
-        )
-        tiles.append(tile)
-        city_cells.append(SimpleNamespace(city_tile=tile))
-    game = SimpleNamespace(
-        cities={"c": SimpleNamespace(team=0, city_cells=city_cells)},
-        state={"teamStates": {0: {"units": {}}, 1: {"units": {}}}},
-    )
-    snapshot = snapshot_from_updates(
+def test_checkpoint_rejects_nonfinite_model_parameters(tmp_path):
+    model = LuxBehaviorCloningModel(ModelConfig(base_channels=8, feature_channels=16))
+    checkpoint_path = tmp_path / "nonfinite.pt"
+    save_bc_checkpoint(checkpoint_path, model, None, 0, {}, {"train": []})
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    first_parameter = next(iter(checkpoint["model"].values()))
+    first_parameter.view(-1)[0] = float("nan")
+    torch.save(checkpoint, checkpoint_path)
+
+    with pytest.raises(ValueError, match="non-finite model parameters"):
+        load_bc_checkpoint(str(checkpoint_path))
+
+
+def test_old_unet_checkpoint_without_encoder_config_loads(tmp_path):
+    model = LuxBehaviorCloningModel(ModelConfig(base_channels=8, feature_channels=16))
+    checkpoint_path = tmp_path / "old_unet.pt"
+    save_bc_checkpoint(checkpoint_path, model, None, 0, {}, {"train": []})
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    for name in (
+        "encoder_type",
+        "transformer_dim",
+        "transformer_heads",
+        "transformer_ffn_dim",
+        "transformer_dropout",
+        "transformer16_layers",
+        "axial32_layers",
+    ):
+        checkpoint["model_config"].pop(name)
+    torch.save(checkpoint, checkpoint_path)
+
+    restored, _ = load_bc_checkpoint(str(checkpoint_path))
+
+    assert restored.config.encoder_type == "unet"
+
+
+def test_resume_rejects_explicit_encoder_mismatch(tmp_path, monkeypatch):
+    model = LuxBehaviorCloningModel(ModelConfig(base_channels=8, feature_channels=16))
+    checkpoint_path = tmp_path / "unet.pt"
+    save_bc_checkpoint(checkpoint_path, model, None, 0, {}, {"train": []})
+    monkeypatch.setattr(
+        "sys.argv",
         [
-            "rp 0 0",
-            "c 0 c 100 23",
-            "ct 0 c 1 1 0",
-            "ct 0 c 2 1 0",
-            "D_DONE",
+            "train_bc.py",
+            "--replay-dir",
+            "unused",
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--resume",
+            str(checkpoint_path),
+            "--encoder-type",
+            "axial32",
+            "--device",
+            "cpu",
         ],
-        width=16,
-        height=16,
-        turn=0,
     )
-    output = {"city": torch.zeros(1, len(CITY_ACTIONS), 32, 32)}
-    output["city"][:, CITY_ACTIONS.index("no_action")] = 10
-    output["city"][:, CITY_ACTIONS.index("build_worker")] = -10
-    agent = object.__new__(BehaviorCloningAgent)
-    agent.training_profile = "durrett"
 
-    actions = agent._city_actions(game, 0, snapshot, output, *snapshot.padding)
+    with pytest.raises(ValueError, match="Checkpoint encoder is unet"):
+        train_main()
 
-    assert len(actions) == 2
-    assert all(isinstance(action, SpawnWorkerAction) for action in actions)
+
+def test_compile_defaults_to_cuda_and_accepts_override():
+    assert resolve_compile(enabled=None, device=torch.device("cuda"))
+    assert not resolve_compile(enabled=None, device=torch.device("cpu"))
+    assert not resolve_compile(enabled=False, device=torch.device("cuda"))
+
+
+def test_amp_dtype_defaults_are_resolved_and_bfloat16_requires_device_support(monkeypatch):
+    assert resolve_amp_dtype("bfloat16", torch.device("cpu")) == torch.bfloat16
+    assert resolve_amp_dtype("float16", torch.device("cuda")) == torch.float16
+    assert resolve_amp_dtype("float32", torch.device("cuda")) == torch.float32
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+    with pytest.raises(ValueError, match="does not support bfloat16"):
+        resolve_amp_dtype("bfloat16", torch.device("cuda"))
+
+
+def test_parse_evaluation_checkpoint():
+    name, path = parse_checkpoint("axial=models/axial/best.pt")
+    assert name == "axial"
+    assert str(path) == "models/axial/best.pt"
+    with pytest.raises(ValueError, match="Expected NAME=CHECKPOINT"):
+        parse_checkpoint("missing-name-separator")
+
+
+def test_match_workers_and_seed_shards_are_capped_complete_and_balanced(monkeypatch):
+    monkeypatch.setattr("examples.evaluate_bc_checkpoints.os.cpu_count", lambda: 16)
+    assert parse_match_workers("auto") == "auto"
+    assert parse_match_workers("3") == 3
+    with pytest.raises(argparse.ArgumentTypeError, match="positive integer"):
+        parse_match_workers("0")
+
+    assert resolve_match_workers("auto", torch.device("cuda"), 50) == 2
+    assert resolve_match_workers("auto", torch.device("cpu"), 50) == 4
+    assert resolve_match_workers(8, torch.device("cpu"), 3) == 3
+    shards = shard_match_seeds(10, 11, 4)
+    assert sorted(seed for shard in shards for seed in shard) == list(range(10, 21))
+    assert max(map(len, shards)) - min(map(len, shards)) <= 1
+
+
+def test_round_robin_schedule_count_includes_pairs_seeds_and_both_orientations():
+    assignments = match_pair_orientations(3)
+    assert assignments == [
+        (0, 0, 1, 0),
+        (0, 0, 1, 1),
+        (1, 0, 2, 0),
+        (1, 0, 2, 1),
+        (2, 1, 2, 0),
+        (2, 1, 2, 1),
+    ]
+    assert expected_match_game_count(3, 50) == 300
+    assert expected_match_game_count(3, 2) == 12
+    assert select_evaluation_winner("lowest-loss", None) == ("test_loss", "lowest-loss")
+    match_evaluation = {"standings": [{"name": "match-winner"}]}
+    assert select_evaluation_winner("lowest-loss", match_evaluation) == (
+        "round_robin_score_rate",
+        "match-winner",
+    )
+
+
+def _synthetic_match(pair, winner, *, seed=0, orientation=0):
+    return {
+        "pair_index": 0,
+        "pair": list(pair),
+        "seed": seed,
+        "orientation": orientation,
+        "winner": winner,
+        "draw": winner is None,
+    }
+
+
+def test_match_aggregation_uses_head_to_head_then_test_loss_for_ties():
+    games = [
+        _synthetic_match(("a", "b"), "a"),
+        _synthetic_match(("a", "c"), "c"),
+        _synthetic_match(("b", "c"), "b"),
+        _synthetic_match(("a", "d"), "d"),
+        _synthetic_match(("b", "d"), "d"),
+        _synthetic_match(("c", "d"), "c"),
+    ]
+    pairwise, standings = aggregate_match_results(games, {"a": 0.4, "b": 0.1, "c": 0.3, "d": 0.2})
+    by_name = {row["name"]: row for row in standings}
+    assert by_name["a"]["wins"] == 1
+    assert by_name["a"]["losses"] == 2
+    assert by_name["a"]["draws"] == 0
+    assert by_name["a"]["score_rate"] == pytest.approx(1 / 3)
+    assert [row["name"] for row in standings] == ["c", "d", "a", "b"]
+    assert len(pairwise) == 6
+    reversed_pairwise, reversed_standings = aggregate_match_results(
+        list(reversed(games)),
+        {"a": 0.4, "b": 0.1, "c": 0.3, "d": 0.2},
+    )
+    assert reversed_pairwise == pairwise
+    assert reversed_standings == standings
+
+    draw_games = [_synthetic_match(("a", "b"), None)]
+    _, draw_standings = aggregate_match_results(draw_games, {"a": 0.2, "b": 0.1})
+    assert [row["name"] for row in draw_standings] == ["b", "a"]
+    assert draw_standings[0]["draws"] == 1
+    assert draw_standings[0]["score_rate"] == 0.5
+    _, name_tiebreak_standings = aggregate_match_results(draw_games, {"a": 0.1, "b": 0.1})
+    assert [row["name"] for row in name_tiebreak_standings] == ["a", "b"]
+
+
+def test_match_result_sorting_is_independent_of_worker_completion_order():
+    games = [
+        {"pair_index": 1, "seed": 4, "orientation": 1},
+        {"pair_index": 0, "seed": 5, "orientation": 0},
+        {"pair_index": 0, "seed": 4, "orientation": 1},
+        {"pair_index": 0, "seed": 4, "orientation": 0},
+    ]
+    expected = [(0, 4, 0), (0, 4, 1), (0, 5, 0), (1, 4, 1)]
+    assert [(game["pair_index"], game["seed"], game["orientation"]) for game in sort_match_games(games)] == expected
+    assert sort_match_games(list(reversed(games))) == sort_match_games(games)
+
+
+def test_gradient_accumulation_steps_partial_final_group():
+    dataset = LuxReplayDataset(
+        ["luxai2021/tests/replays_for_test/27095556.json"],
+        max_turns=5,
+    )
+    loader = DataLoader(dataset, batch_size=1)
+    model = LuxBehaviorCloningModel(ModelConfig(base_channels=4, feature_channels=8))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    scaler = torch.amp.GradScaler("cpu", enabled=False)
+
+    metrics = run_epoch(
+        model,
+        loader,
+        torch.device("cpu"),
+        {},
+        optimizer=optimizer,
+        scaler=scaler,
+        show_progress=False,
+        gradient_accumulation_steps=2,
+    )
+
+    assert metrics["optimizer_steps"] == 3
+    assert metrics["samples"] == 5
+
+
+def test_run_epoch_rejects_nonfinite_loss_before_optimizer_update():
+    dataset = LuxReplayDataset(
+        ["luxai2021/tests/replays_for_test/27095556.json"],
+        max_turns=1,
+    )
+    loader = DataLoader(dataset, batch_size=1)
+    model = LuxBehaviorCloningModel(ModelConfig(base_channels=4, feature_channels=8))
+    with torch.no_grad():
+        next(model.parameters()).fill_(float("nan"))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    scaler = torch.amp.GradScaler("cpu", enabled=False)
+
+    with pytest.raises(FloatingPointError, match="Non-finite loss"):
+        run_epoch(
+            model,
+            loader,
+            torch.device("cpu"),
+            {},
+            optimizer=optimizer,
+            scaler=scaler,
+            show_progress=False,
+        )
+
+
+def _comparison_metrics(validation_loss, split_signature="same"):
+    phase = {
+        "loss": validation_loss,
+        "worker_active_accuracy": 0.5,
+        "cart_active_accuracy": 0.4,
+        "city_active_accuracy": 0.3,
+        "samples_per_second": 10.0,
+        "peak_cuda_memory_allocated_bytes": 1024,
+    }
+    return {
+        "model_config": {"encoder_type": "unet"},
+        "model_parameter_count": 100,
+        "encoder_parameter_count": 80,
+        "data_split_signature": split_signature,
+        "class_statistics_signature": "classes",
+        "training_config": {"seed": 42},
+        "history": [{"epoch": 0, "train": phase, "validation": phase}],
+        "test": {"loss": validation_loss},
+    }
+
+
+def test_architecture_comparison_ranks_loss_and_rejects_mismatched_split():
+    comparison = build_comparison(
+        {
+            "higher": _comparison_metrics(2.0),
+            "lower": _comparison_metrics(1.0),
+        }
+    )
+    assert comparison["winner"] == "lower"
+    with pytest.raises(ValueError, match="data_split_signature"):
+        build_comparison(
+            {
+                "first": _comparison_metrics(1.0),
+                "second": _comparison_metrics(1.0, split_signature="different"),
+            }
+        )
 
 
 def test_replay_uses_next_step_actions():

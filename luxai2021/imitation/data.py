@@ -48,18 +48,9 @@ _DELTA_TO_DIRECTION = {value: key for key, value in _DIRECTION_TO_DELTA.items()}
 
 
 @dataclass(frozen=True)
-class SourceInfo:
-    source_id: int
-    lb: float
-    metadata_path: Path
-
-
-@dataclass(frozen=True)
 class ReplayMetadata:
     turn_count: int
     winner: int | None
-    source_id: int | None = None
-    source_teams: tuple[int, ...] = ()
 
 
 def discover_replays(replay_dir: str) -> list[Path]:
@@ -70,51 +61,6 @@ def discover_replays(replay_dir: str) -> list[Path]:
         msg = f"No Kaggle replay JSON files found under {replay_dir}"
         raise ValueError(msg)
     return result
-
-
-def _find_source_info(path: Path) -> SourceInfo:
-    for parent in (path.parent, *path.parents):
-        metadata_path = parent / "agent_info.json"
-        if not metadata_path.exists():
-            continue
-        with metadata_path.open(encoding="utf-8") as metadata_file:
-            metadata = json.load(metadata_file)
-        try:
-            source_id = int(metadata["agent_id"])
-            lb = float(metadata["lb"])
-        except (KeyError, TypeError, ValueError) as error:
-            msg = f"Invalid source metadata in {metadata_path}"
-            raise ValueError(msg) from error
-        return SourceInfo(source_id=source_id, lb=lb, metadata_path=metadata_path)
-    msg = f"No ancestor agent_info.json found for source replay {path}"
-    raise ValueError(msg)
-
-
-def discover_sources(replay_paths: Sequence[Path]) -> tuple[SourceInfo, ...]:
-    sources: dict[int, SourceInfo] = {}
-    for replay_path in replay_paths:
-        source = _find_source_info(Path(replay_path))
-        previous = sources.get(source.source_id)
-        if previous is not None and (previous.lb != source.lb or previous.metadata_path != source.metadata_path):
-            msg = f"Conflicting metadata for source {source.source_id}"
-            raise ValueError(msg)
-        sources[source.source_id] = source
-    return tuple(sources[source_id] for source_id in sorted(sources))
-
-
-def limit_replays_per_source(
-    replay_paths: Sequence[Path],
-    maximum: int,
-) -> list[Path]:
-    if maximum <= 0:
-        return list(replay_paths)
-    selected: dict[int, list[Path]] = {}
-    for replay_path in sorted(Path(path) for path in replay_paths):
-        source_id = _find_source_info(replay_path).source_id
-        bucket = selected.setdefault(source_id, [])
-        if len(bucket) < maximum:
-            bucket.append(replay_path)
-    return [path for source_id in sorted(selected) for path in selected[source_id]]
 
 
 def split_replays(
@@ -177,11 +123,8 @@ def _replay_turn_count(path: Path) -> int | None:
 def _replay_metadata(
     path: Path,
     cache: _ReplayCache,
-    *,
-    include_source: bool = False,
 ) -> ReplayMetadata:
     info_path = path.with_name(f"{path.stem}_info.json")
-    source = _find_source_info(path) if include_source else None
     if info_path.exists():
         with info_path.open(encoding="utf-8") as info_file:
             info = json.load(info_file)
@@ -189,25 +132,10 @@ def _replay_metadata(
         rewards = [agent["reward"] for agent in agents]
         turn_count = _replay_turn_count(path)
         if len(rewards) == _TEAM_COUNT and turn_count is not None:
-            source_teams = ()
-            if source is not None:
-                matches = [int(agent["index"]) for agent in agents if int(agent["submissionId"]) == source.source_id]
-                if not matches:
-                    msg = f"Expected at least one agent with submissionId={source.source_id} in {info_path}"
-                    raise ValueError(msg)
-                if len(set(matches)) != len(matches):
-                    msg = f"Duplicate team indices for submissionId={source.source_id} in {info_path}"
-                    raise ValueError(msg)
-                source_teams = tuple(matches)
             return ReplayMetadata(
                 turn_count=turn_count,
                 winner=_winner_from_rewards(rewards),
-                source_id=None if source is None else source.source_id,
-                source_teams=source_teams,
             )
-    if source is not None:
-        msg = f"Source replay requires valid per-game metadata: {info_path}"
-        raise ValueError(msg)
     replay = cache.get(path)
     return ReplayMetadata(
         turn_count=len(replay["steps"]) - 1,
@@ -366,41 +294,28 @@ class LuxReplayDataset(Dataset):
         winner_weight: float = 1.5,
         seed: int = 42,
         max_turns: int = 0,
-        source_ids: Sequence[int] = (),
     ) -> None:
         self.replay_paths = [Path(path) for path in replay_paths]
         self.augment = augment
-        if team_selection not in {"winner", "all", "source"}:
+        if team_selection not in {"winner", "all"}:
             msg = f"Unsupported team selection: {team_selection}"
             raise ValueError(msg)
         self.team_selection = team_selection
-        self.source_ids = tuple(int(source_id) for source_id in source_ids)
-        self.source_id_to_index = {source_id: index for index, source_id in enumerate(self.source_ids)}
-        if self.team_selection == "source" and not self.source_ids:
-            msg = "source_ids must be provided when team_selection='source'"
-            raise ValueError(msg)
         self.winner_weight = winner_weight
         self.seed = seed
         self.cache = _ReplayCache()
-        self.samples: list[tuple[Path, int, int, int]] = []
+        self.samples: list[tuple[Path, int, int]] = []
         self.sample_groups: list[list[int]] = []
         for path in self.replay_paths:
-            metadata = _replay_metadata(path, self.cache, include_source=self.team_selection == "source")
+            metadata = _replay_metadata(path, self.cache)
             turn_count = metadata.turn_count
             if max_turns > 0:
                 turn_count = min(turn_count, max_turns)
             teams = (metadata.winner,) if self.team_selection == "winner" and metadata.winner is not None else ()
-            source_index = -1
             if self.team_selection == "all":
                 teams = (0, 1)
-            elif self.team_selection == "source":
-                if metadata.source_id not in self.source_id_to_index:
-                    msg = f"Source {metadata.source_id} is not present in source_ids"
-                    raise ValueError(msg)
-                teams = metadata.source_teams
-                source_index = self.source_id_to_index[metadata.source_id]
             group_start = len(self.samples)
-            self.samples.extend((path, turn, team, source_index) for turn in range(turn_count) for team in teams)
+            self.samples.extend((path, turn, team) for turn in range(turn_count) for team in teams)
             if len(self.samples) > group_start:
                 self.sample_groups.append(list(range(group_start, len(self.samples))))
 
@@ -411,7 +326,7 @@ class LuxReplayDataset(Dataset):
         self,
         index: int,
     ) -> tuple[BoardSnapshot, list[str], int, Mapping[str, object]]:
-        path, turn, team, _ = self.samples[index]
+        path, turn, team = self.samples[index]
         replay = self.cache.get(path)
         observation = replay["steps"][turn][0]["observation"]
         initial_observation = replay["steps"][0][0]["observation"]
@@ -443,7 +358,6 @@ class LuxReplayDataset(Dataset):
             winner = _winner_from_rewards(replay.get("rewards") or ())
         result = {
             "observation": torch.from_numpy(features),
-            "source_index": torch.tensor(self.samples[index][3], dtype=torch.long),
             "sample_weight": torch.tensor(
                 self.winner_weight if self.team_selection == "all" and team == winner else 1.0,
                 dtype=torch.float32,
