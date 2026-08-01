@@ -346,6 +346,8 @@ def test_job_api_claim_context_and_upload_artifacts(tmp_path):
     server.start()
     try:
         host, port = server.address
+        health = JobApiClient(f"http://{host}:{port}").health()
+        assert health == {"status": "ok", "api_version": 1}
         unauthorized = JobApiClient(f"http://{host}:{port}", token=f"wrong-{candidate.candidate_id}")
         with pytest.raises(RuntimeError, match="HTTP 401"):
             unauthorized.claim("intruder")

@@ -641,13 +641,31 @@ uv run --locked python examples/evolve_rl.py \
   --device cuda --distributed --job-api-listen 127.0.0.1:8765
 ```
 
-On the ws3 host, forward a local port to the PC1 API. The `pc1` SSH alias should point to
-`172.17.189.62` through `ProxyJump lyra`:
+When ws3 cannot authenticate to lyra with a forwarded agent, relay the API through the Mac that owns the working SSH
+configuration. Do not copy private keys into ws3. In Mac terminal A, forward the PC1 API to the Mac:
 
 ```bash
-ssh -N -L 127.0.0.1:18765:127.0.0.1:8765 \
-  -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes pc1
+ssh -N -L 127.0.0.1:28765:127.0.0.1:8765 \
+  -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
+  ueda
 ```
+
+In Mac terminal B, expose that Mac-local port only on ws3's loopback interface:
+
+```bash
+ssh -N -R 127.0.0.1:18765:127.0.0.1:28765 \
+  -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
+  tomohiro_ws3
+```
+
+Keep both Mac SSH processes running. In a ws3 terminal, verify the forwarded endpoint before starting Docker:
+
+```bash
+curl http://127.0.0.1:18765/healthz
+```
+
+It should return `{"status":"ok","api_version":1}`. `Connection refused` means the SSH tunnel is not running on
+ws3; checking PC1's port `8765` does not verify ws3's forwarded port `18765`.
 
 Start the ws3 Docker worker in another terminal. Host networking lets the container reach the loopback SSH tunnel;
 the worker run directory is local persistent scratch, not a shared mount:

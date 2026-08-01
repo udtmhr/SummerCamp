@@ -82,6 +82,11 @@ class JobApiClient:
     def claim(self, worker_id: str) -> dict[str, Any] | None:
         return self._post("/v1/claim", {"worker_id": worker_id})
 
+    def health(self) -> dict[str, Any]:
+        request = urllib.request.Request(f"{self.base_url}/healthz", method="GET")
+        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            return json.loads(response.read())
+
     def complete(
         self,
         *,
@@ -157,6 +162,12 @@ class JobApiServer:
                     return True
                 provided = self.headers.get("Authorization", "").removeprefix("Bearer ")
                 return hmac.compare_digest(provided, owner.token)
+
+            def do_GET(self) -> None:
+                if self.path in {"/", "/healthz"}:
+                    self._json(HTTPStatus.OK, {"status": "ok", "api_version": JOB_API_VERSION})
+                else:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
             def do_POST(self) -> None:
                 if not self._authorized():

@@ -490,9 +490,37 @@ def run_worker(args: argparse.Namespace) -> None:
     )
     worker_id = args.worker_id or f"{socket.gethostname()}-{os.getpid()}"
     idle_started = time.monotonic()
+    last_api_error: OSError | None = None
     while True:
         if api is not None:
-            claim = api.claim(worker_id)
+            try:
+                claim = api.claim(worker_id)
+            except OSError as error:
+                if last_api_error is None:
+                    print(
+                        json.dumps(
+                            {
+                                "worker_id": worker_id,
+                                "job_api": args.job_api_url,
+                                "status": "waiting",
+                                "error": str(error),
+                            },
+                            sort_keys=True,
+                        )
+                    )
+                last_api_error = error
+                if args.worker_idle_seconds > 0 and time.monotonic() - idle_started >= args.worker_idle_seconds:
+                    message = f"Job API remained unreachable: {args.job_api_url}"
+                    raise ConnectionError(message) from error
+                time.sleep(max(0.1, args.job_poll_seconds))
+                continue
+            if last_api_error is not None:
+                print(
+                    json.dumps(
+                        {"worker_id": worker_id, "job_api": args.job_api_url, "status": "connected"}, sort_keys=True
+                    )
+                )
+                last_api_error = None
             if claim is None:
                 claimed = None
             else:
