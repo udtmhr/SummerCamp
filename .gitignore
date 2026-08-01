@@ -143,3 +143,5 @@ dmypy.json
 ./replays/
 replay_datasets
 /shared/
+dockerfile
+docker-compose.yaml
