@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import threading
 
 import numpy as np
 import pytest
@@ -21,6 +22,7 @@ from luxai2021.imitation.model import (
     ModelConfig,
     load_bc_checkpoint,
 )
+from luxai2021.rl.batched_rollout import ActorCriticBatcher, InferenceBatcher
 from luxai2021.rl.evaluation import acceptance_report, paired_seed_deltas
 from luxai2021.rl.evolution import (
     CandidateResult,
@@ -38,7 +40,7 @@ from luxai2021.rl.evolution import (
 from luxai2021.rl.job_api import JobApiClient, JobApiServer, extract_artifact_directory
 from luxai2021.rl.metrics import GameMetrics
 from luxai2021.rl.policy import FullTurnActorCritic, RolloutAgent
-from luxai2021.rl.ppo import PPOConfig, PPOTrainer, collect_episode
+from luxai2021.rl.ppo import PPOConfig, PPOTrainer, collect_episode, collect_episodes_batched
 from luxai2021.rl.reward import RewardProgram, default_reward_program
 
 
@@ -198,6 +200,99 @@ def test_short_full_turn_ppo_smoke_updates_finite_parameters(tmp_path):
     )
 
 
+def test_training_checkpoint_v2_restores_budget_progress_and_legacy_estimate(tmp_path):
+    actor = FullTurnActorCritic(_small_policy())
+    trainer = PPOTrainer(actor, copy.deepcopy(actor.policy), PPOConfig(), torch.device("cpu"))
+    checkpoint_path = tmp_path / "latest_rl.pt"
+    trainer.save_training_checkpoint(
+        checkpoint_path,
+        source_checkpoint="base.pt",
+        reward_program=default_reward_program(),
+        update=3,
+        metrics={"elapsed_seconds": 25.0},
+        training_state={
+            "cumulative_decisions": 1234,
+            "cumulative_turns": 456,
+            "cumulative_episodes": 7,
+            "elapsed_seconds": 25.0,
+        },
+    )
+
+    restored = trainer.load_training_state(
+        checkpoint_path,
+        source_checkpoint="base.pt",
+        reward_program=default_reward_program(),
+    )
+
+    assert restored.next_update == 4
+    assert restored.cumulative_decisions == 1234
+    assert restored.cumulative_turns == 456
+    assert restored.cumulative_episodes == 7
+
+    legacy = torch.load(checkpoint_path, weights_only=False)
+    legacy["schema_version"] = 1
+    legacy.pop("training_state")
+    legacy.pop("torch_rng_state")
+    legacy.pop("cuda_rng_state_all")
+    legacy["metrics"] = {"elapsed_seconds": 50.0}
+    legacy_path = tmp_path / "legacy_rl.pt"
+    torch.save(legacy, legacy_path)
+    restored_legacy = trainer.load_training_state(
+        legacy_path,
+        source_checkpoint="base.pt",
+        reward_program=default_reward_program(),
+        legacy_target_decisions=1000,
+        legacy_stage_seconds=100,
+    )
+    assert restored_legacy.cumulative_decisions == 500
+
+
+def test_inference_batcher_and_parallel_rollout_batch_requests():
+    barrier = threading.Barrier(2)
+
+    def infer(values):
+        return [value * 2 for value in values]
+
+    batcher = InferenceBatcher(infer, max_batch_size=2, wait_seconds=0.05, name="test-inference")
+    outputs = [None, None]
+
+    def submit(index):
+        barrier.wait()
+        outputs[index] = batcher.submit(index + 1)
+
+    threads = [threading.Thread(target=submit, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    metrics = batcher.metrics()
+    batcher.close()
+    assert outputs == [2, 4]
+    assert metrics["max_batch_size"] == 2
+
+    actor = FullTurnActorCritic(_small_policy()).eval()
+    snapshot = copy.deepcopy(actor).eval()
+    actor_batcher = ActorCriticBatcher(actor, torch.device("cpu"), 2, name="test-rollout-inference")
+    try:
+        episodes = collect_episodes_batched(
+            actor,
+            [
+                (lambda: RolloutAgent(snapshot, device="cpu", deterministic=True), 31, "snapshot"),
+                (lambda: RolloutAgent(snapshot, device="cpu", deterministic=True), 32, "snapshot"),
+            ],
+            default_reward_program(),
+            device=torch.device("cpu"),
+            inference_backend=actor_batcher.submit,
+            max_turns=4,
+        )
+    finally:
+        rollout_metrics = actor_batcher.metrics()
+        actor_batcher.close()
+    assert len(episodes) == 2
+    assert all(episode.records for episode in episodes)
+    assert rollout_metrics["max_batch_size"] == 2
+
+
 def test_dry_run_archive_is_json_serializable():
     candidate = initial_candidate(island=0, seed=42)
     encoded = json.dumps(candidate.to_dict(), sort_keys=True)
@@ -335,7 +430,7 @@ def test_filesystem_job_queue_claim_and_complete(tmp_path):
     assert (tmp_path / "jobs" / "completed" / f"{job.job_id}.json").exists()
 
 
-def test_job_api_claim_context_and_upload_artifacts(tmp_path):
+def test_job_api_claim_context_and_upload_artifacts(tmp_path):  # noqa: PLR0915
     coordinator_dir = tmp_path / "coordinator"
     store = EvolutionStore(coordinator_dir)
     candidate = initial_candidate(island=0, seed=7)
@@ -366,6 +461,18 @@ def test_job_api_claim_context_and_upload_artifacts(tmp_path):
         worker_artifacts.mkdir()
         (worker_artifacts / "best.pt").write_bytes(b"policy")
         (worker_artifacts / "latest_rl.pt").write_bytes(b"training")
+        partial_artifacts = tmp_path / "partial-artifacts"
+        partial_artifacts.mkdir()
+        (partial_artifacts / "latest_rl.pt").write_bytes(b"partial-training")
+        client.heartbeat(
+            lease_id=claim["lease_id"],
+            job=job,
+            artifact_dir=partial_artifacts,
+        )
+        partial_checkpoint = (
+            coordinator_dir / "artifacts" / candidate.candidate_id / job.stage / job.base_name / "latest_rl.pt"
+        )
+        assert partial_checkpoint.read_bytes() == b"partial-training"
         result = CandidateResult(
             candidate.candidate_id,
             job.stage,
@@ -391,6 +498,21 @@ def test_job_api_claim_context_and_upload_artifacts(tmp_path):
         downloaded = tmp_path / "downloaded-input"
         extract_artifact_directory(medium_claim["input_artifact"]["zip_base64"], downloaded)
         assert (downloaded / "latest_rl.pt").read_bytes() == b"training"
+        medium_partial = tmp_path / "medium-partial"
+        medium_partial.mkdir()
+        (medium_partial / "latest_rl.pt").write_bytes(b"medium-partial-training")
+        client.heartbeat(
+            lease_id=medium_claim["lease_id"],
+            job=medium_job,
+            artifact_dir=medium_partial,
+        )
+        client.release(lease_id=medium_claim["lease_id"], job=medium_job)
+        medium_claim = client.claim("replacement-worker")
+        assert medium_claim is not None
+        assert medium_claim["input_artifact"]["stage"] == "medium-resattn8"
+        resumed_medium = tmp_path / "resumed-medium"
+        extract_artifact_directory(medium_claim["input_artifact"]["zip_base64"], resumed_medium)
+        assert (resumed_medium / "latest_rl.pt").read_bytes() == b"medium-partial-training"
         failed = CandidateResult(
             candidate.candidate_id,
             medium_job.stage,

@@ -609,8 +609,12 @@ uv run --locked python examples/evolve_rl.py \
   --device cuda
 ```
 
-The defaults screen 24 ResAttn8 candidates for 20 minutes, continue the best eight to 90 minutes, and train the best
-two from both UNet and ResAttn8 for six hours each. Final evaluation uses 50 fixed seeds, both player orientations,
+The defaults screen 24 ResAttn8 candidates for 550,000 sampled decisions, continue the best eight for another
+1,925,000 decisions, and train the best two from both UNet and ResAttn8 for 9,900,000 decisions each. A candidate runs
+four Lux environments concurrently; candidate and opponent inference requests are collected into GPU batches while
+action decoding remains environment-local. PPO also evaluates all decisions of each entity type as tensors instead of
+one Python operation per unit. Tune `--rollout-envs` for each GPU and `--decisions-per-update` for the rollout/update
+balance. Final evaluation uses 50 fixed seeds, both player orientations,
 the two distilled bases plus the original first-place policy, no replay output, paired bootstrap reporting, and an
 inference-latency guard. Re-running the same command resumes completed candidates and stage checkpoints. Use
 `--no-codex` for deterministic numeric mutations, or `--overwrite-run` to intentionally start that run directory
@@ -628,7 +632,10 @@ uv run --locked python examples/evolve_rl.py \
 ```
 
 Candidate definitions, failures, training checkpoints, league games, and the promotion report are written under the
-run directory so an interrupted search remains inspectable and resumable.
+run directory so an interrupted search remains inspectable and resumable. `latest_rl.pt` uses checkpoint schema v2 and
+stores cumulative decisions, turns, episodes, optimizer state, and RNG state. Re-running a stage resumes its remaining
+decision budget. Schema-v1 checkpoints remain loadable; their consumed budget is conservatively estimated from their
+recorded elapsed-time fraction.
 
 Independent candidates can use another GPU machine without a shared filesystem. The coordinator keeps the authoritative
 queue and artifacts locally and exposes a loopback-only Job API. Start it on PC1; omitting `--coordinator-only` lets PC1
@@ -674,7 +681,10 @@ the worker run directory is local persistent scratch, not a shared mount:
 mkdir -p "$HOME/lux-evolution-worker"
 docker run --rm --gpus all --network host \
   -e LUX_EVOLUTION_JOB_TOKEN \
+  -e UV_PROJECT_ENVIRONMENT=/tmp/lux-evolution-venv \
+  -e UV_LINK_MODE=copy \
   -v "$HOME/lux-evolution-worker:/workspace/lux-evolution-worker" \
+  -v "$PWD:/app:ro" -w /app \
   ueda/uv-app \
   uv run --locked python examples/evolve_rl.py \
     --run-dir /workspace/lux-evolution-worker \
@@ -687,7 +697,10 @@ The repository revision and base model files must exist in the image on both mac
 local to each machine, so pass ws3-specific paths after the image command when needed. The API sends candidate context
 to preserve parent-change feedback, returns completed checkpoints and diagnostics to PC1, and downloads the short-stage
 checkpoint when a medium-stage job moves to another machine. Completion uploads are idempotent, while stale claims older
-than 12 hours are requeued. Set `LUX_EVOLUTION_JOB_TOKEN` to the same random value on PC1 and ws3; it is not written to
+than 12 hours are requeued. Every 10 minutes by default, ws3 uploads `latest_rl.pt` with a lease heartbeat; a restarted
+worker downloads that partial stage and continues its remaining decision budget. Ctrl-C releases the lease after a
+best-effort final checkpoint upload. Change the transfer interval with `--job-heartbeat-seconds`. Set
+`LUX_EVOLUTION_JOB_TOKEN` to the same random value on PC1 and ws3; it is not written to
 the run manifest. `--worker-idle-seconds 0` keeps the remote worker alive across generation barriers. Add
 `--coordinator-only` only when PC1 should schedule without using its own GPU.
 

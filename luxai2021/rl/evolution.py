@@ -172,6 +172,7 @@ class EvolutionJob:
     seconds: int
     eval_seeds: int
     eval_seed_start: int
+    decision_budget: int | None = None
 
     @property
     def job_id(self) -> str:
@@ -189,8 +190,14 @@ class EvolutionJob:
             seconds=int(value["seconds"]),
             eval_seeds=int(value["eval_seeds"]),
             eval_seed_start=int(value["eval_seed_start"]),
+            decision_budget=(int(value["decision_budget"]) if value.get("decision_budget") is not None else None),
         )
-        if job.base_name not in {"unet", "resattn8"} or job.seconds < 0 or job.eval_seeds < 1:
+        if (
+            job.base_name not in {"unet", "resattn8"}
+            or job.seconds < 0
+            or job.eval_seeds < 1
+            or (job.decision_budget is not None and job.decision_budget < 1)
+        ):
             raise ValueError("Invalid distributed evolution job")
         return job
 
@@ -231,6 +238,19 @@ class FilesystemJobQueue:
         completed = self.completed_dir / f"{job.job_id}.json"
         EvolutionStore.write_json(completed, payload)
         claimed_path.unlink(missing_ok=True)
+
+    def heartbeat(self, claimed_path: Path) -> None:
+        if not claimed_path.exists():
+            raise ValueError("Unknown or expired lease")
+        claimed_path.touch()
+
+    def release(self, claimed_path: Path) -> None:
+        if not claimed_path.exists():
+            return
+        job = EvolutionJob.from_dict(json.loads(claimed_path.read_text(encoding="utf-8")))
+        pending = self.pending_dir / f"{job.job_id}.json"
+        if not pending.exists():
+            claimed_path.replace(pending)
 
     def recover_stale(self, stale_seconds: float) -> int:
         if stale_seconds <= 0:

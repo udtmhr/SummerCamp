@@ -23,6 +23,12 @@ from luxai2021.imitation.agent import BehaviorCloningAgent, FirstPlaceAgent
 from luxai2021.imitation.data import ReplayBatchSampler
 from luxai2021.imitation.distillation import LuxDistillationDataset, compact_distillation_collate
 from luxai2021.imitation.model import load_bc_checkpoint
+from luxai2021.rl.batched_rollout import (
+    ActorCriticBatcher,
+    BatchedOpponentPool,
+    BehaviorCloningBatcher,
+    FirstPlaceBatcher,
+)
 from luxai2021.rl.evaluation import LeagueMember, acceptance_report, evaluate_against_league
 from luxai2021.rl.evolution import (
     CandidateResult,
@@ -38,7 +44,7 @@ from luxai2021.rl.evolution import (
 )
 from luxai2021.rl.job_api import JOB_API_VERSION, JobApiClient, JobApiServer, extract_artifact_directory
 from luxai2021.rl.policy import FullTurnActorCritic, RolloutAgent
-from luxai2021.rl.ppo import PPOTrainer, collect_episode
+from luxai2021.rl.ppo import PPOTrainer, collect_episodes_batched
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
@@ -68,6 +74,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--short-seconds", type=int, default=20 * 60)
     parser.add_argument("--medium-seconds", type=int, default=90 * 60)
     parser.add_argument("--final-seconds", type=int, default=6 * 60 * 60)
+    parser.add_argument("--short-decisions", type=int, default=550_000)
+    parser.add_argument("--medium-decisions", type=int, default=1_925_000)
+    parser.add_argument("--final-decisions", type=int, default=9_900_000)
+    parser.add_argument("--decisions-per-update", type=int, default=40_000)
+    parser.add_argument("--rollout-envs", type=int, default=4)
     parser.add_argument("--medium-count", type=int, default=8)
     parser.add_argument("--final-count", type=int, default=2)
     parser.add_argument("--episodes-per-update", type=int, default=2)
@@ -97,6 +108,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--job-api-listen", help="Coordinator API listen address, for example 127.0.0.1:8765")
     parser.add_argument("--job-api-url", help="Worker API URL reached through SSH, for example http://127.0.0.1:18765")
     parser.add_argument("--job-api-timeout-seconds", type=float, default=600.0)
+    parser.add_argument("--job-heartbeat-seconds", type=float, default=600.0)
     return parser.parse_args()
 
 
@@ -188,6 +200,49 @@ def opponent_factories(
     }
 
 
+def batched_opponent_pool(
+    *,
+    base_checkpoint: Path,
+    other_checkpoint: Path,
+    teacher_checkpoint: Path,
+    snapshot: FullTurnActorCritic,
+    device: torch.device,
+    rollout_envs: int,
+) -> tuple[BatchedOpponentPool, dict[str, tuple[str, Callable[[], Agent]]]]:
+    device_name = str(device)
+    self_base = BehaviorCloningBatcher(
+        BehaviorCloningAgent(str(base_checkpoint), device=device_name, tta="none"),
+        rollout_envs,
+        name="lux-self-base-inference",
+    )
+    other_base = BehaviorCloningBatcher(
+        BehaviorCloningAgent(str(other_checkpoint), device=device_name, tta="none"),
+        rollout_envs,
+        name="lux-other-base-inference",
+    )
+    teacher = FirstPlaceBatcher(
+        FirstPlaceAgent(str(teacher_checkpoint), device=device_name, tta="none"),
+        rollout_envs,
+        name="lux-teacher-inference",
+    )
+    snapshot_backend = ActorCriticBatcher(snapshot, device, rollout_envs, name="lux-snapshot-inference")
+    resources = BatchedOpponentPool(
+        {
+            "self_base": self_base,
+            "other_base": other_base,
+            "teacher": teacher,
+            "snapshot": snapshot_backend,
+        }
+    )
+    factories = {
+        "self_base": (base_checkpoint.parent.name, resources.factory("self_base")),
+        "other_base": (other_checkpoint.parent.name, resources.factory("other_base")),
+        "teacher": ("first-place", resources.factory("teacher")),
+        "snapshot": ("initial-snapshot", resources.factory("snapshot")),
+    }
+    return resources, factories
+
+
 def train_candidate(
     candidate: EvolutionCandidate,
     *,
@@ -199,6 +254,9 @@ def train_candidate(
     prepared_cache_dir: Path,
     output_dir: Path,
     seconds: int,
+    decision_budget: int | None,
+    decisions_per_update: int,
+    rollout_envs: int,
     episodes_per_update: int,
     bc_batch_size: int,
     bc_replays: int,
@@ -207,6 +265,8 @@ def train_candidate(
     seed: int,
     max_turns: int,
     resume_from: Path | None = None,
+    resume_budget_progress: bool = True,
+    checkpoint_callback: Callable[[Path, Mapping[str, object]], None] | None = None,
 ) -> tuple[Path, dict[str, object]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     actor_critic = FullTurnActorCritic.from_checkpoint(base_checkpoint, device)
@@ -231,57 +291,130 @@ def train_candidate(
         device,
         bc_batch_provider=bc_provider,
     )
+    actor_critic.eval()
     start_update = 0
+    cumulative_decisions = 0
+    cumulative_turns = 0
+    episode_index = 0
+    previous_elapsed_seconds = 0.0
+    resumed_metrics: dict[str, object] | None = None
+    rng = random.Random(seed)
     if resume_from is not None:
-        start_update = trainer.load_training_checkpoint(
+        resume_state = trainer.load_training_state(
             resume_from,
             source_checkpoint=str(base_checkpoint),
             reward_program=candidate.reward_program,
+            legacy_target_decisions=decision_budget,
+            legacy_stage_seconds=seconds,
         )
-    pool = opponent_factories(
+        start_update = resume_state.next_update
+        if resume_budget_progress:
+            cumulative_decisions = resume_state.cumulative_decisions
+            cumulative_turns = resume_state.cumulative_turns
+            episode_index = resume_state.cumulative_episodes
+            previous_elapsed_seconds = resume_state.elapsed_seconds
+            resumed_metrics = resume_state.metrics
+        if resume_budget_progress and resume_state.python_random_state is not None:
+            rng.setstate(resume_state.python_random_state)
+    candidate_batcher = ActorCriticBatcher(
+        actor_critic,
+        device,
+        rollout_envs,
+        name="lux-candidate-inference",
+    )
+    opponent_resources, pool = batched_opponent_pool(
         base_checkpoint=base_checkpoint,
         other_checkpoint=other_checkpoint,
         teacher_checkpoint=teacher_checkpoint,
         snapshot=snapshot,
         device=device,
+        rollout_envs=rollout_envs,
     )
-    rng = random.Random(seed)
-    deadline = time.monotonic() + seconds
+    deadline = time.monotonic() + max(0.0, seconds - previous_elapsed_seconds)
     history = []
     diagnostic_events: list[dict[str, object]] = []
     update = start_update
-    while time.monotonic() < deadline or update == 0:
-        episodes = []
-        for episode_index in range(episodes_per_update):
-            opponent_key = candidate.opponent_mix.choose(rng)
-            opponent_name, factory = pool[opponent_key]
-            episode_seed = seed + update * episodes_per_update + episode_index
-            episodes.append(
-                collect_episode(
+    started_at = time.monotonic()
+    try:
+        while (
+            cumulative_decisions < decision_budget
+            if decision_budget is not None
+            else time.monotonic() < deadline or update == 0
+        ):
+            episodes = []
+            update_decisions = 0
+            target_update_decisions = decisions_per_update if decision_budget is not None else None
+            while (
+                update_decisions < target_update_decisions
+                if target_update_decisions is not None
+                else len(episodes) < episodes_per_update
+            ):
+                wave_size = rollout_envs
+                if target_update_decisions is None:
+                    wave_size = min(wave_size, episodes_per_update - len(episodes))
+                specs = []
+                opponent_key = candidate.opponent_mix.choose(rng)
+                opponent_name, factory = pool[opponent_key]
+                for _ in range(wave_size):
+                    episode_seed = seed + episode_index
+                    episode_index += 1
+                    specs.append((factory, episode_seed, opponent_name))
+                wave = collect_episodes_batched(
                     actor_critic,
-                    factory,
+                    specs,
                     candidate.reward_program,
                     device=device,
-                    seed=episode_seed,
-                    opponent_name=opponent_name,
+                    inference_backend=candidate_batcher.submit,
                     max_turns=max_turns,
                 )
+                episodes.extend(wave)
+                update_decisions += sum(len(record.decisions) for episode in wave for record in episode.records)
+            actor_critic.train()
+            metrics = trainer.update(episodes)
+            actor_critic.eval()
+            cumulative_decisions += int(metrics["decisions"])
+            cumulative_turns += int(metrics["turns"])
+            diagnostic_events.extend(event for episode in episodes for event in episode.diagnostic_events)
+            metrics.update(
+                {
+                    "update": update,
+                    "elapsed_seconds": previous_elapsed_seconds + time.monotonic() - started_at,
+                    "cumulative_decisions": cumulative_decisions,
+                    "cumulative_turns": cumulative_turns,
+                    "cumulative_episodes": episode_index,
+                    "decisions_per_second": cumulative_decisions
+                    / max(previous_elapsed_seconds + time.monotonic() - started_at, 1e-6),
+                    "candidate_inference": candidate_batcher.metrics(),
+                    "opponent_inference": opponent_resources.metrics(),
+                    "rollout_envs": rollout_envs,
+                }
             )
-        metrics = trainer.update(episodes)
-        diagnostic_events.extend(event for episode in episodes for event in episode.diagnostic_events)
-        metrics["update"] = update
-        metrics["elapsed_seconds"] = seconds - max(0.0, deadline - time.monotonic())
-        history.append(metrics)
-        trainer.save_training_checkpoint(
-            output_dir / "latest_rl.pt",
-            source_checkpoint=str(base_checkpoint),
-            reward_program=candidate.reward_program,
-            update=update,
-            metrics=metrics,
-        )
-        update += 1
-        if seconds <= 0:
-            break
+            history.append(metrics)
+            trainer.save_training_checkpoint(
+                output_dir / "latest_rl.pt",
+                source_checkpoint=str(base_checkpoint),
+                reward_program=candidate.reward_program,
+                update=update,
+                metrics=metrics,
+                training_state={
+                    "cumulative_decisions": cumulative_decisions,
+                    "cumulative_turns": cumulative_turns,
+                    "cumulative_episodes": episode_index,
+                    "elapsed_seconds": metrics["elapsed_seconds"],
+                    "python_random_state": rng.getstate(),
+                },
+            )
+            if checkpoint_callback is not None:
+                checkpoint_callback(output_dir, metrics)
+            update += 1
+            if decision_budget is None and seconds <= 0:
+                break
+    finally:
+        candidate_batcher.close()
+        opponent_resources.close()
+    final_metrics = history[-1] if history else resumed_metrics
+    if final_metrics is None:
+        raise RuntimeError("Training completed without a checkpoint or a PPO update")
     _, source = load_bc_checkpoint(str(base_checkpoint), "cpu")
     summary = {
         "candidate_id": candidate.candidate_id,
@@ -290,13 +423,16 @@ def train_candidate(
         "reward_program": candidate.reward_program.to_dict(),
         "ppo_config": asdict(candidate.ppo_config),
         "opponent_mix": asdict(candidate.opponent_mix),
+        "decision_budget": decision_budget,
+        "decisions_per_update": decisions_per_update,
+        "rollout_envs": rollout_envs,
         "history": history,
         "diagnostic_events": diagnostic_events,
     }
     actor_critic.export_policy(
         output_dir / "best.pt",
         epoch=max(0, update - 1),
-        metrics={"validation": history[-1], "ppo": history[-1]},
+        metrics={"validation": final_metrics, "ppo": final_metrics},
         split=source["split"],
         metadata=summary,
     )
@@ -314,11 +450,25 @@ def candidate_result(
     args: argparse.Namespace,
     device: torch.device,
     seconds: int,
+    decision_budget: int | None,
     eval_seeds: int,
     eval_seed_start: int,
+    checkpoint_callback: Callable[[Path, Mapping[str, object]], None] | None = None,
 ) -> CandidateResult:
     started_at = time.monotonic()
     output_dir = Path(args.run_dir) / "artifacts" / candidate.candidate_id / stage / base_name
+    current_checkpoint = output_dir / "latest_rl.pt"
+    prior_short_checkpoint = (
+        Path(args.run_dir)
+        / "artifacts"
+        / candidate.candidate_id
+        / "short-resattn8"
+        / "resattn8"
+        / "latest_rl.pt"
+    )
+    resume_from = current_checkpoint if current_checkpoint.exists() else None
+    if resume_from is None and stage == "medium-resattn8" and prior_short_checkpoint.exists():
+        resume_from = prior_short_checkpoint
     try:
         checkpoint, training = train_candidate(
             candidate,
@@ -330,6 +480,9 @@ def candidate_result(
             prepared_cache_dir=Path(args.prepared_cache_dir),
             output_dir=output_dir,
             seconds=seconds,
+            decision_budget=decision_budget,
+            decisions_per_update=args.decisions_per_update,
+            rollout_envs=args.rollout_envs,
             episodes_per_update=args.episodes_per_update,
             bc_batch_size=args.bc_batch_size,
             bc_replays=args.bc_replays,
@@ -337,16 +490,9 @@ def candidate_result(
             device=device,
             seed=args.seed + candidate.generation * 10_000 + candidate.island * 100,
             max_turns=args.max_turns,
-            resume_from=(
-                Path(args.run_dir)
-                / "artifacts"
-                / candidate.candidate_id
-                / "short-resattn8"
-                / "resattn8"
-                / "latest_rl.pt"
-                if stage == "medium-resattn8"
-                else None
-            ),
+            resume_from=resume_from,
+            resume_budget_progress=resume_from == current_checkpoint,
+            checkpoint_callback=checkpoint_callback,
         )
         anchors = [
             LeagueMember("unet-base", Path(args.unet_checkpoint)),
@@ -424,6 +570,7 @@ def execute_evolution_job(
     args: argparse.Namespace,
     device: torch.device,
     store: EvolutionStore,
+    checkpoint_callback: Callable[[Path, Mapping[str, object]], None] | None = None,
 ) -> CandidateResult:
     candidates = {candidate.candidate_id: candidate for candidate in store.candidates()}
     candidate = candidates[job.candidate_id]
@@ -439,6 +586,16 @@ def execute_evolution_job(
         "resattn8": (Path(args.resattn8_checkpoint), Path(args.unet_checkpoint)),
     }
     base_checkpoint, other_checkpoint = checkpoints[job.base_name]
+    decision_budget = job.decision_budget
+    if decision_budget is None:
+        if job.seconds <= 0:
+            decision_budget = 1
+        elif job.stage.startswith("short-"):
+            decision_budget = args.short_decisions
+        elif job.stage.startswith("medium-"):
+            decision_budget = args.medium_decisions
+        elif job.stage.startswith("final-"):
+            decision_budget = args.final_decisions
     result = candidate_result(
         candidate,
         stage=job.stage,
@@ -448,8 +605,10 @@ def execute_evolution_job(
         args=args,
         device=device,
         seconds=job.seconds,
+        decision_budget=decision_budget,
         eval_seeds=job.eval_seeds,
         eval_seed_start=job.eval_seed_start,
+        checkpoint_callback=checkpoint_callback,
     )
     result = add_candidate_reflection(result, candidate, candidates, prior_results)
     store.save_result(result)
@@ -460,7 +619,15 @@ def _apply_coordinator_manifest(args: argparse.Namespace, manifest: Mapping[str,
     coordinator_args = manifest.get("arguments", {})
     if not isinstance(coordinator_args, dict):
         raise TypeError("Coordinator manifest arguments are invalid")
-    for name in ("seed", "episodes_per_update", "bc_batch_size", "bc_replays", "no_bc_anchor", "max_turns"):
+    for name in (
+        "seed",
+        "episodes_per_update",
+        "decisions_per_update",
+        "bc_batch_size",
+        "bc_replays",
+        "no_bc_anchor",
+        "max_turns",
+    ):
         if name in coordinator_args:
             setattr(args, name, coordinator_args[name])
 
@@ -587,7 +754,66 @@ def run_worker(args: argparse.Namespace) -> None:
                 sort_keys=True,
             )
         )
-        result = execute_evolution_job(job, args=args, device=device, store=store)
+        last_heartbeat = time.monotonic()
+        current_job = job
+        current_lease = lease
+
+        def checkpoint_callback(
+            artifact_dir: Path,
+            metrics: Mapping[str, object],
+            current_lease: str | Path = current_lease,
+            current_job: EvolutionJob = current_job,
+        ) -> None:
+            nonlocal last_heartbeat
+            if api is None or time.monotonic() - last_heartbeat < args.job_heartbeat_seconds:
+                return
+            try:
+                api.heartbeat(lease_id=current_lease, job=current_job, artifact_dir=artifact_dir)
+            except (OSError, RuntimeError) as error:
+                print(
+                    json.dumps(
+                        {
+                            "worker_id": worker_id,
+                            "job_id": current_job.job_id,
+                            "status": "heartbeat_failed",
+                            "error": str(error),
+                        },
+                        sort_keys=True,
+                    )
+                )
+                return
+            last_heartbeat = time.monotonic()
+            print(
+                json.dumps(
+                    {
+                        "worker_id": worker_id,
+                        "job_id": current_job.job_id,
+                        "status": "checkpoint_uploaded",
+                        "cumulative_decisions": metrics.get("cumulative_decisions"),
+                    },
+                    sort_keys=True,
+                )
+            )
+
+        try:
+            result = execute_evolution_job(
+                job,
+                args=args,
+                device=device,
+                store=store,
+                checkpoint_callback=checkpoint_callback,
+            )
+        except KeyboardInterrupt:
+            if api is None:
+                queue.release(lease)
+            else:
+                artifact_dir = run_dir / "artifacts" / job.candidate_id / job.stage / job.base_name
+                try:
+                    api.heartbeat(lease_id=lease, job=job, artifact_dir=artifact_dir)
+                    api.release(lease_id=lease, job=job)
+                except (OSError, RuntimeError):
+                    pass
+            raise
         if api is None:
             queue.complete(lease, result)
         else:
@@ -625,6 +851,8 @@ def main() -> None:
         raise ValueError("--job-api-url is only valid with --worker")
     if args.islands < 1 or args.initial_per_island < 1 or args.generations < 0:
         raise ValueError("Population sizes must be positive")
+    if args.rollout_envs < 1 or args.decisions_per_update < 1:
+        raise ValueError("Rollout environment and decision budgets must be positive")
     run_dir = Path(args.run_dir)
     if args.overwrite_run and run_dir.exists():
         shutil.rmtree(run_dir)
@@ -729,6 +957,7 @@ def main() -> None:
             args.short_seconds,
             args.screening_seeds,
             args.screening_seed_start,
+            1 if args.short_seconds <= 0 else args.short_decisions,
         )
 
     island_parents: dict[int, EvolutionCandidate] = {}
@@ -836,6 +1065,7 @@ def main() -> None:
                 max(0, args.medium_seconds - args.short_seconds),
                 args.medium_seeds,
                 args.screening_seed_start + 10_000,
+                args.medium_decisions,
             )
             for candidate in medium
         ]
@@ -850,6 +1080,7 @@ def main() -> None:
             args.final_seconds,
             args.final_seeds,
             args.final_seed_start,
+            args.final_decisions,
         )
         for candidate in finalists
         for base_name in ("unet", "resattn8")

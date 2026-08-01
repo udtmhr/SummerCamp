@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# ruff: noqa: ARG002, C901, FBT001, PLR0912, PLR0913, PLR0915, TC003
+# ruff: noqa: C901, PLR0912, PLR0913, PLR0915, TC003
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -26,7 +26,7 @@ from luxai2021.imitation.schema import encode_snapshot, snapshot_from_game
 from luxai2021.rl.metrics import GameMetrics, metrics_from_game
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
 
 @dataclass
@@ -126,22 +126,31 @@ class RolloutAgent(BehaviorCloningAgent):
         *,
         device: str | torch.device,
         deterministic: bool = False,
+        inference_backend: Callable[[Tensor], tuple[dict[str, Tensor], Tensor]] | None = None,
+        record_trajectory: bool = True,
     ) -> None:
         Agent.__init__(self)
         self.actor_critic = actor_critic
         self.model = actor_critic.policy
         self.device = torch.device(device)
         self.deterministic = deterministic
+        self.inference_backend = inference_backend
+        self.record_trajectory = record_trajectory
         self.checkpoint = {"inference_augmentation": "none"}
         self.tta = "none"
         self.records: list[TurnRecord] = []
+        self.generator = torch.Generator(device="cpu")
 
     def game_start(self, game: object) -> None:
         self.records = []
+        seed = int(getattr(game, "configs", {}).get("seed", 0))
+        self.generator.manual_seed(seed * 2 + self.team)
 
-    @staticmethod
-    def _choose_action(distribution: Categorical, deterministic: bool) -> Tensor:
-        return distribution.logits.argmax() if deterministic else distribution.sample()
+    def _choose_action(self, distribution: Categorical) -> Tensor:
+        if self.deterministic:
+            return distribution.logits.argmax()
+        probabilities = distribution.probs.float().cpu()
+        return torch.multinomial(probabilities, 1, generator=self.generator).squeeze(0)
 
     def _sample_units(
         self,
@@ -181,7 +190,7 @@ class RolloutAgent(BehaviorCloningAgent):
             legal = monotonically_tighten_legal_mask(existing_legal, additional_allow)
             y, x = unit.pos.y + y_offset, unit.pos.x + x_offset
             distribution = _distribution(output[entity][0, :, y, x], legal)
-            action_tensor = self._choose_action(distribution, self.deterministic)
+            action_tensor = self._choose_action(distribution).to(distribution.logits.device)
             action_index = int(action_tensor)
             action_name = action_names[action_index]
             candidate = _Candidate("stay", float(distribution.logits[action_index]))
@@ -283,7 +292,7 @@ class RolloutAgent(BehaviorCloningAgent):
             legal = monotonically_tighten_legal_mask(base_legal, additional_allow)
             y, x = tile.pos.y + y_offset, tile.pos.x + x_offset
             distribution = _distribution(output["city_tile"][0, :, y, x], legal)
-            action_tensor = self._choose_action(distribution, self.deterministic)
+            action_tensor = self._choose_action(distribution).to(distribution.logits.device)
             action_index = int(action_tensor)
             action_name = CITY_ACTIONS[action_index]
             if action_name in {"build_worker", "build_cart"}:
@@ -308,9 +317,13 @@ class RolloutAgent(BehaviorCloningAgent):
 
     def process_turn(self, game: object, team: int) -> list[object]:
         snapshot = snapshot_from_game(game)
-        observation = torch.from_numpy(encode_snapshot(snapshot, team))[None].to(self.device)
-        with torch.inference_mode():
-            output, value = self.actor_critic(observation)
+        observation_cpu = torch.from_numpy(encode_snapshot(snapshot, team))
+        if self.inference_backend is None:
+            observation = observation_cpu[None].to(self.device)
+            with torch.inference_mode():
+                output, value = self.actor_critic(observation)
+        else:
+            output, value = self.inference_backend(observation_cpu)
         x_offset, y_offset = snapshot.padding
         unit_choices, unit_decisions = self._sample_units(
             game,
@@ -328,14 +341,15 @@ class RolloutAgent(BehaviorCloningAgent):
             x_offset,
             y_offset,
         )
-        self.records.append(
-            TurnRecord(
-                observation=observation[0].detach().cpu(),
-                metrics=metrics_from_game(game, team),
-                decisions=unit_decisions + city_decisions,
-                value=float(value[0]),
+        if self.record_trajectory:
+            self.records.append(
+                TurnRecord(
+                    observation=observation_cpu,
+                    metrics=metrics_from_game(game, team),
+                    decisions=unit_decisions + city_decisions,
+                    value=float(value.reshape(-1)[0]),
+                )
             )
-        )
         return [*self._choices_to_actions(unit_choices, team), *city_actions]
 
 

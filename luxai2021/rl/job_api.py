@@ -107,6 +107,23 @@ class JobApiClient:
         if response is None or not response.get("ok"):
             raise RuntimeError("Job API did not acknowledge completion")
 
+    def heartbeat(self, *, lease_id: str, job: EvolutionJob, artifact_dir: Path) -> None:
+        response = self._post(
+            "/v1/heartbeat",
+            {
+                "lease_id": lease_id,
+                "job_id": job.job_id,
+                "artifacts_zip_base64": encode_artifact_directory(artifact_dir),
+            },
+        )
+        if response is None or not response.get("ok"):
+            raise RuntimeError("Job API did not acknowledge heartbeat")
+
+    def release(self, *, lease_id: str, job: EvolutionJob) -> None:
+        response = self._post("/v1/release", {"lease_id": lease_id, "job_id": job.job_id})
+        if response is None or not response.get("ok"):
+            raise RuntimeError("Job API did not acknowledge lease release")
+
 
 class _JobApiHttpServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -180,6 +197,10 @@ class JobApiServer:
                         self._claim(payload)
                     elif self.path == "/v1/complete":
                         self._complete(payload)
+                    elif self.path == "/v1/heartbeat":
+                        self._heartbeat(payload)
+                    elif self.path == "/v1/release":
+                        self._release(payload)
                     else:
                         self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError, zipfile.BadZipFile) as error:
@@ -196,7 +217,15 @@ class JobApiServer:
                 candidate = next(item for item in candidates if item.candidate_id == job.candidate_id)
                 manifest = json.loads((owner.run_dir / "manifest.json").read_text(encoding="utf-8"))
                 input_artifact = None
-                if job.stage == "medium-resattn8":
+                current_dir = owner.run_dir / "artifacts" / job.candidate_id / job.stage / job.base_name
+                current_encoded = encode_artifact_directory(current_dir)
+                if current_encoded is not None:
+                    input_artifact = {
+                        "stage": job.stage,
+                        "base_name": job.base_name,
+                        "zip_base64": current_encoded,
+                    }
+                elif job.stage == "medium-resattn8":
                     input_stage = "short-resattn8"
                     input_base = "resattn8"
                     input_dir = owner.run_dir / "artifacts" / job.candidate_id / input_stage / input_base
@@ -221,6 +250,32 @@ class JobApiServer:
                         "input_artifact": input_artifact,
                     },
                 )
+
+            def _validate_lease(self, payload: dict[str, Any]) -> tuple[str, Path, EvolutionJob]:
+                lease_id = str(payload["lease_id"])
+                if Path(lease_id).name != lease_id:
+                    raise ValueError("Invalid lease id")
+                claimed_path = owner.queue.running_dir / lease_id
+                if not claimed_path.exists():
+                    raise ValueError("Unknown or expired lease")
+                job = EvolutionJob.from_dict(json.loads(claimed_path.read_text(encoding="utf-8")))
+                if job.job_id != str(payload["job_id"]):
+                    raise ValueError("Lease and job id do not match")
+                return lease_id, claimed_path, job
+
+            def _heartbeat(self, payload: dict[str, Any]) -> None:
+                _, claimed_path, job = self._validate_lease(payload)
+                encoded = payload.get("artifacts_zip_base64")
+                if encoded:
+                    artifact_dir = owner.run_dir / "artifacts" / job.candidate_id / job.stage / job.base_name
+                    extract_artifact_directory(str(encoded), artifact_dir)
+                owner.queue.heartbeat(claimed_path)
+                self._json(HTTPStatus.OK, {"ok": True})
+
+            def _release(self, payload: dict[str, Any]) -> None:
+                _, claimed_path, _ = self._validate_lease(payload)
+                owner.queue.release(claimed_path)
+                self._json(HTTPStatus.OK, {"ok": True})
 
             def _complete(self, payload: dict[str, Any]) -> None:
                 lease_id = str(payload["lease_id"])
