@@ -630,27 +630,46 @@ uv run --locked python examples/evolve_rl.py \
 Candidate definitions, failures, training checkpoints, league games, and the promotion report are written under the
 run directory so an interrupted search remains inspectable and resumable.
 
-Independent candidates can use another GPU machine through the atomic filesystem job queue. Put the run directory on
-a filesystem visible at the same path from both machines (for example NFS), use the same repository revision and model
-artifacts, then start the coordinator on the first machine:
+Independent candidates can use another GPU machine without a shared filesystem. The coordinator keeps the authoritative
+queue and artifacts locally and exposes a loopback-only Job API. Start it on PC1; omitting `--coordinator-only` lets PC1
+also train candidates while serving ws3:
 
 ```bash
+export LUX_EVOLUTION_JOB_TOKEN='<same-random-token-on-both-machines>'
 uv run --locked python examples/evolve_rl.py \
-  --run-dir /shared/lux-s1-001 --device cuda --distributed
+  --run-dir /home/ueda/workspace/LuxPythonEnvGym/shared/lux-evolution \
+  --device cuda --distributed --job-api-listen 127.0.0.1:8765
 ```
 
-Start one worker per GPU on the second machine:
+On the ws3 host, forward a local port to the PC1 API. The `pc1` SSH alias should point to
+`172.17.189.62` through `ProxyJump lyra`:
 
 ```bash
-uv run --locked python examples/evolve_rl.py \
-  --run-dir /shared/lux-s1-001 --device cuda --worker \
-  --worker-id gpu-pc-2
+ssh -N -L 127.0.0.1:18765:127.0.0.1:8765 \
+  -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes pc1
 ```
 
-The coordinator batches islands at each generation and both machines atomically claim different candidates. It also
-works locally by default; add `--coordinator-only` when the first machine should schedule without consuming a GPU.
-Worker algorithm settings are read from the coordinator manifest, while checkpoint/cache path flags remain local so
-the two machines may store the same artifacts at different paths. Stale claims older than 12 hours are requeued.
+Start the ws3 Docker worker in another terminal. Host networking lets the container reach the loopback SSH tunnel;
+the worker run directory is local persistent scratch, not a shared mount:
+
+```bash
+mkdir -p "$HOME/lux-evolution-worker"
+docker run --rm --gpus all --network host \
+  -e LUX_EVOLUTION_JOB_TOKEN \
+  -v "$HOME/lux-evolution-worker:/workspace/lux-evolution-worker" \
+  ueda/uv-app \
+  uv run --locked python examples/evolve_rl.py \
+    --run-dir /workspace/lux-evolution-worker \
+    --device cuda --worker --worker-id ws3-gpu0 \
+    --job-api-url http://127.0.0.1:18765
+```
+
+The repository revision and base model files must exist in the image on both machines. Checkpoint/cache path flags are
+local to each machine, so pass ws3-specific paths after the image command when needed. The API sends candidate context
+to preserve parent-change feedback, returns completed checkpoints and diagnostics to PC1, and downloads the short-stage
+checkpoint when a medium-stage job moves to another machine. Completion uploads are idempotent, while stale claims older
+than 12 hours are requeued. Set `LUX_EVOLUTION_JOB_TOKEN` to the same random value on PC1 and ws3; it is not written to
+the run manifest. Add `--coordinator-only` only when PC1 should schedule without using its own GPU.
 
 ### Play against the original first-place model
 

@@ -34,6 +34,7 @@ from luxai2021.rl.evolution import (
     mutate_candidate,
     proposal_schema,
 )
+from luxai2021.rl.job_api import JobApiClient, JobApiServer, extract_artifact_directory
 from luxai2021.rl.metrics import GameMetrics
 from luxai2021.rl.policy import FullTurnActorCritic, RolloutAgent
 from luxai2021.rl.ppo import PPOConfig, PPOTrainer, collect_episode
@@ -329,3 +330,85 @@ def test_filesystem_job_queue_claim_and_complete(tmp_path):
     queue.complete(claimed_path, result)
     assert queue.outstanding_ids() == set()
     assert (tmp_path / "jobs" / "completed" / f"{job.job_id}.json").exists()
+
+
+def test_job_api_claim_context_and_upload_artifacts(tmp_path):
+    coordinator_dir = tmp_path / "coordinator"
+    store = EvolutionStore(coordinator_dir)
+    candidate = initial_candidate(island=0, seed=7)
+    store.save_candidate(candidate)
+    store.save_manifest({"schema_version": 1, "arguments": {"seed": 7}})
+    queue = FilesystemJobQueue(coordinator_dir)
+    job = EvolutionJob(candidate.candidate_id, "short-resattn8", "resattn8", 0, 1, 100)
+    queue.enqueue(job)
+    token = f"test-{candidate.candidate_id}"
+    server = JobApiServer("127.0.0.1:0", run_dir=coordinator_dir, queue=queue, token=token)
+    server.start()
+    try:
+        host, port = server.address
+        unauthorized = JobApiClient(f"http://{host}:{port}", token=f"wrong-{candidate.candidate_id}")
+        with pytest.raises(RuntimeError, match="HTTP 401"):
+            unauthorized.claim("intruder")
+        client = JobApiClient(f"http://{host}:{port}", token=token)
+        claim = client.claim("ws3")
+
+        assert claim is not None
+        assert claim["job"]["candidate_id"] == candidate.candidate_id
+        assert claim["candidate"]["candidate_id"] == candidate.candidate_id
+        assert claim["manifest"]["arguments"]["seed"] == 7
+
+        worker_artifacts = tmp_path / "worker-artifacts"
+        worker_artifacts.mkdir()
+        (worker_artifacts / "best.pt").write_bytes(b"policy")
+        (worker_artifacts / "latest_rl.pt").write_bytes(b"training")
+        result = CandidateResult(
+            candidate.candidate_id,
+            job.stage,
+            "completed",
+            0.6,
+            0.5,
+            0.01,
+            2.0,
+            {"checkpoint": "/worker/path/best.pt"},
+        )
+        client.complete(
+            lease_id=claim["lease_id"],
+            job=job,
+            result=result,
+            artifact_dir=worker_artifacts,
+        )
+
+        medium_job = EvolutionJob(candidate.candidate_id, "medium-resattn8", "resattn8", 0, 1, 200)
+        queue.enqueue(medium_job)
+        medium_claim = client.claim("other-worker")
+        assert medium_claim is not None
+        assert medium_claim["input_artifact"]["stage"] == "short-resattn8"
+        downloaded = tmp_path / "downloaded-input"
+        extract_artifact_directory(medium_claim["input_artifact"]["zip_base64"], downloaded)
+        assert (downloaded / "latest_rl.pt").read_bytes() == b"training"
+        failed = CandidateResult(
+            candidate.candidate_id,
+            medium_job.stage,
+            "failed",
+            0.0,
+            0.0,
+            float("inf"),
+            0.0,
+            {},
+            "test completion",
+        )
+        client.complete(
+            lease_id=medium_claim["lease_id"],
+            job=medium_job,
+            result=failed,
+            artifact_dir=tmp_path / "missing-artifacts",
+        )
+    finally:
+        server.close()
+
+    coordinator_artifacts = coordinator_dir / "artifacts" / candidate.candidate_id / job.stage / job.base_name
+    assert (coordinator_artifacts / "best.pt").read_bytes() == b"policy"
+    assert (coordinator_artifacts / "latest_rl.pt").read_bytes() == b"training"
+    assert queue.outstanding_ids() == set()
+    stored = next(item for item in store.results() if item.stage == job.stage)
+    assert stored.metrics["checkpoint"] == str(coordinator_artifacts / "best.pt")

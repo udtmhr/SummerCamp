@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: BLE001, C901, INP001, PLR0912, PLR0913, PLR0915, S311, S607
 import argparse
+import atexit
 import copy
 import json
 import os
@@ -34,6 +35,7 @@ from luxai2021.rl.evolution import (
     mutate_candidate,
     select_elites,
 )
+from luxai2021.rl.job_api import JOB_API_VERSION, JobApiClient, JobApiServer, extract_artifact_directory
 from luxai2021.rl.policy import FullTurnActorCritic, RolloutAgent
 from luxai2021.rl.ppo import PPOTrainer, collect_episode
 
@@ -91,6 +93,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--job-timeout-seconds", type=float, default=24 * 60 * 60)
     parser.add_argument("--recover-stale-job-seconds", type=float, default=12 * 60 * 60)
     parser.add_argument("--coordinator-only", action="store_true")
+    parser.add_argument("--job-api-listen", help="Coordinator API listen address, for example 127.0.0.1:8765")
+    parser.add_argument("--job-api-url", help="Worker API URL reached through SSH, for example http://127.0.0.1:18765")
+    parser.add_argument("--job-api-timeout-seconds", type=float, default=600.0)
     return parser.parse_args()
 
 
@@ -424,33 +429,99 @@ def execute_evolution_job(
     return result
 
 
+def _apply_coordinator_manifest(args: argparse.Namespace, manifest: Mapping[str, object]) -> None:
+    coordinator_args = manifest.get("arguments", {})
+    if not isinstance(coordinator_args, dict):
+        raise TypeError("Coordinator manifest arguments are invalid")
+    for name in ("seed", "episodes_per_update", "bc_batch_size", "bc_replays", "no_bc_anchor", "max_turns"):
+        if name in coordinator_args:
+            setattr(args, name, coordinator_args[name])
+
+
+def _sync_api_claim(store: EvolutionStore, claim: Mapping[str, object]) -> tuple[EvolutionJob, str]:
+    if int(claim.get("api_version", 0)) != JOB_API_VERSION:
+        raise ValueError("Coordinator Job API version is incompatible")
+    manifest = claim["manifest"]
+    if not isinstance(manifest, dict):
+        raise TypeError("Coordinator manifest is invalid")
+    store.save_manifest(manifest)
+    for value in claim.get("candidates", []):
+        store.save_candidate(EvolutionCandidate.from_dict(value))
+    for value in claim.get("results", []):
+        store.save_result(CandidateResult(**value))
+    candidate = EvolutionCandidate.from_dict(claim["candidate"])
+    store.save_candidate(candidate)
+    job = EvolutionJob.from_dict(claim["job"])
+    input_artifact = claim.get("input_artifact")
+    if input_artifact is not None:
+        if not isinstance(input_artifact, dict):
+            raise TypeError("Input artifact descriptor is invalid")
+        destination = (
+            store.run_dir
+            / "artifacts"
+            / job.candidate_id
+            / str(input_artifact["stage"])
+            / str(input_artifact["base_name"])
+        )
+        extract_artifact_directory(str(input_artifact["zip_base64"]), destination)
+    return job, str(claim["lease_id"])
+
+
 def run_worker(args: argparse.Namespace) -> None:
     if args.overwrite_run:
         raise ValueError("Distributed workers cannot overwrite the run directory")
     run_dir = Path(args.run_dir)
-    if not (run_dir / "manifest.json").exists():
+    if args.job_api_url is None and not (run_dir / "manifest.json").exists():
         raise ValueError("Worker run directory does not contain a coordinator manifest")
-    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-    coordinator_args = manifest.get("arguments", {})
-    for name in ("seed", "episodes_per_update", "bc_batch_size", "bc_replays", "no_bc_anchor", "max_turns"):
-        if name in coordinator_args:
-            setattr(args, name, coordinator_args[name])
+    if (run_dir / "manifest.json").exists():
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        _apply_coordinator_manifest(args, manifest)
     device = resolve_device(args.device)
     store = EvolutionStore(run_dir)
-    queue = FilesystemJobQueue(run_dir)
+    queue = None if args.job_api_url else FilesystemJobQueue(run_dir)
+    api = (
+        JobApiClient(
+            args.job_api_url,
+            token=os.environ.get("LUX_EVOLUTION_JOB_TOKEN"),
+            timeout_seconds=args.job_api_timeout_seconds,
+        )
+        if args.job_api_url
+        else None
+    )
     worker_id = args.worker_id or f"{socket.gethostname()}-{os.getpid()}"
     idle_started = time.monotonic()
     while True:
-        claimed = queue.claim(worker_id)
+        if api is not None:
+            claim = api.claim(worker_id)
+            if claim is None:
+                claimed = None
+            else:
+                job, lease_id = _sync_api_claim(store, claim)
+                _apply_coordinator_manifest(args, claim["manifest"])
+                claimed = (job, lease_id)
+        else:
+            claimed = queue.claim(worker_id)
         if claimed is None:
             if args.worker_idle_seconds > 0 and time.monotonic() - idle_started >= args.worker_idle_seconds:
                 return
             time.sleep(max(0.1, args.job_poll_seconds))
             continue
         idle_started = time.monotonic()
-        job, claimed_path = claimed
+        job, lease = claimed
         result = execute_evolution_job(job, args=args, device=device, store=store)
-        queue.complete(claimed_path, result)
+        if api is None:
+            queue.complete(lease, result)
+        else:
+            artifact_dir = run_dir / "artifacts" / job.candidate_id / job.stage / job.base_name
+            upload_deadline = time.monotonic() + args.job_timeout_seconds
+            while True:
+                try:
+                    api.complete(lease_id=lease, job=job, result=result, artifact_dir=artifact_dir)
+                    break
+                except OSError:
+                    if time.monotonic() >= upload_deadline:
+                        raise
+                    time.sleep(max(0.1, args.job_poll_seconds))
         print(json.dumps({"worker_id": worker_id, "job_id": job.job_id, "status": result.status}, sort_keys=True))
 
 
@@ -471,6 +542,8 @@ def main() -> None:
     if args.worker:
         run_worker(args)
         return
+    if args.job_api_url:
+        raise ValueError("--job-api-url is only valid with --worker")
     if args.islands < 1 or args.initial_per_island < 1 or args.generations < 0:
         raise ValueError("Population sizes must be positive")
     run_dir = Path(args.run_dir)
@@ -501,7 +574,21 @@ def main() -> None:
         )
     candidates = {candidate.candidate_id: candidate for candidate in store.candidates()}
     results = store.results()
-    queue = FilesystemJobQueue(run_dir) if args.distributed else None
+    queue = FilesystemJobQueue(run_dir) if args.distributed or args.job_api_listen else None
+    job_api_server = None
+    if args.job_api_listen and not args.dry_run:
+        if queue is None:
+            raise RuntimeError("Job API requires a coordinator queue")
+        job_api_server = JobApiServer(
+            args.job_api_listen,
+            run_dir=run_dir,
+            queue=queue,
+            token=os.environ.get("LUX_EVOLUTION_JOB_TOKEN"),
+        )
+        job_api_server.start()
+        atexit.register(job_api_server.close)
+        host, port = job_api_server.address
+        print(json.dumps({"job_api": f"http://{host}:{port}"}, sort_keys=True))
 
     def register(candidate: EvolutionCandidate) -> None:
         candidates[candidate.candidate_id] = candidate
@@ -747,6 +834,9 @@ def main() -> None:
     summary = {"ranking": ranking, "promoted_candidate": promoted}
     store.write_json(run_dir / "summary.json", summary)
     print(json.dumps(summary, sort_keys=True))
+    if job_api_server is not None:
+        job_api_server.close()
+        atexit.unregister(job_api_server.close)
 
 
 if __name__ == "__main__":
