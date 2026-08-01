@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import copy
+import gzip
 import json
 import os
 import random
@@ -366,7 +367,33 @@ def candidate_result(
         ]
         teacher_score_rate = sum((float(game["outcome"]) + 1.0) * 0.5 for game in teacher_games) / len(teacher_games)
         kl = float(training["history"][-1]["kl"])
-        metrics = {"training": training, "evaluation": evaluation, "checkpoint": str(checkpoint)}
+        diagnostics_path = output_dir / "diagnostics.json.gz"
+        with gzip.open(diagnostics_path, "wt", encoding="utf-8") as output:
+            json.dump(
+                {
+                    "training_diagnostic_events": training.get("diagnostic_events", []),
+                    "evaluation_games": [
+                        {
+                            "anchor": game.get("anchor"),
+                            "seed": game.get("seed"),
+                            "orientation": game.get("orientation"),
+                            "candidate_team": game.get("candidate_team"),
+                            "candidate_inference_seconds": game.get("candidate_inference_seconds", []),
+                            "diagnostic_events": game.get("diagnostic_events", []),
+                        }
+                        for game in evaluation["games"]
+                        if "outcome" in game
+                    ],
+                },
+                output,
+                separators=(",", ":"),
+            )
+        metrics = {
+            "training": training,
+            "evaluation": evaluation,
+            "checkpoint": str(checkpoint),
+            "diagnostics_artifact": diagnostics_path.name,
+        }
         return CandidateResult(
             candidate.candidate_id,
             stage,
@@ -447,11 +474,17 @@ def _sync_api_claim(store: EvolutionStore, claim: Mapping[str, object]) -> tuple
     store.save_manifest(manifest)
     for value in claim.get("candidates", []):
         store.save_candidate(EvolutionCandidate.from_dict(value))
+    coordinator_result_keys = set()
     for value in claim.get("results", []):
-        store.save_result(CandidateResult(**value))
+        result = CandidateResult(**value)
+        coordinator_result_keys.add((result.candidate_id, result.stage))
+        store.save_result(result)
     candidate = EvolutionCandidate.from_dict(claim["candidate"])
     store.save_candidate(candidate)
     job = EvolutionJob.from_dict(claim["job"])
+    if (job.candidate_id, job.stage) not in coordinator_result_keys:
+        stale_result = store.result_dir / f"{job.candidate_id}-{job.stage}.json"
+        stale_result.unlink(missing_ok=True)
     input_artifact = claim.get("input_artifact")
     if input_artifact is not None:
         if not isinstance(input_artifact, dict):

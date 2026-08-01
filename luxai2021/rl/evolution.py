@@ -454,6 +454,47 @@ def summarize_diagnostic_events(metrics: Mapping[str, Any]) -> dict[str, object]
     }
 
 
+def compact_candidate_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove high-volume raw traces after their Codex-facing summary is built."""
+    compacted = dict(metrics)
+    training = compacted.get("training")
+    if isinstance(training, Mapping):
+        compact_training = dict(training)
+        training_events = compact_training.pop("diagnostic_events", ())
+        compact_training["diagnostic_event_count"] = len(training_events)
+        compacted["training"] = compact_training
+    evaluation = compacted.get("evaluation")
+    if isinstance(evaluation, Mapping):
+        compact_evaluation = dict(evaluation)
+        compact_games = []
+        for game in compact_evaluation.get("games", ()):
+            if not isinstance(game, Mapping):
+                continue
+            compact_game = dict(game)
+            inference_seconds = [float(value) for value in compact_game.pop("candidate_inference_seconds", ())]
+            if inference_seconds:
+                ordered = sorted(inference_seconds)
+                index = min(len(ordered) - 1, int(len(ordered) * 0.95))
+                compact_game["candidate_inference_count"] = len(ordered)
+                compact_game["candidate_inference_total_seconds"] = sum(ordered)
+                compact_game["candidate_inference_p95_seconds"] = ordered[index]
+            events = [event for event in compact_game.pop("diagnostic_events", ()) if isinstance(event, Mapping)]
+            if events:
+                city_events = [event for event in events if event.get("event") == "city_destroyed_night_fuel"]
+                illegal_events = [event for event in events if event.get("event") == "illegal_action"]
+                compact_game["diagnostics"] = {
+                    "city_tile_loss_turns": sorted({int(event["turn"]) for event in city_events}),
+                    "city_tiles_lost": sum(int(event.get("city_tiles_lost", 0)) for event in city_events),
+                    "city_loss_event_count": len(city_events),
+                    "illegal_action_turns": sorted({int(event["turn"]) for event in illegal_events}),
+                    "illegal_action_count": len(illegal_events),
+                }
+            compact_games.append(compact_game)
+        compact_evaluation["games"] = compact_games
+        compacted["evaluation"] = compact_evaluation
+    return compacted
+
+
 def add_candidate_reflection(
     result: CandidateResult,
     candidate: EvolutionCandidate,
@@ -496,7 +537,7 @@ def add_candidate_reflection(
         "diagnostics": summarize_diagnostic_events(metrics),
         "parent_comparisons": parent_comparisons,
     }
-    return replace(result, metrics=metrics)
+    return replace(result, metrics=compact_candidate_metrics(metrics))
 
 
 class CodexCandidateGenerator:

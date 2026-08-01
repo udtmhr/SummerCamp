@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from examples.evolve_rl import _sync_api_claim
 from luxai2021.env.agent import Agent
 from luxai2021.game.actions import MoveAction
 from luxai2021.game.game import Game
@@ -307,6 +308,8 @@ def test_reflection_contains_parent_changes_improvement_and_diagnostic_turns():
 
     assert reflection["diagnostics"]["city_tile_loss_turns"] == [31]
     assert reflection["diagnostics"]["illegal_action_turns"] == [32]
+    assert reflected.metrics["training"]["diagnostic_event_count"] == 2
+    assert "diagnostic_events" not in reflected.metrics["training"]
     comparison = reflection["parent_comparisons"][0]
     assert comparison["changes"]
     assert comparison["improvement"]["score_rate_delta"] == pytest.approx(0.2)
@@ -414,3 +417,36 @@ def test_job_api_claim_context_and_upload_artifacts(tmp_path):
     assert queue.outstanding_ids() == set()
     stored = next(item for item in store.results() if item.stage == job.stage)
     assert stored.metrics["checkpoint"] == str(coordinator_artifacts / "best.pt")
+
+
+def test_api_claim_discards_stale_local_result(tmp_path):
+    store = EvolutionStore(tmp_path)
+    candidate = initial_candidate(island=0, seed=9)
+    stale = CandidateResult(
+        candidate.candidate_id,
+        "short-resattn8",
+        "failed",
+        0.0,
+        0.0,
+        float("inf"),
+        0.0,
+        {},
+        "missing model from an older coordinator run",
+    )
+    store.save_result(stale)
+    job = EvolutionJob(candidate.candidate_id, stale.stage, "resattn8", 0, 1, 100)
+    claim = {
+        "api_version": 1,
+        "lease_id": "ws3--job.json",
+        "job": job.to_dict(),
+        "candidate": candidate.to_dict(),
+        "candidates": [candidate.to_dict()],
+        "results": [],
+        "manifest": {"schema_version": 1, "arguments": {}},
+        "input_artifact": None,
+    }
+
+    claimed_job, _ = _sync_api_claim(store, claim)
+
+    assert claimed_job == job
+    assert store.results() == []
