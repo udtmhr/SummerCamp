@@ -49,6 +49,7 @@ from luxai2021.imitation.model import (
     POLICY_SCHEMA_FIRST_PLACE_FLAT,
     AxialTransformerBlock,
     AxisAttention,
+    GlobalSpatialAttentionBlock,
     LuxBehaviorCloningModel,
     ModelConfig,
     _safe_cross_entropy,
@@ -338,7 +339,10 @@ def test_encoder_masks_padding_and_returns_global_features():
     assert output["global_features"].shape == (1, model.encoder.global_output_channels)
 
 
-@pytest.mark.parametrize("encoder_type", ["unet", "transformer16", "axial32", "axial32_4m5"])
+@pytest.mark.parametrize(
+    "encoder_type",
+    ["unet", "resattn8", "transformer16", "axial32", "axial32_4m5"],
+)
 @pytest.mark.parametrize("board_size", BOARD_SIZES)
 def test_all_encoders_mask_padding_and_return_finite_features(encoder_type, board_size):
     offset = (32 - board_size) // 2
@@ -358,6 +362,11 @@ def test_all_encoders_mask_padding_and_return_finite_features(encoder_type, boar
             axial32_4m5_dim=16,
             axial32_4m5_ffn_dim=32,
             axial32_4m5_layers=1,
+            resattn8_base_channels=4,
+            resattn8_feature_channels=16,
+            resattn8_heads=4,
+            resattn8_ffn_dim=32,
+            resattn8_layers=1,
         )
     )
 
@@ -387,6 +396,23 @@ def test_axis_attention_handles_fully_padded_groups_and_ignores_invalid_keys():
     assert torch.isfinite(output).all()
     assert not output[:, 1].any()
     assert torch.allclose(output[:, 0, :2], changed_output[:, 0, :2])
+
+
+def test_global_spatial_attention_masks_padding_and_empty_samples():
+    block = GlobalSpatialAttentionBlock(channels=16, heads=4, ffn_dim=32, dropout=0.0).eval()
+    inputs = torch.randn(2, 16, 4, 4)
+    mask = torch.zeros(2, 1, 4, 4)
+    mask[0, :, 1:3, 1:3] = 1
+
+    output = block(inputs, mask)
+    changed = inputs.clone()
+    changed[0] = torch.where(mask[0].bool(), changed[0], torch.full_like(changed[0], 1e6))
+    changed_output = block(changed, mask)
+
+    assert torch.isfinite(output).all()
+    assert not output[1].any()
+    assert not output.masked_select(mask == 0).any()
+    assert torch.allclose(output[0], changed_output[0])
 
 
 def test_axis_attention_sdpa_is_finite_for_large_fp16_inputs():
@@ -439,7 +465,20 @@ def test_compact_axial_has_4m5_parameters_for_flat_distillation_policy():
     assert parameter_count == 4_505_692
 
 
-@pytest.mark.parametrize("encoder_type", ["unet", "transformer16", "axial32", "axial32_4m5"])
+def test_resattn8_has_expected_flat_policy_parameter_count():
+    config = ModelConfig(
+        encoder_type="resattn8",
+        policy_schema=POLICY_SCHEMA_FIRST_PLACE_FLAT,
+    )
+    parameter_count = sum(parameter.numel() for parameter in LuxBehaviorCloningModel(config).parameters())
+
+    assert parameter_count == 4_409_500
+
+
+@pytest.mark.parametrize(
+    "encoder_type",
+    ["unet", "resattn8", "transformer16", "axial32", "axial32_4m5"],
+)
 def test_encoder_checkpoint_round_trip(tmp_path, encoder_type):
     config = ModelConfig(
         base_channels=8,
@@ -453,6 +492,11 @@ def test_encoder_checkpoint_round_trip(tmp_path, encoder_type):
         axial32_4m5_dim=16,
         axial32_4m5_ffn_dim=32,
         axial32_4m5_layers=1,
+        resattn8_base_channels=4,
+        resattn8_feature_channels=16,
+        resattn8_heads=4,
+        resattn8_ffn_dim=32,
+        resattn8_layers=1,
     )
     model = LuxBehaviorCloningModel(config)
     checkpoint_path = tmp_path / f"{encoder_type}.pt"
@@ -515,6 +559,11 @@ def test_old_unet_checkpoint_without_encoder_config_loads(tmp_path):
         "axial32_4m5_dim",
         "axial32_4m5_ffn_dim",
         "axial32_4m5_layers",
+        "resattn8_base_channels",
+        "resattn8_feature_channels",
+        "resattn8_heads",
+        "resattn8_ffn_dim",
+        "resattn8_layers",
     ):
         checkpoint["model_config"].pop(name)
     torch.save(checkpoint, checkpoint_path)

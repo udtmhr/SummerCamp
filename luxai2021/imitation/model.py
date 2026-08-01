@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from math import sqrt
 from typing import TYPE_CHECKING
 
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 CHECKPOINT_SCHEMA_VERSION = 1
 POLICY_SCHEMA_FACTORIZED = "factorized_v1"
 POLICY_SCHEMA_FIRST_PLACE_FLAT = "first_place_flat_v1"
-ENCODER_TYPES = ("unet", "transformer16", "axial32", "axial32_4m5")
+ENCODER_TYPES = ("unet", "resattn8", "transformer16", "axial32", "axial32_4m5")
 
 
 def _group_count(channels: int) -> int:
@@ -94,9 +94,14 @@ class ModelConfig:
     axial32_4m5_dim: int = 192
     axial32_4m5_ffn_dim: int = 672
     axial32_4m5_layers: int = 6
+    resattn8_base_channels: int = 48
+    resattn8_feature_channels: int = 96
+    resattn8_heads: int = 6
+    resattn8_ffn_dim: int = 384
+    resattn8_layers: int = 2
     policy_schema: str = POLICY_SCHEMA_FACTORIZED
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: C901
         if self.encoder_type not in ENCODER_TYPES:
             msg = f"Unsupported encoder type: {self.encoder_type}"
             raise ValueError(msg)
@@ -109,11 +114,24 @@ class ModelConfig:
             raise ValueError("transformer_dim must be divisible by transformer_heads")
         if self.axial32_4m5_dim % self.transformer_heads:
             raise ValueError("axial32_4m5_dim must be divisible by transformer_heads")
+        if self.resattn8_base_channels < 1 or self.resattn8_feature_channels < 1:
+            raise ValueError("ResAttnUNet8 channel counts must be positive")
+        if self.resattn8_heads < 1:
+            raise ValueError("resattn8_heads must be positive")
+        if (self.resattn8_base_channels * 4) % self.resattn8_heads:
+            raise ValueError("The ResAttnUNet8 bottleneck width must be divisible by resattn8_heads")
         if self.transformer_ffn_dim < 1 or self.axial32_4m5_ffn_dim < 1:
             raise ValueError("Transformer FFN dimensions must be positive")
+        if self.resattn8_ffn_dim < 1:
+            raise ValueError("resattn8_ffn_dim must be positive")
         if not 0 <= self.transformer_dropout < 1:
             raise ValueError("transformer_dropout must be in [0, 1)")
-        if self.transformer16_layers < 1 or self.axial32_layers < 1 or self.axial32_4m5_layers < 1:
+        if (
+            self.transformer16_layers < 1
+            or self.axial32_layers < 1
+            or self.axial32_4m5_layers < 1
+            or self.resattn8_layers < 1
+        ):
             raise ValueError("Transformer layer counts must be positive")
 
 
@@ -188,6 +206,91 @@ class LuxSpatialEncoder(nn.Module):
 
     def forward(self, inputs: Tensor) -> Tensor:
         return self.forward_features(inputs).spatial
+
+
+class GlobalSpatialAttentionBlock(nn.Module):
+    """Global SDPA at the 8x8 U-Net bottleneck with masked residual updates."""
+
+    def __init__(self, channels: int, heads: int, ffn_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.heads = heads
+        self.head_dim = channels // heads
+        self.position = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=1,
+            groups=channels,
+            bias=False,
+        )
+        self.attention_norm = nn.LayerNorm(channels)
+        self.qkv = nn.Linear(channels, channels * 3)
+        self.projection = nn.Linear(channels, channels)
+        self.projection_dropout = nn.Dropout(dropout)
+        self.ffn_norm = nn.LayerNorm(channels)
+        self.ffn = nn.Sequential(
+            nn.Linear(channels, ffn_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, channels),
+            nn.Dropout(dropout),
+        )
+        self.attention_dropout = dropout
+
+    def forward(self, inputs: Tensor, mask: Tensor) -> Tensor:
+        batch_size, channels, height, width = inputs.shape
+        masked_inputs = inputs * mask
+        output = (masked_inputs + self.position(masked_inputs)) * mask
+        tokens = output.flatten(2).transpose(1, 2)
+        normalized = self.attention_norm(tokens)
+        qkv = self.qkv(normalized).reshape(
+            batch_size,
+            height * width,
+            3,
+            self.heads,
+            self.head_dim,
+        )
+        query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+
+        valid_tokens = mask.flatten(1).bool()
+        empty_samples = ~valid_tokens.any(dim=1)
+        first_token = torch.arange(height * width, device=inputs.device) == 0
+        safe_tokens = valid_tokens | (empty_samples[:, None] & first_token[None])
+        attended = nn_functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=safe_tokens[:, None, None, :],
+            dropout_p=self.attention_dropout if self.training else 0.0,
+        )
+        attended = attended.transpose(1, 2).reshape(batch_size, height * width, channels)
+        tokens = tokens + self.projection_dropout(self.projection(attended))
+        tokens = tokens + self.ffn(self.ffn_norm(tokens))
+        return tokens.transpose(1, 2).reshape(batch_size, channels, height, width) * mask
+
+
+class ResAttnUNet8SpatialEncoder(LuxSpatialEncoder):
+    """Compact residual U-Net with global attention restricted to 8x8 features."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        compact_config = replace(
+            config,
+            base_channels=config.resattn8_base_channels,
+            feature_channels=config.resattn8_feature_channels,
+        )
+        super().__init__(compact_config)
+        bottleneck_channels = config.resattn8_base_channels * 4
+        blocks: list[nn.Module] = [ResidualBlock(bottleneck_channels)]
+        blocks.extend(
+            GlobalSpatialAttentionBlock(
+                bottleneck_channels,
+                config.resattn8_heads,
+                config.resattn8_ffn_dim,
+                config.transformer_dropout,
+            )
+            for _ in range(config.resattn8_layers)
+        )
+        self.bottleneck = nn.ModuleList(blocks)
 
 
 class Transformer16SpatialEncoder(nn.Module):
@@ -458,6 +561,7 @@ class LuxBehaviorCloningModel(nn.Module):
         self.config = config or ModelConfig()
         encoder_types = {
             "unet": LuxSpatialEncoder,
+            "resattn8": ResAttnUNet8SpatialEncoder,
             "transformer16": Transformer16SpatialEncoder,
             "axial32": Axial32SpatialEncoder,
             "axial32_4m5": Axial32SpatialEncoder,

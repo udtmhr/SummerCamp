@@ -70,6 +70,11 @@ def _small_flat_config(encoder_type):
         axial32_4m5_dim=16,
         axial32_4m5_ffn_dim=32,
         axial32_4m5_layers=1,
+        resattn8_base_channels=4,
+        resattn8_feature_channels=16,
+        resattn8_heads=4,
+        resattn8_ffn_dim=32,
+        resattn8_layers=1,
         policy_schema=POLICY_SCHEMA_FIRST_PLACE_FLAT,
     )
 
@@ -237,7 +242,10 @@ def test_flat_augmentation_rotates_labels_masks_and_teacher_logits():
     assert rotated["worker_teacher_logits"][0, west] == teacher[0, north]
 
 
-@pytest.mark.parametrize("encoder_type", ["unet", "transformer16", "axial32", "axial32_4m5"])
+@pytest.mark.parametrize(
+    "encoder_type",
+    ["unet", "resattn8", "transformer16", "axial32", "axial32_4m5"],
+)
 def test_all_student_encoders_support_flat_policy_checkpoint(tmp_path, encoder_type):
     model = LuxBehaviorCloningModel(_small_flat_config(encoder_type))
     observation = torch.zeros(1, len(FEATURE_NAMES), 32, 32)

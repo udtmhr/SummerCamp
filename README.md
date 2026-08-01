@@ -355,10 +355,12 @@ flags, corrected cooldown normalization, and categorical embeddings for the 40-t
 board size. The encoder masks padding at every U-Net stage and exposes pooled global features for a future
 RL value head.
 
-Four encoders can be trained with the same observation, action heads, and viable-action
+Five encoders can be trained with the same observation, action heads, and viable-action
 masks:
 
 - `unet` is the default 32x32 residual U-Net.
+- `resattn8` is the recommended compact hybrid: a 48/96/192-channel residual U-Net with two global SDPA
+  blocks only at the 8x8 bottleneck. Its flat distillation policy has 4,409,500 parameters.
 - `transformer16` applies an eight-layer Transformer to 16x16 tokens and decodes through a 32x32 skip.
 - `axial32` keeps 32x32 features and alternates row and column attention in six axial blocks.
 - `axial32_4m5` keeps the six axial blocks but uses 192-wide attention and a 672-wide FFN. The flat-policy
@@ -540,26 +542,25 @@ uv run python examples/precompute_distillation_dataset.py \
   --num-workers 4
 ```
 
-Train any student encoder against the shared prepared cache:
+Train the recommended attention hybrid against the shared prepared cache:
 
 ```bash
-for encoder in unet transformer16 axial32 axial32_4m5; do
-  uv run python examples/train_distilled_bc.py \
-    --encoder-type "$encoder" \
-    --replay-dir replay_datasets \
-    --teacher-cache-dir models/teachers/lux_2021_first_place/cache \
-    --prepared-cache-dir models/teachers/lux_2021_first_place/prepared \
-    --output-dir "models/distilled/$encoder" \
-    --batch-size 64 \
-    --num-workers 8 \
-    --prefetch-factor 2 \
-    --device cuda
-done
+uv run --locked python examples/train_distilled_bc.py \
+  --encoder-type resattn8 \
+  --replay-dir replay_datasets \
+  --teacher-cache-dir models/teachers/lux_2021_first_place/cache \
+  --prepared-cache-dir models/teachers/lux_2021_first_place/prepared \
+  --output-dir models/distilled/resattn8 \
+  --batch-size 64 \
+  --num-workers 8 \
+  --prefetch-factor 2 \
+  --amp-dtype bfloat16 \
+  --device cuda
 ```
 
-The first three students start from the matching existing BC encoder and replace only their policy heads with the
-faithful flat schema. `axial32_4m5` starts directly from distillation unless `--student-checkpoint` supplies a
-matching pretrained checkpoint. Training combines temperature-scaled KL loss with replay hard labels. CUDA
+`resattn8` starts directly from distillation unless `--student-checkpoint` supplies a matching pretrained
+checkpoint. The full Transformer encoders remain loadable for existing checkpoint compatibility but are no longer
+recommended for new distillation runs. Training combines temperature-scaled KL loss with replay hard labels. CUDA
 training enables BF16, TF32,
 channels-last tensors, fused AdamW, variable-size tail batches without dummy padding, and replay caching. The legacy
 `--no-compile` flag is accepted as a no-op for command compatibility. D4 augmentation runs as one vectorized GPU
@@ -570,8 +571,8 @@ two-view ensemble automatically. Override it for latency comparisons with `--tta
 
 ```bash
 uv run python main.py \
-  --model-a models/distilled/axial32/best.pt \
-  --model-b models/distilled/transformer16/best.pt \
+  --model-a models/distilled/resattn8/best.pt \
+  --model-b models/distilled/unet/best.pt \
   --tta-a auto --tta-b auto --device cuda
 ```
 

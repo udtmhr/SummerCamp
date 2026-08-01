@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
 DEFAULT_STUDENTS = {
     "unet": "models/bc_v2/best.pt",
+    "resattn8": None,
     "transformer16": "models/bc_encoder_compare/transformer16/best.pt",
     "axial32": "models/bc_encoder_compare/axial32/best.pt",
     "axial32_4m5": None,
