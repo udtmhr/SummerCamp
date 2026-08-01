@@ -107,13 +107,13 @@ class JobApiClient:
         if response is None or not response.get("ok"):
             raise RuntimeError("Job API did not acknowledge completion")
 
-    def heartbeat(self, *, lease_id: str, job: EvolutionJob, artifact_dir: Path) -> None:
+    def heartbeat(self, *, lease_id: str, job: EvolutionJob, artifact_dir: Path | None = None) -> None:
         response = self._post(
             "/v1/heartbeat",
             {
                 "lease_id": lease_id,
                 "job_id": job.job_id,
-                "artifacts_zip_base64": encode_artifact_directory(artifact_dir),
+                "artifacts_zip_base64": encode_artifact_directory(artifact_dir) if artifact_dir is not None else None,
             },
         )
         if response is None or not response.get("ok"):

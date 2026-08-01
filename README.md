@@ -684,7 +684,7 @@ docker run --rm --gpus all --network host \
   -e UV_PROJECT_ENVIRONMENT=/tmp/lux-evolution-venv \
   -e UV_LINK_MODE=copy \
   -v "$HOME/lux-evolution-worker:/workspace/lux-evolution-worker" \
-  -v "$PWD:/app:ro" -w /app \
+  -v "$PWD:/app" -w /app \
   ueda/uv-app \
   uv run --locked python examples/evolve_rl.py \
     --run-dir /workspace/lux-evolution-worker \

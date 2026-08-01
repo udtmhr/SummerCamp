@@ -232,12 +232,22 @@ class FilesystemJobQueue:
         return None
 
     def complete(self, claimed_path: Path, result: CandidateResult) -> None:
-        payload = json.loads(claimed_path.read_text(encoding="utf-8"))
+        job_id = f"{result.candidate_id}--{result.stage}"
+        completed = self.completed_dir / f"{job_id}.json"
+        if completed.exists():
+            claimed_path.unlink(missing_ok=True)
+            return
+        source_path = claimed_path if claimed_path.exists() else self.pending_dir / f"{job_id}.json"
+        if source_path.exists():
+            payload = json.loads(source_path.read_text(encoding="utf-8"))
+        else:
+            payload = {"candidate_id": result.candidate_id, "stage": result.stage}
         payload.update({"result_status": result.status, "completed_at": time.time()})
-        job = EvolutionJob.from_dict(payload)
-        completed = self.completed_dir / f"{job.job_id}.json"
         EvolutionStore.write_json(completed, payload)
+        source_path.unlink(missing_ok=True)
         claimed_path.unlink(missing_ok=True)
+        for duplicate in self.running_dir.glob(f"*--{job_id}.json"):
+            duplicate.unlink(missing_ok=True)
 
     def heartbeat(self, claimed_path: Path) -> None:
         if not claimed_path.exists():

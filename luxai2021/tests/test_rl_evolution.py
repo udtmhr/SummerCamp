@@ -430,6 +430,21 @@ def test_filesystem_job_queue_claim_and_complete(tmp_path):
     assert (tmp_path / "jobs" / "completed" / f"{job.job_id}.json").exists()
 
 
+def test_filesystem_job_completion_recovers_a_requeued_lease(tmp_path):
+    queue = FilesystemJobQueue(tmp_path)
+    job = EvolutionJob("candidate", "short-resattn8", "resattn8", 1200, 4, 100)
+    queue.enqueue(job)
+    claimed_job, claimed_path = queue.claim("pc1")
+    assert claimed_job == job
+    claimed_path.replace(queue.pending_dir / f"{job.job_id}.json")
+
+    result = CandidateResult("candidate", job.stage, "completed", 0.5, 0.5, 0.0, 10.0, {})
+    queue.complete(claimed_path, result)
+
+    assert queue.outstanding_ids() == set()
+    assert (queue.completed_dir / f"{job.job_id}.json").exists()
+
+
 def test_job_api_claim_context_and_upload_artifacts(tmp_path):  # noqa: PLR0915
     coordinator_dir = tmp_path / "coordinator"
     store = EvolutionStore(coordinator_dir)

@@ -11,6 +11,7 @@ import random
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -627,6 +628,7 @@ def _apply_coordinator_manifest(args: argparse.Namespace, manifest: Mapping[str,
         "bc_replays",
         "no_bc_anchor",
         "max_turns",
+        "recover_stale_job_seconds",
     ):
         if name in coordinator_args:
             setattr(args, name, coordinator_args[name])
@@ -754,7 +756,7 @@ def run_worker(args: argparse.Namespace) -> None:
                 sort_keys=True,
             )
         )
-        last_heartbeat = time.monotonic()
+        last_checkpoint_upload = time.monotonic()
         current_job = job
         current_lease = lease
 
@@ -764,8 +766,8 @@ def run_worker(args: argparse.Namespace) -> None:
             current_lease: str | Path = current_lease,
             current_job: EvolutionJob = current_job,
         ) -> None:
-            nonlocal last_heartbeat
-            if api is None or time.monotonic() - last_heartbeat < args.job_heartbeat_seconds:
+            nonlocal last_checkpoint_upload
+            if api is None or time.monotonic() - last_checkpoint_upload < args.job_heartbeat_seconds:
                 return
             try:
                 api.heartbeat(lease_id=current_lease, job=current_job, artifact_dir=artifact_dir)
@@ -782,7 +784,7 @@ def run_worker(args: argparse.Namespace) -> None:
                     )
                 )
                 return
-            last_heartbeat = time.monotonic()
+            last_checkpoint_upload = time.monotonic()
             print(
                 json.dumps(
                     {
@@ -795,6 +797,37 @@ def run_worker(args: argparse.Namespace) -> None:
                 )
             )
 
+        lease_stop = threading.Event()
+        stale_seconds = float(args.recover_stale_job_seconds)
+        lease_interval = min(60.0, stale_seconds / 3.0) if stale_seconds > 0 else 60.0
+        lease_interval = max(0.1, lease_interval)
+
+        def keep_lease_alive(
+            stop: threading.Event = lease_stop,
+            interval: float = lease_interval,
+            active_lease: str | Path = current_lease,
+            active_job: EvolutionJob = current_job,
+            active_api: JobApiClient | None = api,
+            active_queue: FilesystemJobQueue | None = queue,
+        ) -> None:
+            while not stop.is_set():
+                try:
+                    if active_api is None:
+                        if active_queue is None or not isinstance(active_lease, Path):
+                            return
+                        active_queue.heartbeat(active_lease)
+                    else:
+                        active_api.heartbeat(lease_id=str(active_lease), job=active_job)
+                except (OSError, RuntimeError, ValueError):
+                    return
+                stop.wait(interval)
+
+        lease_thread = threading.Thread(
+            target=keep_lease_alive,
+            name=f"lux-lease-{job.job_id}",
+            daemon=True,
+        )
+        lease_thread.start()
         try:
             result = execute_evolution_job(
                 job,
@@ -814,6 +847,9 @@ def run_worker(args: argparse.Namespace) -> None:
                 except (OSError, RuntimeError):
                     pass
             raise
+        finally:
+            lease_stop.set()
+            lease_thread.join(timeout=5)
         if api is None:
             queue.complete(lease, result)
         else:
