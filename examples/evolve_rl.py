@@ -831,7 +831,21 @@ def run_worker(args: argparse.Namespace) -> None:
                         active_queue.heartbeat(active_lease)
                     else:
                         active_api.heartbeat(lease_id=str(active_lease), job=active_job)
-                except (OSError, RuntimeError, ValueError) as error:
+                except OSError as error:
+                    print(
+                        json.dumps(
+                            {
+                                "worker_id": worker_id,
+                                "job_id": active_job.job_id,
+                                "status": "lease_heartbeat_retry",
+                                "error": str(error),
+                            },
+                            sort_keys=True,
+                        )
+                    )
+                    stop.wait(min(interval, 10.0))
+                    continue
+                except (RuntimeError, ValueError) as error:
                     print(
                         json.dumps(
                             {
