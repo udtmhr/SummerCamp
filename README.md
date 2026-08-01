@@ -681,6 +681,7 @@ the worker run directory is local persistent scratch, not a shared mount:
 mkdir -p "$HOME/lux-evolution-worker"
 docker run --rm --gpus all --network host \
   -e LUX_EVOLUTION_JOB_TOKEN \
+  -e PYTHONUNBUFFERED=1 \
   -e UV_PROJECT_ENVIRONMENT=/tmp/lux-evolution-venv \
   -e UV_LINK_MODE=copy \
   -v "$HOME/lux-evolution-worker:/workspace/lux-evolution-worker" \

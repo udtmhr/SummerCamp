@@ -653,7 +653,10 @@ def _sync_api_claim(store: EvolutionStore, claim: Mapping[str, object]) -> tuple
     job = EvolutionJob.from_dict(claim["job"])
     if (job.candidate_id, job.stage) not in coordinator_result_keys:
         stale_result = store.result_dir / f"{job.candidate_id}-{job.stage}.json"
-        stale_result.unlink(missing_ok=True)
+        if stale_result.exists():
+            local_result = CandidateResult(**json.loads(stale_result.read_text(encoding="utf-8")))
+            if local_result.status != "completed":
+                stale_result.unlink()
     input_artifact = claim.get("input_artifact")
     if input_artifact is not None:
         if not isinstance(input_artifact, dict):
@@ -828,7 +831,18 @@ def run_worker(args: argparse.Namespace) -> None:
                         active_queue.heartbeat(active_lease)
                     else:
                         active_api.heartbeat(lease_id=str(active_lease), job=active_job)
-                except (OSError, RuntimeError, ValueError):
+                except (OSError, RuntimeError, ValueError) as error:
+                    print(
+                        json.dumps(
+                            {
+                                "worker_id": worker_id,
+                                "job_id": active_job.job_id,
+                                "status": "lease_heartbeat_failed",
+                                "error": str(error),
+                            },
+                            sort_keys=True,
+                        )
+                    )
                     return
                 stop.wait(interval)
 
@@ -857,9 +871,6 @@ def run_worker(args: argparse.Namespace) -> None:
                 except (OSError, RuntimeError):
                     pass
             raise
-        finally:
-            lease_stop.set()
-            lease_thread.join(timeout=5)
         if api is None:
             queue.complete(lease, result)
         else:
@@ -873,6 +884,8 @@ def run_worker(args: argparse.Namespace) -> None:
                     if time.monotonic() >= upload_deadline:
                         raise
                     time.sleep(max(0.1, args.job_poll_seconds))
+        lease_stop.set()
+        lease_thread.join(timeout=5)
         print(
             json.dumps(
                 {

@@ -587,3 +587,34 @@ def test_api_claim_discards_stale_local_result(tmp_path):
 
     assert claimed_job == job
     assert store.results() == []
+
+
+def test_api_claim_preserves_completed_local_result_for_retry_upload(tmp_path):
+    store = EvolutionStore(tmp_path)
+    candidate = initial_candidate(island=0, seed=10)
+    completed = CandidateResult(
+        candidate.candidate_id,
+        "short-resattn8",
+        "completed",
+        0.5,
+        0.5,
+        0.01,
+        2.0,
+        {"checkpoint": "local/best.pt"},
+    )
+    store.save_result(completed)
+    job = EvolutionJob(candidate.candidate_id, completed.stage, "resattn8", 1200, 4, 100)
+    claim = {
+        "api_version": 1,
+        "lease_id": "ws3--job.json",
+        "job": job.to_dict(),
+        "candidate": candidate.to_dict(),
+        "candidates": [candidate.to_dict()],
+        "results": [],
+        "manifest": {"schema_version": 1, "arguments": {}},
+        "input_artifact": None,
+    }
+
+    _sync_api_claim(store, claim)
+
+    assert store.results() == [completed]
