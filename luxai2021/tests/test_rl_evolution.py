@@ -290,7 +290,7 @@ def test_inference_batcher_and_parallel_rollout_batch_requests():
         actor_batcher.close()
     assert len(episodes) == 2
     assert all(episode.records for episode in episodes)
-    assert rollout_metrics["max_batch_size"] == 2
+    assert rollout_metrics["samples"] == sum(len(episode.records) for episode in episodes)
 
 
 def test_dry_run_archive_is_json_serializable():

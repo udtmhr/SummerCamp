@@ -1,0 +1,225 @@
+{
+  "$defs": {
+    "expression": {
+      "additionalProperties": false,
+      "properties": {
+        "condition": {
+          "$ref": "#/$defs/expression"
+        },
+        "high": {
+          "type": "number"
+        },
+        "left": {
+          "$ref": "#/$defs/expression"
+        },
+        "low": {
+          "type": "number"
+        },
+        "name": {
+          "enum": [
+            "cargo_fuel",
+            "carts",
+            "city_fuel",
+            "city_survival",
+            "city_tiles",
+            "city_tiles_built",
+            "collected_fuel",
+            "cycle",
+            "fuel_generated",
+            "night",
+            "research",
+            "turn",
+            "units",
+            "workers"
+          ],
+          "type": "string"
+        },
+        "op": {
+          "enum": [
+            "constant",
+            "metric",
+            "abs",
+            "neg",
+            "tanh",
+            "add",
+            "sub",
+            "mul",
+            "safe_div",
+            "min",
+            "max",
+            "clip",
+            "gate"
+          ],
+          "type": "string"
+        },
+        "right": {
+          "$ref": "#/$defs/expression"
+        },
+        "value": {
+          "oneOf": [
+            {
+              "type": "number"
+            },
+            {
+              "$ref": "#/$defs/expression"
+            }
+          ]
+        },
+        "when_false": {
+          "$ref": "#/$defs/expression"
+        },
+        "when_true": {
+          "$ref": "#/$defs/expression"
+        }
+      },
+      "required": [
+        "op"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "opponent_mix": {
+      "additionalProperties": false,
+      "properties": {
+        "other_base": {
+          "type": "number"
+        },
+        "self_base": {
+          "type": "number"
+        },
+        "snapshot": {
+          "type": "number"
+        },
+        "teacher": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "self_base",
+        "other_base",
+        "teacher",
+        "snapshot"
+      ],
+      "type": "object"
+    },
+    "ppo_config": {
+      "additionalProperties": false,
+      "properties": {
+        "bc_coefficient": {
+          "type": "number"
+        },
+        "clip_range": {
+          "type": "number"
+        },
+        "entropy_coefficient": {
+          "type": "number"
+        },
+        "gae_lambda": {
+          "type": "number"
+        },
+        "gamma": {
+          "type": "number"
+        },
+        "gradient_clip": {
+          "type": "number"
+        },
+        "kl_coefficient": {
+          "type": "number"
+        },
+        "learning_rate": {
+          "type": "number"
+        },
+        "minibatch_turns": {
+          "type": "integer"
+        },
+        "update_epochs": {
+          "type": "integer"
+        },
+        "value_clip_range": {
+          "type": "number"
+        },
+        "value_coefficient": {
+          "type": "number"
+        },
+        "weight_decay": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "learning_rate",
+        "weight_decay",
+        "gamma",
+        "gae_lambda",
+        "clip_range",
+        "value_clip_range",
+        "entropy_coefficient",
+        "value_coefficient",
+        "kl_coefficient",
+        "bc_coefficient",
+        "gradient_clip",
+        "update_epochs",
+        "minibatch_turns"
+      ],
+      "type": "object"
+    },
+    "rationale": {
+      "type": "string"
+    },
+    "reward_program": {
+      "additionalProperties": false,
+      "properties": {
+        "components": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "expression": {
+                "$ref": "#/$defs/expression"
+              },
+              "name": {
+                "type": "string"
+              },
+              "weight": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "name",
+              "expression",
+              "weight"
+            ],
+            "type": "object"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "gamma": {
+          "type": "number"
+        },
+        "reward_scale": {
+          "type": "number"
+        },
+        "version": {
+          "const": 1
+        }
+      },
+      "required": [
+        "version",
+        "components",
+        "reward_scale",
+        "gamma"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "reward_program",
+    "ppo_config",
+    "opponent_mix",
+    "rationale"
+  ],
+  "type": "object"
+}

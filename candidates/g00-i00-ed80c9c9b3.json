@@ -1,0 +1,68 @@
+{
+  "candidate_id": "g00-i00-ed80c9c9b3",
+  "generation": 0,
+  "island": 0,
+  "opponent_mix": {
+    "other_base": 0.25,
+    "self_base": 0.45,
+    "snapshot": 0.1,
+    "teacher": 0.2
+  },
+  "parent_ids": [],
+  "ppo_config": {
+    "bc_coefficient": 0.05,
+    "clip_range": 0.2,
+    "entropy_coefficient": 0.005,
+    "gae_lambda": 0.95,
+    "gamma": 0.995,
+    "gradient_clip": 1.0,
+    "kl_coefficient": 0.05,
+    "learning_rate": 1e-05,
+    "minibatch_turns": 32,
+    "update_epochs": 2,
+    "value_clip_range": 0.2,
+    "value_coefficient": 0.5,
+    "weight_decay": 1e-05
+  },
+  "rationale": "Bounded human initialization for the first island population.",
+  "reward_program": {
+    "components": [
+      {
+        "expression": {
+          "name": "city_tiles",
+          "op": "metric"
+        },
+        "name": "city_tiles",
+        "weight": 1.5627420593060477
+      },
+      {
+        "expression": {
+          "name": "city_survival",
+          "op": "metric"
+        },
+        "name": "city_survival",
+        "weight": 0.68600258125344
+      },
+      {
+        "expression": {
+          "name": "units",
+          "op": "metric"
+        },
+        "name": "units",
+        "weight": 0.46625439775536787
+      },
+      {
+        "expression": {
+          "name": "research",
+          "op": "metric"
+        },
+        "name": "research",
+        "weight": 0.18339264428892937
+      }
+    ],
+    "gamma": 0.995,
+    "reward_scale": 0.2,
+    "version": 1
+  },
+  "schema_version": 1
+}

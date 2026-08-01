@@ -389,9 +389,12 @@ class PPOTrainer:
         self.actor_critic.value_head.load_state_dict(checkpoint["value_head"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         if checkpoint.get("torch_rng_state") is not None:
-            torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
+            torch.set_rng_state(checkpoint["torch_rng_state"].to(device="cpu", dtype=torch.uint8))
         if torch.cuda.is_available() and checkpoint.get("cuda_rng_state_all") is not None:
-            torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state_all"])
+            cuda_rng_states = [
+                state.to(device="cpu", dtype=torch.uint8) for state in checkpoint["cuda_rng_state_all"]
+            ]
+            torch.cuda.set_rng_state_all(cuda_rng_states)
 
         metrics = dict(checkpoint.get("metrics", {}))
         state = (

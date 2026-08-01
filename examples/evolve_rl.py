@@ -692,6 +692,7 @@ def run_worker(args: argparse.Namespace) -> None:
     )
     worker_id = args.worker_id or f"{socket.gethostname()}-{os.getpid()}"
     idle_started = time.monotonic()
+    idle_announced = False
     last_api_error: OSError | None = None
     while True:
         if api is not None:
@@ -732,6 +733,14 @@ def run_worker(args: argparse.Namespace) -> None:
         else:
             claimed = queue.claim(worker_id)
         if claimed is None:
+            if not idle_announced:
+                print(
+                    json.dumps(
+                        {"worker_id": worker_id, "status": "waiting_for_job"},
+                        sort_keys=True,
+                    )
+                )
+                idle_announced = True
             if args.worker_idle_seconds > 0 and time.monotonic() - idle_started >= args.worker_idle_seconds:
                 print(
                     json.dumps(
@@ -743,6 +752,7 @@ def run_worker(args: argparse.Namespace) -> None:
             time.sleep(max(0.1, args.job_poll_seconds))
             continue
         idle_started = time.monotonic()
+        idle_announced = False
         job, lease = claimed
         print(
             json.dumps(
@@ -863,7 +873,17 @@ def run_worker(args: argparse.Namespace) -> None:
                     if time.monotonic() >= upload_deadline:
                         raise
                     time.sleep(max(0.1, args.job_poll_seconds))
-        print(json.dumps({"worker_id": worker_id, "job_id": job.job_id, "status": result.status}, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "worker_id": worker_id,
+                    "job_id": job.job_id,
+                    "status": result.status,
+                    "error": result.error,
+                },
+                sort_keys=True,
+            )
+        )
 
 
 def _best_parent(

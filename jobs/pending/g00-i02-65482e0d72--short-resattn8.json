@@ -1,0 +1,9 @@
+{
+  "base_name": "resattn8",
+  "candidate_id": "g00-i02-65482e0d72",
+  "decision_budget": 550000,
+  "eval_seed_start": 100000,
+  "eval_seeds": 4,
+  "seconds": 1200,
+  "stage": "short-resattn8"
+}
