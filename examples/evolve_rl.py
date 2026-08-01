@@ -531,11 +531,29 @@ def run_worker(args: argparse.Namespace) -> None:
             claimed = queue.claim(worker_id)
         if claimed is None:
             if args.worker_idle_seconds > 0 and time.monotonic() - idle_started >= args.worker_idle_seconds:
+                print(
+                    json.dumps(
+                        {"worker_id": worker_id, "status": "idle_timeout", "seconds": args.worker_idle_seconds},
+                        sort_keys=True,
+                    )
+                )
                 return
             time.sleep(max(0.1, args.job_poll_seconds))
             continue
         idle_started = time.monotonic()
         job, lease = claimed
+        print(
+            json.dumps(
+                {
+                    "worker_id": worker_id,
+                    "job_id": job.job_id,
+                    "status": "claimed",
+                    "training_seconds": job.seconds,
+                    "evaluation_seeds": job.eval_seeds,
+                },
+                sort_keys=True,
+            )
+        )
         result = execute_evolution_job(job, args=args, device=device, store=store)
         if api is None:
             queue.complete(lease, result)
@@ -646,6 +664,7 @@ def main() -> None:
             return
         for job in jobs:
             queue.enqueue(job)
+            print(json.dumps({"job_id": job.job_id, "status": "enqueued"}, sort_keys=True))
         expected = {(job.candidate_id, job.stage) for job in jobs}
         deadline = time.monotonic() + args.job_timeout_seconds
         worker_id = f"coordinator-{socket.gethostname()}-{os.getpid()}"

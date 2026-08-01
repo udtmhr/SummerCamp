@@ -679,7 +679,8 @@ docker run --rm --gpus all --network host \
   uv run --locked python examples/evolve_rl.py \
     --run-dir /workspace/lux-evolution-worker \
     --device cuda --worker --worker-id ws3-gpu0 \
-    --job-api-url http://127.0.0.1:18765
+    --job-api-url http://127.0.0.1:18765 \
+    --worker-idle-seconds 0
 ```
 
 The repository revision and base model files must exist in the image on both machines. Checkpoint/cache path flags are
@@ -687,7 +688,8 @@ local to each machine, so pass ws3-specific paths after the image command when n
 to preserve parent-change feedback, returns completed checkpoints and diagnostics to PC1, and downloads the short-stage
 checkpoint when a medium-stage job moves to another machine. Completion uploads are idempotent, while stale claims older
 than 12 hours are requeued. Set `LUX_EVOLUTION_JOB_TOKEN` to the same random value on PC1 and ws3; it is not written to
-the run manifest. Add `--coordinator-only` only when PC1 should schedule without using its own GPU.
+the run manifest. `--worker-idle-seconds 0` keeps the remote worker alive across generation barriers. Add
+`--coordinator-only` only when PC1 should schedule without using its own GPU.
 
 ### Play against the original first-place model
 
