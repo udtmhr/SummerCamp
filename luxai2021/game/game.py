@@ -85,6 +85,10 @@ class Game:
         """
         self.global_city_id_count = 0
         self.global_unit_id_count = 0
+        # Structured diagnostics are intentionally independent from replay
+        # logging so training/evaluation can inspect failures without writing
+        # replay files.
+        self.diagnostic_events = []
         self.cities = {}  # string -> City
         self.cells_with_roads = set() # Set, maintained to speed up agent designs that want to build road maps
         self.stats = {
@@ -545,11 +549,23 @@ class Game:
         """
         for city in list(self.cities.values()):
             # if city does not have enough fuel, destroy it
-            # TODO, probably add this event to replay
-            if city.fuel < city.get_light_upkeep():
+            upkeep = city.get_light_upkeep()
+            if city.fuel < upkeep:
+                self.diagnostic_events.append(
+                    {
+                        "event": "city_destroyed_night_fuel",
+                        "turn": int(self.state["turn"]),
+                        "team": int(city.team),
+                        "city_id": str(city.id),
+                        "city_tiles_lost": len(city.city_cells),
+                        "fuel": float(city.fuel),
+                        "upkeep": float(upkeep),
+                        "fuel_deficit": float(upkeep - city.fuel),
+                    }
+                )
                 self.destroy_city(city.team, city.id)
             else:
-                city.fuel -= city.get_light_upkeep()
+                city.fuel -= upkeep
 
         for team in [Constants.TEAM.A, Constants.TEAM.B]:
             for unit in list(self.state["teamStates"][team]["units"].values()):

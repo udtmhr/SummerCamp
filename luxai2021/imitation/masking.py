@@ -25,6 +25,22 @@ _MAX_RESEARCH = GAME_CONSTANTS["PARAMETERS"]["RESEARCH_REQUIREMENTS"]["URANIUM"]
 _CAPACITY = GAME_CONSTANTS["PARAMETERS"]["RESOURCE_CAPACITY"]
 
 
+def monotonically_tighten_legal_mask(
+    existing_mask: np.ndarray,
+    additional_allow_mask: np.ndarray,
+) -> np.ndarray:
+    """Apply new restrictions without ever re-enabling an existing illegal action."""
+    if existing_mask.shape != additional_allow_mask.shape:
+        msg = f"Legal-mask tightening shape mismatch: {existing_mask.shape} != {additional_allow_mask.shape}"
+        raise ValueError(msg)
+    existing = np.asarray(existing_mask, dtype=np.bool_)
+    additional = np.asarray(additional_allow_mask, dtype=np.bool_)
+    tightened = existing & additional
+    if np.any(tightened & ~existing):  # Defensive invariant; AND should make this unreachable.
+        raise AssertionError("Legal-mask tightening attempted to re-enable an action")
+    return tightened
+
+
 def _units_by_position(snapshot: BoardSnapshot) -> dict[tuple[int, int], list[UnitSnapshot]]:
     result: dict[tuple[int, int], list[UnitSnapshot]] = {}
     for unit in snapshot.units.values():

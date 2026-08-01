@@ -580,6 +580,78 @@ The teacher adapter is pinned to upstream commit `973a6c6c63211b6c7ab6fdf50e026e
 `40248f0fbc9b8e1e1b1f7cc6fc674c041d8dac43b964ae45bd976d927cdffd22`. See
 [`docs/THIRD_PARTY_NOTICES.md`](docs/THIRD_PARTY_NOTICES.md) for attribution.
 
+### Codex-guided evolutionary reinforcement learning
+
+`examples/evolve_rl.py` evolves bounded reward programs, PPO parameters, and opponent mixtures while keeping the
+distilled UNet/ResAttn8 architectures and `first_place_flat_v1` action schema fixed. Codex proposes structured JSON
+only; proposals are validated before training and cannot execute arbitrary reward code. PPO uses full-turn legal
+action sampling, a training-only value head, reference-policy KL, and the prepared teacher cache as a distillation
+anchor. Exported `best.pt` files remain compatible with `BehaviorCloningAgent`.
+
+Each Codex feedback record includes the exact turns where city tiles disappeared from night fuel shortage, fuel and
+upkeep at destruction, illegal actions rejected by the engine, the candidate's setting changes from its parent, and
+the resulting score/teacher-score/KL deltas. Dynamic action restrictions are applied only by intersecting them with
+the existing legal-action mask, so an existing forbidden action can never be re-enabled by evolution.
+
+First verify the 24-candidate schedule without training:
+
+```bash
+uv run --locked python examples/evolve_rl.py \
+  --run-dir models/evolution/lux-s1-001 \
+  --dry-run
+```
+
+Then launch the default staged run on one GPU:
+
+```bash
+uv run --locked python examples/evolve_rl.py \
+  --run-dir models/evolution/lux-s1-001 \
+  --device cuda
+```
+
+The defaults screen 24 ResAttn8 candidates for 20 minutes, continue the best eight to 90 minutes, and train the best
+two from both UNet and ResAttn8 for six hours each. Final evaluation uses 50 fixed seeds, both player orientations,
+the two distilled bases plus the original first-place policy, no replay output, paired bootstrap reporting, and an
+inference-latency guard. Re-running the same command resumes completed candidates and stage checkpoints. Use
+`--no-codex` for deterministic numeric mutations, or `--overwrite-run` to intentionally start that run directory
+again. The Codex CLI must already be installed and authenticated when proposal generation is enabled.
+
+Run a short end-to-end check before committing a long GPU allocation:
+
+```bash
+uv run --locked python examples/evolve_rl.py \
+  --run-dir /tmp/lux-evolution-smoke \
+  --no-codex --device cpu --overwrite-run \
+  --islands 1 --initial-per-island 1 --generations 0 \
+  --short-seconds 0 --medium-count 0 --final-count 0 \
+  --episodes-per-update 1 --screening-seeds 1 --max-turns 4
+```
+
+Candidate definitions, failures, training checkpoints, league games, and the promotion report are written under the
+run directory so an interrupted search remains inspectable and resumable.
+
+Independent candidates can use another GPU machine through the atomic filesystem job queue. Put the run directory on
+a filesystem visible at the same path from both machines (for example NFS), use the same repository revision and model
+artifacts, then start the coordinator on the first machine:
+
+```bash
+uv run --locked python examples/evolve_rl.py \
+  --run-dir /shared/lux-s1-001 --device cuda --distributed
+```
+
+Start one worker per GPU on the second machine:
+
+```bash
+uv run --locked python examples/evolve_rl.py \
+  --run-dir /shared/lux-s1-001 --device cuda --worker \
+  --worker-id gpu-pc-2
+```
+
+The coordinator batches islands at each generation and both machines atomically claim different candidates. It also
+works locally by default; add `--coordinator-only` when the first machine should schedule without consuming a GPU.
+Worker algorithm settings are read from the coordinator manifest, while checkpoint/cache path flags remain local so
+the two machines may store the same artifacts at different paths. Stale claims older than 12 hours are requeued.
+
 ### Play against the original first-place model
 
 Use the normal one-on-one CLI with a BC or distilled checkpoint on one side and the original first-place teacher on

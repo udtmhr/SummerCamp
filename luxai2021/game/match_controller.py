@@ -163,10 +163,10 @@ class MatchController:
                     self.action_buffer.append(action)
                     self.accumulated_stats = action.commit_action_update_stats(self.game, self.accumulated_stats)
                 else:
-                    #print(f'action is invalid {action} turn {self.game.state["turn"]}: {vars(action)}', file=sys.stderr)
-                    pass
+                    self._record_invalid_action(action, "rejected_by_action_validator")
                     
             except KeyError:
+                self._record_invalid_action(action, "missing_or_dead_entity")
                 print(f'action failed, probably a dead unit {action}: {vars(action)}', file=sys.stderr)
 
         # Mark the unit or city as not able to perform another action this turn
@@ -186,6 +186,36 @@ class MatchController:
 
         if actionable is not None:
             actionable.set_can_act_override(False)
+
+    def _record_invalid_action(self, action, reason):
+        details = {}
+        team = getattr(action, "team", -1)
+        if not isinstance(team, int):
+            team = -1
+        for name in (
+            "unit_id",
+            "source_id",
+            "destination_id",
+            "direction",
+            "resource_type",
+            "amount",
+            "x",
+            "y",
+        ):
+            value = getattr(action, name, None)
+            if isinstance(value, (str, int, float, bool)):
+                details[name] = value
+        self.game.diagnostic_events.append(
+            {
+                "event": "illegal_action",
+                "turn": int(self.game.state["turn"]),
+                "team": team,
+                "action": str(getattr(action, "action", type(action).__name__)),
+                "action_class": type(action).__name__,
+                "reason": reason,
+                "details": details,
+            }
+        )
 
     def take_actions(self, actions):
         """
