@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import threading
+from collections import Counter
 
 import numpy as np
 import pytest
@@ -104,6 +105,23 @@ def _metrics(**updates):
     }
     values.update(updates)
     return GameMetrics(0, values)
+
+
+def _candidate_proposal(parent, *, mutation_kind, reward_program=None, secondary_parent_ids=()):
+    return {
+        "reward_program": copy.deepcopy(reward_program or parent.reward_program.to_dict()),
+        "ppo_config": copy.deepcopy(vars(parent.ppo_config)),
+        "opponent_mix": copy.deepcopy(vars(parent.opponent_mix)),
+        "mutation_kind": mutation_kind,
+        "primary_parent_id": None if mutation_kind == "restart" else parent.candidate_id,
+        "secondary_parent_ids": list(secondary_parent_ids),
+        "inheritance_mode": "base" if mutation_kind == "restart" else "policy",
+        "mutation_manifest": {"changed_paths": ["reward_program"], "summary": "test proposal"},
+        "parameter_constraint_coefficient": 0.0
+        if mutation_kind == "restart"
+        else parent.parameter_constraint_coefficient,
+        "rationale": "test proposal",
+    }
 
 
 def test_reward_program_is_bounded_and_preserves_terminal_reward():
@@ -340,22 +358,292 @@ def test_parameter_mutation_keeps_ast_shape_and_validates_island_contract():
     assert approximate_ast_distance(parent, child) <= 0.2
 
 
-def test_existing_feature_mutation_uses_safe_phase_and_risk_signs():
+def test_existing_feature_mutation_uses_safe_phase_and_risk_signs_in_every_generation():
     parent = initial_candidate(island=2, seed=12)
     additions = 0
-    for seed in range(100):
-        child = mutate_candidate(parent, generation=1, island=2, seed=seed)
-        added = [component for component in child.reward_program.components if component.name.startswith("feature_")]
-        for component in added:
-            additions += 1
-            metric = str(component.expression["name"])
-            assert metric in DIRECT_REWARD_METRIC_NAMES
-            assert metric not in GATING_METRIC_NAMES
-            if metric in LOWER_IS_BETTER_METRIC_NAMES:
-                assert component.weight < 0.0
-            else:
-                assert component.weight > 0.0
+    for generation in (1, 2):
+        for seed in range(100):
+            child = mutate_candidate(parent, generation=generation, island=2, seed=seed)
+            validate_candidate_mutation([parent], child)
+            assert child.mutation_kind == "feature_existing"
+            assert child.reward_program.derived_metrics == parent.reward_program.derived_metrics
+            added = [
+                component for component in child.reward_program.components if component.name.startswith("feature_")
+            ]
+            for component in added:
+                additions += 1
+                metric = str(component.expression["name"])
+                assert metric in DIRECT_REWARD_METRIC_NAMES
+                assert metric not in GATING_METRIC_NAMES
+                if metric in LOWER_IS_BETTER_METRIC_NAMES:
+                    assert component.weight < 0.0
+                else:
+                    assert component.weight > 0.0
     assert additions > 0
+
+
+def test_feature_generated_remains_loadable_but_is_not_proposable():
+    parent = initial_candidate(island=2, seed=12)
+    proposal = _candidate_proposal(parent, mutation_kind="feature_generated")
+    proposal["reward_program"]["derived_metrics"] = [
+        {"name": "legacy_generated", "expression": {"op": "count", "selector": "own_workers"}}
+    ]
+    proposal["reward_program"]["components"].append(
+        {
+            "name": "legacy_generated",
+            "expression": {"op": "derived", "name": "legacy_generated"},
+            "weight": 0.2,
+        }
+    )
+    candidate = EvolutionCandidate.from_proposal(
+        proposal,
+        generation=2,
+        island=2,
+        parent_ids=(parent.candidate_id,),
+    )
+
+    restored = EvolutionCandidate.from_dict(candidate.to_dict())
+    mutation_enum = proposal_schema()["properties"]["mutation_kind"]["enum"]
+
+    assert restored == candidate
+    assert restored.candidate_id == candidate.candidate_id
+    assert "feature_generated" not in mutation_enum
+    with pytest.raises(ValueError, match="does not allow"):
+        validate_candidate_mutation([parent], candidate)
+
+
+@pytest.mark.parametrize(
+    ("stagnated", "expected"),
+    [
+        (False, {"structural": 0.50, "crossover": 0.30, "restart": 0.20}),
+        (True, {"structural": 0.40, "crossover": 0.20, "restart": 0.40}),
+    ],
+)
+def test_island3_fallback_has_no_generated_feature_and_expected_distribution(stagnated, expected):
+    parent = initial_candidate(island=3, seed=1)
+    donor = initial_candidate(island=0, seed=99)
+    counts = Counter(
+        mutate_candidate(
+            parent,
+            generation=1,
+            island=3,
+            seed=seed,
+            secondary_parents=(donor,),
+            stagnated=stagnated,
+        ).mutation_kind
+        for seed in range(1000)
+    )
+
+    assert "feature_generated" not in counts
+    for kind, ratio in expected.items():
+        assert counts[kind] / 1000 == pytest.approx(ratio, abs=0.04)
+
+
+def test_island3_without_secondary_parent_reassigns_crossover_to_structural():
+    parent = initial_candidate(island=3, seed=1)
+    counts = Counter(mutate_candidate(parent, generation=1, island=3, seed=seed).mutation_kind for seed in range(500))
+
+    assert counts["crossover"] == 0
+    assert counts["structural"] / 500 == pytest.approx(0.80, abs=0.05)
+    assert counts["restart"] / 500 == pytest.approx(0.20, abs=0.05)
+
+
+def test_island3_structural_accepts_one_training_setting_family_only():
+    parent = initial_candidate(island=3, seed=1)
+    structural = next(
+        child
+        for seed in range(100)
+        if (child := mutate_candidate(parent, generation=1, island=3, seed=seed)).mutation_kind == "structural"
+    )
+    proposal = _candidate_proposal(
+        parent,
+        mutation_kind="structural",
+        reward_program=structural.reward_program.to_dict(),
+    )
+    proposal["ppo_config"]["learning_rate"] *= 1.1
+    proposal["parameter_constraint_coefficient"] = 0.05
+    proposal["mutation_manifest"]["changed_paths"].extend(
+        ("ppo_config.learning_rate", "parameter_constraint_coefficient")
+    )
+    ppo_child = EvolutionCandidate.from_proposal(
+        proposal,
+        generation=1,
+        island=3,
+        parent_ids=(parent.candidate_id,),
+    )
+    validate_candidate_mutation([parent], ppo_child)
+
+    zero_constraint = copy.deepcopy(proposal)
+    zero_constraint["parameter_constraint_coefficient"] = 0.0
+    zero_constraint_child = EvolutionCandidate.from_proposal(
+        zero_constraint,
+        generation=1,
+        island=3,
+        parent_ids=(parent.candidate_id,),
+    )
+    with pytest.raises(ValueError, match="positive parent parameter constraint"):
+        validate_candidate_mutation([parent], zero_constraint_child)
+
+    opponent_proposal = _candidate_proposal(
+        parent,
+        mutation_kind="structural",
+        reward_program=structural.reward_program.to_dict(),
+    )
+    opponent_proposal["opponent_mix"]["self_base"] -= 0.05
+    opponent_proposal["opponent_mix"]["other_base"] += 0.05
+    opponent_proposal["parameter_constraint_coefficient"] = 0.05
+    opponent_proposal["mutation_manifest"]["changed_paths"].extend(("opponent_mix", "parameter_constraint_coefficient"))
+    opponent_child = EvolutionCandidate.from_proposal(
+        opponent_proposal,
+        generation=1,
+        island=3,
+        parent_ids=(parent.candidate_id,),
+    )
+    validate_candidate_mutation([parent], opponent_child)
+
+    both = copy.deepcopy(proposal)
+    both["opponent_mix"]["self_base"] -= 0.05
+    both["opponent_mix"]["other_base"] += 0.05
+    both["mutation_manifest"]["changed_paths"].append("opponent_mix")
+    both_child = EvolutionCandidate.from_proposal(
+        both,
+        generation=1,
+        island=3,
+        parent_ids=(parent.candidate_id,),
+    )
+    with pytest.raises(ValueError, match="not both"):
+        validate_candidate_mutation([parent], both_child)
+
+
+def test_island3_structural_rejects_too_small_and_too_large_ast_changes():
+    parent = initial_candidate(island=3, seed=1)
+    too_small_reward = parent.reward_program.to_dict()
+    too_small_reward["components"][0]["weight"] *= 1.01
+    too_small = EvolutionCandidate.from_proposal(
+        _candidate_proposal(parent, mutation_kind="structural", reward_program=too_small_reward),
+        generation=1,
+        island=3,
+        parent_ids=(parent.candidate_id,),
+    )
+    with pytest.raises(ValueError, match="AST distance"):
+        validate_candidate_mutation([parent], too_small)
+
+    large_reward = {
+        "version": 2,
+        "derived_metrics": [],
+        "components": [
+            {
+                "name": f"large_{index}",
+                "expression": {"op": "square", "value": {"op": "metric", "name": metric}},
+                "weight": -1.0 if index % 2 else 1.0,
+            }
+            for index, metric in enumerate(sorted(DIRECT_REWARD_METRIC_NAMES)[:16])
+        ],
+        "reward_scale": 0.4,
+        "gamma": 0.91,
+    }
+    too_large = EvolutionCandidate.from_proposal(
+        _candidate_proposal(parent, mutation_kind="structural", reward_program=large_reward),
+        generation=1,
+        island=3,
+        parent_ids=(parent.candidate_id,),
+    )
+    assert approximate_ast_distance(parent, too_large) > 0.65
+    with pytest.raises(ValueError, match="AST distance"):
+        validate_candidate_mutation([parent], too_large)
+
+
+def test_island3_crossover_requires_secondary_contribution_and_fixed_training_settings():
+    parent = initial_candidate(island=3, seed=1)
+    donor = initial_candidate(island=0, seed=99)
+    crossover = next(
+        child
+        for seed in range(100)
+        if (
+            child := mutate_candidate(
+                parent,
+                generation=1,
+                island=3,
+                seed=seed,
+                secondary_parents=(donor,),
+            )
+        ).mutation_kind
+        == "crossover"
+    )
+    validate_candidate_mutation([parent, donor], crossover)
+    assert crossover.secondary_parent_ids == (donor.candidate_id,)
+
+    unchanged = _candidate_proposal(
+        parent,
+        mutation_kind="crossover",
+        secondary_parent_ids=(donor.candidate_id,),
+    )
+    unchanged_child = EvolutionCandidate.from_proposal(
+        unchanged,
+        generation=1,
+        island=3,
+        parent_ids=(parent.candidate_id, donor.candidate_id),
+    )
+    with pytest.raises(ValueError, match="secondary parent"):
+        validate_candidate_mutation([parent, donor], unchanged_child)
+
+    changed_ppo = _candidate_proposal(
+        parent,
+        mutation_kind="crossover",
+        reward_program=crossover.reward_program.to_dict(),
+        secondary_parent_ids=(donor.candidate_id,),
+    )
+    changed_ppo["ppo_config"]["learning_rate"] *= 1.1
+    changed_ppo["mutation_manifest"]["changed_paths"].append("ppo_config.learning_rate")
+    changed_ppo_child = EvolutionCandidate.from_proposal(
+        changed_ppo,
+        generation=1,
+        island=3,
+        parent_ids=(parent.candidate_id, donor.candidate_id),
+    )
+    with pytest.raises(ValueError, match="only recombine"):
+        validate_candidate_mutation([parent, donor], changed_ppo_child)
+
+
+def test_island3_restart_accepts_arbitrary_safe_reward_and_one_training_family():
+    parent = initial_candidate(island=3, seed=1)
+    reward = default_reward_program().to_dict()
+    reward["version"] = 2
+    reward["derived_metrics"] = []
+    reward["components"][0]["expression"] = {
+        "op": "gate",
+        "condition": {"op": "metric", "name": "night"},
+        "when_true": {"op": "metric", "name": "min_city_survival"},
+        "when_false": {"op": "metric", "name": "worker_resource_access"},
+    }
+    proposal = _candidate_proposal(parent, mutation_kind="restart", reward_program=reward)
+    proposal["ppo_config"]["learning_rate"] *= 1.1
+    proposal["mutation_manifest"]["changed_paths"].extend(
+        ("ppo_config.learning_rate", "parameter_constraint_coefficient")
+    )
+    candidate = EvolutionCandidate.from_proposal(
+        proposal,
+        generation=1,
+        island=3,
+        parent_ids=(parent.candidate_id,),
+    )
+    validate_candidate_mutation([parent], candidate)
+    assert candidate.primary_parent_id is None
+    assert candidate.inheritance_mode == "base"
+    assert candidate.parameter_constraint_coefficient == 0.0
+
+    both = copy.deepcopy(proposal)
+    both["opponent_mix"]["self_base"] -= 0.05
+    both["opponent_mix"]["other_base"] += 0.05
+    both["mutation_manifest"]["changed_paths"].append("opponent_mix")
+    both_candidate = EvolutionCandidate.from_proposal(
+        both,
+        generation=1,
+        island=3,
+        parent_ids=(parent.candidate_id,),
+    )
+    with pytest.raises(ValueError, match="not both"):
+        validate_candidate_mutation([parent], both_candidate)
 
 
 def test_codex_proposal_schema_uses_supported_structured_output_constructs():
@@ -377,6 +665,11 @@ def test_codex_proposal_schema_uses_supported_structured_output_constructs():
     encoded = json.dumps(schema)
     assert "own_at_risk_city_tiles" in encoded
     assert "own_night_fuel_deficit" in encoded
+
+    island3_prompt = build_codex_prompt([initial_candidate(island=3, seed=1)], [], island=3, generation=1)
+    assert "coordinated edits across multiple components" in island3_prompt
+    assert "Use only structural, crossover, or restart" in island3_prompt
+    assert "prefer the single targeted change" not in island3_prompt
 
 
 def test_candidate_content_hash_detects_manual_edit():

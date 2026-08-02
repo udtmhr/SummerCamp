@@ -636,11 +636,18 @@ the resulting score/teacher-score/KL deltas. Dynamic action restrictions are app
 the existing legal-action mask, so an existing forbidden action can never be re-enabled by evolution.
 
 The four islands have fixed roles: `i00` makes one or two coefficient changes, `i01` makes one local AST edit,
-`i02` adds or removes a feature, and `i03` performs large edits, crossover, generated Metric DSL, or restart.
+`i02` adds or removes one direct normalized metric, and `i03` performs a free bounded reward redesign, crossover,
+or restart. `feature_generated` remains readable in older candidate files but is never proposed for new candidates.
 Non-restart candidates inherit the primary parent's policy checkpoint; only `i00` also inherits its value head.
 Value-head resets run a critic-only warm-up before PPO, and inherited tensors use a relative L2-SP constraint with
 cosine decay. The illegal-action auxiliary loss acts on unmasked logits while sampling still uses the hard mask.
-Generated metrics are bounded JSON DSL expressions rather than Python code.
+Reward expressions remain bounded structured data rather than arbitrary Python code.
+
+On `i03`, Codex may coordinate changes across multiple reward components and subtrees. A structural candidate may
+also change either the PPO/parameter-constraint family or the opponent mixture, but never both. Structural policy
+inheritance requires approximate AST distance 0.20 to 0.65; a more radical proposal must use `restart`. Without
+Codex, the normal fallback mix is 50% structural, 30% crossover, and 20% restart. After two stagnant generations it
+becomes 40%, 20%, and 40%, respectively; unavailable crossover probability is reassigned to structural exploration.
 
 The Metric DSL also exposes phase-aware and local survival signals: normalized turns until night/night turns
 remaining, minimum per-city survival, at-risk city-tile fraction, next-night fuel deficit, nearby cargo coverage,

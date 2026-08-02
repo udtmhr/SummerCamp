@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 # ruff: noqa: C901, EM102, PLR0912, PLR0913, PLR0915, PLR2004, S311, S603, TC003
+import copy
 import hashlib
 import json
 import math
@@ -30,8 +31,13 @@ OPPONENT_KEYS = ("self_base", "other_base", "teacher", "snapshot")
 MUTATION_KINDS = frozenset(
     {"initial", "legacy", "parameter", "structural", "feature_existing", "feature_generated", "crossover", "restart"}
 )
+PROPOSABLE_MUTATION_KINDS = MUTATION_KINDS - {"legacy", "initial", "feature_generated"}
 INHERITANCE_MODES = frozenset({"base", "policy", "policy_value"})
 _STRUCTURAL_WRAPPERS = frozenset({"abs", "neg", "tanh", "exp_decay", "log1p_abs", "square"})
+_STRUCTURAL_BINARY_OPS = frozenset({"add", "sub", "mul", "safe_div", "min", "max"})
+_I03_STRUCTURAL_DISTANCE_MIN = 0.20
+_I03_STRUCTURAL_DISTANCE_MAX = 0.65
+_I03_STRUCTURAL_ATTEMPTS = 16
 
 
 @dataclass(frozen=True)
@@ -517,7 +523,7 @@ def proposal_schema() -> dict[str, Any]:
                 "required": list(OPPONENT_KEYS),
                 "additionalProperties": False,
             },
-            "mutation_kind": {"type": "string", "enum": sorted(MUTATION_KINDS - {"legacy", "initial"})},
+            "mutation_kind": {"type": "string", "enum": sorted(PROPOSABLE_MUTATION_KINDS)},
             "primary_parent_id": {"type": ["string", "null"]},
             "secondary_parent_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
             "inheritance_mode": {"type": "string", "enum": sorted(INHERITANCE_MODES)},
@@ -558,9 +564,21 @@ def build_codex_prompt(
     island_role = {
         0: "parameter: change only one or two numeric leaves; keep AST topology unchanged; inherit policy_value",
         1: "structural: make one local AST operator/subtree edit; inherit policy",
-        2: "feature: add/delete one existing or generated Metric DSL feature; inherit policy",
-        3: "diversity: large structural mutation, crossover, generated feature, or restart",
+        2: "feature: add or delete exactly one direct normalized metric component; inherit policy",
+        3: "diversity: freely redesign the bounded reward structure, recombine parents, or restart",
     }.get(island, "parameter")
+    edit_guidance = (
+        "- On islands 0-2, prefer the single targeted change required by the island contract."
+        if island != 3
+        else """- On island 3, coordinated edits across multiple components and subtrees are encouraged when supported
+  by diagnostics. Use only structural, crossover, or restart; feature_generated is deprecated.
+- Island-3 structural proposals must change the reward AST with approximate distance 0.20 to 0.65 and inherit
+  policy only with a positive parameter constraint. They may additionally change either the PPO/parameter-constraint
+  family or opponent_mix, never both.
+- Island-3 crossover may recombine multiple reward components/derived metrics, must include a distinct contribution
+  from a secondary parent, and must keep the primary parent's PPO, opponent mix, and parameter constraint.
+- Changes more radical than structural distance 0.65 must be declared restart with base inheritance."""
+    )
     return f"""You are evolving a safe reward program and PPO configuration for Lux AI Challenge 2021.
 Return exactly one proposal matching the supplied JSON schema.
 
@@ -570,17 +588,17 @@ Hard constraints:
 - Preserve terminal win/loss reward; design bounded potential shaping for city survival and match strength.
 - PPO must remain close to the distilled reference policy and train on one GPU.
 - Opponent weights must sum to exactly 1.0.
-- Prefer one targeted change justified by evaluation feedback instead of unrelated novelty.
+{edit_guidance}
 - Illegal-action events identify hard action-mask defects. Do not trade them against reward and never weaken an
   existing illegal-action mask; runtime masks may only become stricter.
 - Use the reported city-loss/night-fuel turns and parent deltas to explain the proposed change.
-- Emit reward_program version 2. Derived metrics must use only the safe Metric DSL in the schema.
+- Emit reward_program version 2. Derived metrics must use only safe Reward IR expressions in the schema.
 - turn/night/cycle/turns_until_night/night_turns_remaining describe phase and should be used as gate conditions,
   not standalone objectives. Relative city-risk/loss/deficit metrics are oriented so larger is better. Absolute
   own_city_tiles_at_risk, own_night_fuel_deficit, own_city_tiles_lost, and own_night_fuel_shortage are lower-is-better.
 - min_city_survival is the minimum over individual cities, while city_survival uses aggregate team fuel. Prefer the
   minimum/risk/deficit signals when feedback reports a local night-fuel collapse despite adequate total fuel.
-- On island 2, odd generations use existing whitelist metrics and even generations use generated Metric DSL.
+- On island 2, every generation adds or deletes exactly one direct whitelist metric; do not create derived metrics.
 - A restart sets primary_parent_id to null, inheritance_mode to base, and parameter_constraint_coefficient to 0.
 - mutation_kind, parent provenance, inheritance_mode, and changed_paths must truthfully describe the proposal.
 
@@ -733,6 +751,12 @@ def validate_candidate_mutation(parents: list[EvolutionCandidate], candidate: Ev
     if not parents:
         if candidate.mutation_kind not in {"initial", "restart"}:
             raise ValueError("A parentless candidate must be initial or restart")
+        if candidate.mutation_kind == "restart" and (
+            candidate.primary_parent_id is not None
+            or candidate.inheritance_mode != "base"
+            or candidate.parameter_constraint_coefficient != 0
+        ):
+            raise ValueError("Restart must use base inheritance with no parent parameter constraint")
         return
     parent_by_id = {parent.candidate_id: parent for parent in parents}
     if candidate.mutation_kind != "restart" and candidate.primary_parent_id not in parent_by_id:
@@ -748,7 +772,12 @@ def validate_candidate_mutation(parents: list[EvolutionCandidate], candidate: Ev
             raise ValueError(f"Mutation manifest does not cover changed path: {path}")
     _, _, _, parent_nodes = candidate_ast_descriptor(primary)
     _, _, _, child_nodes = candidate_ast_descriptor(candidate)
-    expected = {0: {"parameter"}, 1: {"structural"}, 2: {"feature_existing", "feature_generated"}}
+    expected = {
+        0: {"parameter"},
+        1: {"structural"},
+        2: {"feature_existing"},
+        3: {"structural", "crossover", "restart"},
+    }
     if candidate.island in expected and candidate.mutation_kind not in expected[candidate.island]:
         raise ValueError(f"Island {candidate.island} does not allow {candidate.mutation_kind}")
     if candidate.island == 0:
@@ -790,54 +819,98 @@ def validate_candidate_mutation(parents: list[EvolutionCandidate], candidate: Ev
 
         parent_components = Counter(serialize(item) for item in primary.reward_program.components)
         child_components = Counter(serialize(item) for item in candidate.reward_program.components)
-        parent_derived = Counter(serialize(item) for item in primary.reward_program.derived_metrics)
-        child_derived = Counter(serialize(item) for item in candidate.reward_program.derived_metrics)
         component_added = sum((child_components - parent_components).values())
         component_removed = sum((parent_components - child_components).values())
-        derived_added = sum((child_derived - parent_derived).values())
-        derived_removed = sum((parent_derived - child_derived).values())
-        parity_valid = (
-            candidate.generation % 2 == 1
-            and candidate.mutation_kind == "feature_existing"
-            and derived_added == derived_removed == 0
-        ) or (
-            candidate.generation % 2 == 0
-            and candidate.mutation_kind == "feature_generated"
-            and max(derived_added, derived_removed) == 1
+        added_components = list((child_components - parent_components).elements())
+        added_direct_metrics = all(
+            json.loads(item).get("expression", {}).get("op") == "metric" for item in added_components
+        )
+        same_non_component_settings = (
+            primary.reward_program.derived_metrics == candidate.reward_program.derived_metrics
+            and primary.reward_program.reward_scale == candidate.reward_program.reward_scale
+            and primary.reward_program.gamma == candidate.reward_program.gamma
+            and primary.ppo_config == candidate.ppo_config
+            and primary.opponent_mix == candidate.opponent_mix
+            and primary.parameter_constraint_coefficient == candidate.parameter_constraint_coefficient
         )
         if (
-            max(component_added, component_removed) > 1
-            or max(derived_added, derived_removed) > 1
-            or component_added + component_removed == 0
+            component_added + component_removed != 1
+            or not added_direct_metrics
             or candidate.inheritance_mode != "policy"
-            or not parity_valid
+            or not same_non_component_settings
         ):
-            raise ValueError("Feature island may add/delete only one feature and one component")
-    elif candidate.mutation_kind == "crossover":
-        allowed_components = {
-            json.dumps(asdict(component), sort_keys=True)
-            for parent in parents
-            for component in parent.reward_program.components
+            raise ValueError("Feature island must add or delete exactly one direct metric component")
+    elif candidate.island == 3 and candidate.mutation_kind == "structural":
+        distance = approximate_ast_distance(primary, candidate)
+        inherited_constraint = (
+            primary.parameter_constraint_coefficient if primary.parameter_constraint_coefficient > 0.0 else 0.05
+        )
+        ppo_family_changed = (
+            primary.ppo_config != candidate.ppo_config
+            or inherited_constraint != candidate.parameter_constraint_coefficient
+        )
+        opponent_changed = primary.opponent_mix != candidate.opponent_mix
+        if primary.reward_program == candidate.reward_program:
+            raise ValueError("Island-3 structural mutation must change the reward program")
+        if not _I03_STRUCTURAL_DISTANCE_MIN <= distance <= _I03_STRUCTURAL_DISTANCE_MAX:
+            raise ValueError("Island-3 structural mutation AST distance must be in [0.20, 0.65]")
+        if candidate.inheritance_mode != "policy":
+            raise ValueError("Island-3 structural mutation must inherit policy only")
+        if candidate.parameter_constraint_coefficient <= 0.0:
+            raise ValueError("Island-3 structural mutation requires a positive parent parameter constraint")
+        if ppo_family_changed and opponent_changed:
+            raise ValueError("Island-3 structural mutation may change PPO settings or opponent mix, not both")
+    elif candidate.island == 3 and candidate.mutation_kind == "crossover":
+
+        def serialize(item: object) -> str:
+            return json.dumps(asdict(item), sort_keys=True, separators=(",", ":"))
+
+        primary_components = {serialize(component) for component in primary.reward_program.components}
+        primary_derived = {serialize(metric) for metric in primary.reward_program.derived_metrics}
+        secondary_parents = [parent_by_id[item] for item in candidate.secondary_parent_ids if item in parent_by_id]
+        secondary_components = {
+            serialize(component) for parent in secondary_parents for component in parent.reward_program.components
         }
-        if any(
-            json.dumps(asdict(component), sort_keys=True) not in allowed_components
-            for component in candidate.reward_program.components
-        ):
+        secondary_derived = {
+            serialize(metric) for parent in secondary_parents for metric in parent.reward_program.derived_metrics
+        }
+        candidate_components = {serialize(component) for component in candidate.reward_program.components}
+        candidate_derived = {serialize(metric) for metric in candidate.reward_program.derived_metrics}
+        allowed_components = primary_components | secondary_components
+        allowed_derived = primary_derived | secondary_derived
+        secondary_contribution = bool(
+            (candidate_components & (secondary_components - primary_components))
+            or (candidate_derived & (secondary_derived - primary_derived))
+        )
+        if not secondary_parents or not secondary_contribution:
+            raise ValueError("Crossover must include a distinct contribution from a secondary parent")
+        if not candidate_components <= allowed_components:
             raise ValueError("Crossover introduced a component not present in its parents")
-        allowed_derived = {
-            json.dumps(asdict(metric), sort_keys=True)
-            for parent in parents
-            for metric in parent.reward_program.derived_metrics
-        }
-        if any(
-            json.dumps(asdict(metric), sort_keys=True) not in allowed_derived
-            for metric in candidate.reward_program.derived_metrics
-        ):
+        if not candidate_derived <= allowed_derived:
             raise ValueError("Crossover introduced a derived metric not present in its parents")
+        if (
+            primary.reward_program == candidate.reward_program
+            or primary.reward_program.reward_scale != candidate.reward_program.reward_scale
+            or primary.reward_program.gamma != candidate.reward_program.gamma
+            or primary.ppo_config != candidate.ppo_config
+            or primary.opponent_mix != candidate.opponent_mix
+            or primary.parameter_constraint_coefficient != candidate.parameter_constraint_coefficient
+            or candidate.inheritance_mode != "policy"
+        ):
+            raise ValueError("Crossover may only recombine parent reward components with primary policy inheritance")
     if candidate.mutation_kind == "restart" and (
-        candidate.inheritance_mode != "base" or candidate.parameter_constraint_coefficient != 0
+        candidate.primary_parent_id is not None
+        or candidate.inheritance_mode != "base"
+        or candidate.parameter_constraint_coefficient != 0
     ):
         raise ValueError("Restart must use base inheritance with no parent parameter constraint")
+    if (
+        candidate.island == 3
+        and candidate.mutation_kind == "restart"
+        and primary.ppo_config != candidate.ppo_config
+        and primary.opponent_mix != candidate.opponent_mix
+    ):
+        raise ValueError("Island-3 restart may change PPO settings or opponent mix, not both")
 
 
 def summarize_diagnostic_events(metrics: Mapping[str, Any]) -> dict[str, object]:
@@ -1048,6 +1121,140 @@ def initial_candidate(*, island: int, seed: int) -> EvolutionCandidate:
     return EvolutionCandidate.from_proposal(proposal, generation=0, island=island, parent_ids=())
 
 
+def _replace_random_expression_leaf(expression: Mapping[str, Any], rng: random.Random) -> dict[str, Any]:
+    result = copy.deepcopy(dict(expression))
+    leaves: list[dict[str, Any]] = []
+
+    def visit(node: object) -> None:
+        if not isinstance(node, dict):
+            return
+        children = [value for value in node.values() if isinstance(value, dict) and "op" in value]
+        if not children:
+            leaves.append(node)
+            return
+        for child in children:
+            visit(child)
+
+    visit(result)
+    target = rng.choice(leaves or [result])
+    target.clear()
+    target.update({"op": "metric", "name": rng.choice(sorted(DIRECT_REWARD_METRIC_NAMES))})
+    return result
+
+
+def _mutate_large_structural_reward(parent: EvolutionCandidate, rng: random.Random) -> dict[str, Any] | None:
+    for attempt in range(_I03_STRUCTURAL_ATTEMPTS):
+        reward = copy.deepcopy(parent.reward_program.to_dict())
+        reward.update({"version": 2})
+        reward.setdefault("derived_metrics", [])
+        for _ in range(rng.randint(2, 4)):
+            index = rng.randrange(len(reward["components"]))
+            expression = reward["components"][index]["expression"]
+            operation = rng.choice(("wrap", "binary", "gate", "leaf"))
+            if operation == "wrap":
+                if expression.get("op") in _STRUCTURAL_WRAPPERS:
+                    reward["components"][index]["expression"] = expression["value"]
+                else:
+                    reward["components"][index]["expression"] = {
+                        "op": rng.choice(sorted(_STRUCTURAL_WRAPPERS)),
+                        "value": expression,
+                    }
+            elif operation == "binary":
+                reward["components"][index]["expression"] = {
+                    "op": rng.choice(sorted(_STRUCTURAL_BINARY_OPS)),
+                    "left": expression,
+                    "right": {"op": "metric", "name": rng.choice(sorted(DIRECT_REWARD_METRIC_NAMES))},
+                }
+            elif operation == "gate":
+                alternate = {"op": "metric", "name": rng.choice(sorted(DIRECT_REWARD_METRIC_NAMES))}
+                original_is_true = bool(rng.getrandbits(1))
+                reward["components"][index]["expression"] = {
+                    "op": "gate",
+                    "condition": {
+                        "op": "metric",
+                        "name": rng.choice(("night", "own_city_tiles_at_risk", "own_night_fuel_deficit")),
+                    },
+                    "when_true": expression if original_is_true else alternate,
+                    "when_false": alternate if original_is_true else expression,
+                }
+            else:
+                reward["components"][index]["expression"] = _replace_random_expression_leaf(expression, rng)
+        try:
+            program = RewardProgram.from_dict(reward)
+        except (KeyError, TypeError, ValueError):
+            continue
+        digest = hashlib.sha256(json.dumps(reward, sort_keys=True).encode()).hexdigest()[:16]
+        temporary = replace(parent, candidate_id=f"structural-{attempt}-{digest}", reward_program=program)
+        distance = approximate_ast_distance(parent, temporary)
+        if _I03_STRUCTURAL_DISTANCE_MIN <= distance <= _I03_STRUCTURAL_DISTANCE_MAX:
+            return reward
+    return None
+
+
+def _crossover_reward(
+    parent: EvolutionCandidate,
+    secondary_parents: tuple[EvolutionCandidate, ...],
+    rng: random.Random,
+) -> tuple[dict[str, Any], str] | None:
+    reward = copy.deepcopy(parent.reward_program.to_dict())
+    reward.update({"version": 2})
+    reward.setdefault("derived_metrics", [])
+    primary_components = {
+        json.dumps(component, sort_keys=True, separators=(",", ":")) for component in reward["components"]
+    }
+    options = [
+        (donor, copy.deepcopy(component))
+        for donor in secondary_parents
+        for component in donor.reward_program.to_dict()["components"]
+        if json.dumps(component, sort_keys=True, separators=(",", ":")) not in primary_components
+    ]
+    rng.shuffle(options)
+    for donor, component in options:
+        candidate_reward = copy.deepcopy(reward)
+        donor_reward = donor.reward_program.to_dict()
+        derived_name = component["expression"].get("name") if component["expression"].get("op") == "derived" else None
+        if derived_name is not None:
+            donor_metric = next(
+                (metric for metric in donor_reward.get("derived_metrics", ()) if metric["name"] == derived_name),
+                None,
+            )
+            existing_metric = next(
+                (metric for metric in candidate_reward["derived_metrics"] if metric["name"] == derived_name),
+                None,
+            )
+            if donor_metric is None or (existing_metric is not None and existing_metric != donor_metric):
+                continue
+            if existing_metric is None:
+                if len(candidate_reward["derived_metrics"]) >= 16:
+                    continue
+                candidate_reward["derived_metrics"].append(copy.deepcopy(donor_metric))
+        replacement_indices = [
+            index
+            for index, existing in enumerate(candidate_reward["components"])
+            if all(
+                other_index == index or other["name"] != component["name"]
+                for other_index, other in enumerate(candidate_reward["components"])
+            )
+        ]
+        if not replacement_indices:
+            continue
+        candidate_reward["components"][rng.choice(replacement_indices)] = component
+        try:
+            RewardProgram.from_dict(candidate_reward)
+        except (KeyError, TypeError, ValueError):
+            continue
+        return candidate_reward, donor.candidate_id
+    return None
+
+
+def _restart_reward(rng: random.Random) -> dict[str, Any]:
+    reward = default_reward_program().to_dict()
+    reward.update({"version": 2, "derived_metrics": []})
+    for component in reward["components"]:
+        component["weight"] *= rng.uniform(0.5, 2.0)
+    return reward
+
+
 def mutate_candidate(
     parent: EvolutionCandidate,
     *,
@@ -1064,6 +1271,7 @@ def mutate_candidate(
     ppo = asdict(parent.ppo_config)
     opponent = asdict(parent.opponent_mix)
     changed_paths: list[str] = []
+    selected_secondary_ids: list[str] = []
     kind = "parameter"
     inheritance = "policy_value"
     constraint = parent.parameter_constraint_coefficient if parent.parameter_constraint_coefficient > 0.0 else 0.05
@@ -1098,6 +1306,7 @@ def mutate_candidate(
         changed_paths.append(f"reward_program.components[{index}].expression")
     elif island == 2:
         inheritance = "policy"
+        constraint = parent.parameter_constraint_coefficient
         used = {
             component["expression"].get("name")
             for component in reward["components"]
@@ -1108,17 +1317,17 @@ def mutate_candidate(
             for index, component in enumerate(reward["components"])
             if component["expression"].get("op") == "metric"
         ]
-        available = sorted(DIRECT_REWARD_METRIC_NAMES - used)
-        if (
-            generation % 2 == 1
-            and existing_metric_indices
-            and len(reward["components"]) > 1
-            and (rng.random() < 0.35 or not available)
-        ):
+        component_names = {str(component["name"]) for component in reward["components"]}
+        available = sorted(
+            metric for metric in DIRECT_REWARD_METRIC_NAMES - used if f"feature_{metric}" not in component_names
+        )
+        can_delete = bool(existing_metric_indices) and len(reward["components"]) > 1
+        can_add = bool(available) and len(reward["components"]) < 16
+        if can_delete and (not can_add or rng.random() < 0.35):
             kind = "feature_existing"
             reward["components"].pop(rng.choice(existing_metric_indices))
             changed_paths.append("reward_program.components")
-        elif generation % 2 == 1 and available:
+        elif can_add:
             kind = "feature_existing"
             metric = rng.choice(available)
             magnitude = rng.uniform(0.1, 0.5)
@@ -1131,100 +1340,52 @@ def mutate_candidate(
             )
             changed_paths.append("reward_program.components")
         else:
-            kind = "feature_generated"
-            generated_names = {item["name"] for item in reward["derived_metrics"]}
-            removable = [
-                (index, component["expression"]["name"])
-                for index, component in enumerate(reward["components"])
-                if component["expression"].get("op") == "derived"
-                and component["expression"].get("name") in generated_names
-            ]
-            delete_generated = (
-                removable
-                and len(reward["components"]) > 1
-                and (rng.random() < 0.35 or len(reward["derived_metrics"]) >= 16)
-            )
-            if delete_generated:
-                component_index, derived_name = rng.choice(removable)
-                reward["components"].pop(component_index)
-                reward["derived_metrics"] = [item for item in reward["derived_metrics"] if item["name"] != derived_name]
-            else:
-                if len(reward["components"]) >= 16:
-                    replacement_index = rng.randrange(len(reward["components"]))
-                    reward["components"].pop(replacement_index)
-                selector = rng.choice(sorted(METRIC_SELECTORS))
-                name = f"generated_{generation}_{selector}_{seed & 0xFFFF:04x}"
-                reward["derived_metrics"].append({"name": name, "expression": {"op": "count", "selector": selector}})
-                reward["components"].append(
-                    {
-                        "name": name,
-                        "expression": {"op": "derived", "name": name},
-                        "weight": rng.uniform(0.1, 0.5),
-                    }
-                )
-            changed_paths.extend(("reward_program.derived_metrics", "reward_program.components"))
+            raise ValueError("Island-2 fallback cannot add or delete a direct metric component")
     else:
         inheritance = "policy"
         draw = rng.random()
         restart_threshold = 0.4 if stagnated else 0.2
         crossover_threshold = restart_threshold + (0.2 if stagnated else 0.3)
-        feature_threshold = crossover_threshold + 0.2
         if draw < restart_threshold:
             kind = "restart"
             inheritance = "base"
             constraint = 0.0
-            reward = default_reward_program().to_dict()
-            reward.update({"version": 2, "derived_metrics": []})
-            for component in reward["components"]:
-                component["weight"] *= rng.uniform(0.5, 2.0)
+            reward = _restart_reward(rng)
             changed_paths.append("reward_program")
         elif draw < crossover_threshold and secondary_parents:
             kind = "crossover"
-            donor = rng.choice(secondary_parents)
-            donor_reward = donor.reward_program.to_dict()
-            donor_options = [
-                component
-                for component in donor_reward["components"]
-                if component["expression"].get("op") != "derived"
-                or any(metric["name"] == component["expression"].get("name") for metric in reward["derived_metrics"])
-            ]
-            donor_component = rng.choice(donor_options or donor_reward["components"])
-            if donor_component["expression"].get("op") == "derived":
-                derived_name = donor_component["expression"]["name"]
-                if not any(metric["name"] == derived_name for metric in reward["derived_metrics"]):
-                    donor_metric = next(
-                        metric for metric in donor_reward["derived_metrics"] if metric["name"] == derived_name
-                    )
-                    if len(reward["derived_metrics"]) >= 16:
-                        reward["derived_metrics"].pop()
-                    reward["derived_metrics"].append(donor_metric)
-                    changed_paths.append("reward_program.derived_metrics")
-            reward["components"][rng.randrange(len(reward["components"]))] = donor_component
-            changed_paths.append("reward_program.components")
-        elif draw < feature_threshold:
-            kind = "feature_generated"
-            selector = rng.choice(sorted(METRIC_SELECTORS))
-            target = rng.choice(sorted(METRIC_SELECTORS))
-            name = f"diverse_{generation}_{selector}_{target}_{seed & 0xFFFF:04x}"
-            reward["derived_metrics"].append(
-                {"name": name, "expression": {"op": "distance", "source": selector, "target": target, "reduce": "min"}}
-            )
-            reward["components"].append(
-                {"name": name, "expression": {"op": "derived", "name": name}, "weight": rng.uniform(-1.0, 1.0)}
-            )
-            changed_paths.extend(("reward_program.derived_metrics", "reward_program.components"))
+            constraint = parent.parameter_constraint_coefficient
+            crossed = _crossover_reward(parent, secondary_parents, rng)
+            if crossed is not None:
+                reward, donor_id = crossed
+                selected_secondary_ids = [donor_id]
+                changed_paths.extend(("reward_program.derived_metrics", "reward_program.components"))
+            else:
+                kind = "structural"
+                constraint = (
+                    parent.parameter_constraint_coefficient if parent.parameter_constraint_coefficient > 0.0 else 0.05
+                )
+                reward = _mutate_large_structural_reward(parent, rng)
         else:
             kind = "structural"
-            for index in rng.sample(range(len(reward["components"])), k=min(2, len(reward["components"]))):
-                expression = reward["components"][index]["expression"]
-                if expression.get("op") in _STRUCTURAL_WRAPPERS:
-                    reward["components"][index]["expression"] = expression["value"]
+            reward = _mutate_large_structural_reward(parent, rng)
+        if kind == "structural":
+            if reward is None:
+                crossed = _crossover_reward(parent, secondary_parents, rng)
+                if crossed is not None:
+                    kind = "crossover"
+                    constraint = parent.parameter_constraint_coefficient
+                    reward, donor_id = crossed
+                    selected_secondary_ids = [donor_id]
+                    changed_paths.extend(("reward_program.derived_metrics", "reward_program.components"))
                 else:
-                    reward["components"][index]["expression"] = {
-                        "op": rng.choice(sorted(_STRUCTURAL_WRAPPERS)),
-                        "value": expression,
-                    }
-                changed_paths.append(f"reward_program.components[{index}].expression")
+                    kind = "restart"
+                    inheritance = "base"
+                    constraint = 0.0
+                    reward = _restart_reward(rng)
+                    changed_paths.append("reward_program")
+            else:
+                changed_paths.append("reward_program.components")
     if (
         constraint != parent.parameter_constraint_coefficient
         and "parameter_constraint_coefficient" not in changed_paths
@@ -1237,7 +1398,7 @@ def mutate_candidate(
         "opponent_mix": opponent,
         "mutation_kind": kind,
         "primary_parent_id": parent.candidate_id if kind != "restart" else None,
-        "secondary_parent_ids": [item.candidate_id for item in secondary_parents],
+        "secondary_parent_ids": selected_secondary_ids,
         "inheritance_mode": inheritance,
         "mutation_manifest": {
             "changed_paths": changed_paths,
