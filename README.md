@@ -520,6 +520,17 @@ Download and SHA-256 verify the upstream MIT-licensed checkpoint, then cache log
 ```bash
 uv run python examples/download_first_place_teacher.py
 
+# Optional: add 100 full teacher-vs-teacher games at seeds 10000..10099.
+# The checkpoint is loaded once and shared by both sides; auto enables the
+# first-place 180-degree rotation ensemble. Re-running skips completed seeds.
+uv run --locked python examples/generate_first_place_selfplay.py \
+  --teacher-checkpoint models/teachers/lux_2021_first_place/062179520_weights.pt \
+  --output-dir replay_datasets/first_place_selfplay \
+  --games 100 \
+  --seed-start 10000 \
+  --device cuda \
+  --tta auto
+
 uv run python examples/precompute_first_place_targets.py \
   --replay-dir replay_datasets \
   --teacher-checkpoint models/teachers/lux_2021_first_place/062179520_weights.pt \
@@ -569,6 +580,37 @@ synchronize once per epoch instead of once per batch. Distilled checkpoints reco
 `inference_augmentation=rot180`, so local play enables the batched
 two-view ensemble automatically. Override it for latency comparisons with `--tta-a none` or `--tta-b none`:
 
+Distillation uses validation-driven learning-rate decay by default. It keeps the current rate until validation loss
+fails to improve by at least `0.002` for three validations, then multiplies it by `0.5`, down to `5e-6`. Scheduler
+state and the learning rate used by each epoch are saved in checkpoints and `metrics.json`. Resume
+`resattn8_v2` for ten more epochs while preserving its teacher-only objective and current `1e-4` rate with:
+
+```bash
+uv run --locked python examples/train_distilled_bc.py \
+  --encoder-type resattn8 \
+  --replay-dir replay_datasets \
+  --teacher-cache-dir models/teachers/lux_2021_first_place/cache \
+  --prepared-cache-dir models/teachers/lux_2021_first_place/prepared \
+  --output-dir models/distilled/resattn8_v2 \
+  --resume models/distilled/resattn8_v2/best.pt \
+  --epochs 30 \
+  --batch-size 64 \
+  --num-workers 8 \
+  --prefetch-factor 1 \
+  --distill-weight 1.0 \
+  --hard-label-weight 0.0 \
+  --lr-scheduler plateau \
+  --lr-decay-factor 0.5 \
+  --lr-patience 2 \
+  --lr-threshold 0.002 \
+  --min-learning-rate 0.000005 \
+  --amp-dtype bfloat16 \
+  --device cuda
+```
+
+On resume, omitting `--learning-rate` preserves the checkpoint rate and scheduler progress. Supplying it explicitly
+starts the resumed optimizer from that rate. Use `--lr-scheduler none` only for a fixed-rate comparison.
+
 ```bash
 uv run python main.py \
   --model-a models/distilled/resattn8/best.pt \
@@ -599,6 +641,15 @@ Non-restart candidates inherit the primary parent's policy checkpoint; only `i00
 Value-head resets run a critic-only warm-up before PPO, and inherited tensors use a relative L2-SP constraint with
 cosine decay. The illegal-action auxiliary loss acts on unmasked logits while sampling still uses the hard mask.
 Generated metrics are bounded JSON DSL expressions rather than Python code.
+
+The Metric DSL also exposes phase-aware and local survival signals: normalized turns until night/night turns
+remaining, minimum per-city survival, at-risk city-tile fraction, next-night fuel deficit, nearby cargo coverage,
+cumulative night city loss, worker resource access/cargo fullness, unit-capacity utilization, and coal/uranium
+unlock state. Selectors include at-risk/safe city tiles, fuel-carrying/full/actionable workers, and resources the
+team can currently harvest. Cumulative loss metrics are intentional: potential differencing avoids the large
+opposite-sign reward that a one-turn event pulse would produce when it resets to zero. Exact action-history signals
+such as oscillation are not exposed until they can distinguish deliberate cooldown waits from genuine repeated-action
+failure.
 
 First verify the 24-candidate schedule without training:
 

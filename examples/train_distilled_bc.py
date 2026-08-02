@@ -42,6 +42,7 @@ DEFAULT_STUDENTS = {
     "axial32": "models/bc_encoder_compare/axial32/best.pt",
     "axial32_4m5": None,
 }
+DEFAULT_LEARNING_RATE = 1e-4
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,7 +58,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prepared-observation-dtype", choices=("float16", "float32"), default="float16")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        help=(
+            "Initial learning rate. Fresh runs default to 1e-4; resumed runs preserve the checkpoint rate "
+            "unless this option is specified."
+        ),
+    )
+    parser.add_argument("--lr-scheduler", choices=("none", "plateau"), default="plateau")
+    parser.add_argument("--lr-decay-factor", type=float, default=0.5)
+    parser.add_argument("--lr-patience", type=int, default=2)
+    parser.add_argument("--lr-threshold", type=float, default=2e-3)
+    parser.add_argument("--min-learning-rate", type=float, default=5e-6)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--temperature", type=float, default=2.0)
     parser.add_argument("--distill-weight", type=float, default=0.75)
@@ -74,6 +87,60 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-turns", type=int, default=0)
     parser.add_argument("--no-progress", action="store_true")
     return parser.parse_args()
+
+
+def make_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    scheduler_name: str,
+    *,
+    factor: float,
+    patience: int,
+    threshold: float,
+    min_learning_rate: float,
+) -> torch.optim.lr_scheduler.ReduceLROnPlateau | None:
+    if scheduler_name == "none":
+        return None
+    if scheduler_name != "plateau":
+        message = f"Unsupported learning-rate scheduler: {scheduler_name}"
+        raise ValueError(message)
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=factor,
+        patience=patience,
+        threshold=threshold,
+        threshold_mode="abs",
+        cooldown=0,
+        min_lr=min_learning_rate,
+    )
+
+
+def restore_lr_scheduler(
+    scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None,
+    checkpoint: Mapping[str, object] | None,
+    best_validation_loss: float | None = None,
+) -> None:
+    if scheduler is None or checkpoint is None:
+        return
+    state = checkpoint.get("lr_scheduler_state")
+    if isinstance(state, dict):
+        scheduler.load_state_dict(state)
+        return
+    if best_validation_loss is not None:
+        scheduler.step(best_validation_loss)
+        return
+    validation = checkpoint.get("metrics", {}).get("validation", {})
+    if "loss" in validation:
+        scheduler.step(float(validation["loss"]))
+
+
+def load_existing_history(path: Path, start_epoch: int, model_config: ModelConfig) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+    summary = json.loads(path.read_text(encoding="utf-8"))
+    if summary.get("model_config") != asdict(model_config):
+        return []
+    return [item for item in summary.get("history", []) if int(item["epoch"]) < start_epoch]
 
 
 def move_batch(batch: Mapping[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
@@ -218,6 +285,9 @@ def make_loader(
 
 def main() -> None:
     args = parse_args()
+    learning_rate_was_explicit = args.learning_rate is not None
+    if args.learning_rate is None:
+        args.learning_rate = DEFAULT_LEARNING_RATE
     if args.batch_size < 1 or args.gradient_accumulation_steps < 1:
         raise ValueError("Batch size and gradient accumulation must be positive")
     if args.temperature <= 0:
@@ -226,6 +296,14 @@ def main() -> None:
         raise ValueError("Loss weights must be non-negative")
     if args.distill_weight + args.hard_label_weight <= 0:
         raise ValueError("At least one loss weight must be positive")
+    if args.learning_rate <= 0 or args.min_learning_rate <= 0:
+        raise ValueError("Learning rates must be positive")
+    if args.min_learning_rate > args.learning_rate:
+        raise ValueError("--min-learning-rate cannot exceed --learning-rate")
+    if not 0 < args.lr_decay_factor < 1:
+        raise ValueError("--lr-decay-factor must be between 0 and 1")
+    if args.lr_patience < 0 or args.lr_threshold < 0:
+        raise ValueError("LR patience and threshold must be non-negative")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     device_name = "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
@@ -322,11 +400,38 @@ def main() -> None:
     )
     if checkpoint is not None and checkpoint.get("optimizer") is not None:
         optimizer.load_state_dict(checkpoint["optimizer"])
+        if learning_rate_was_explicit:
+            for group in optimizer.param_groups:
+                group["lr"] = args.learning_rate
+                group["initial_lr"] = args.learning_rate
+        else:
+            args.learning_rate = float(optimizer.param_groups[0]["lr"])
+    scheduler = make_lr_scheduler(
+        optimizer,
+        args.lr_scheduler,
+        factor=args.lr_decay_factor,
+        patience=args.lr_patience,
+        threshold=args.lr_threshold,
+        min_learning_rate=args.min_learning_rate,
+    )
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda" and amp_dtype == torch.float16)
     if checkpoint is not None and checkpoint.get("scaler") is not None and scaler.is_enabled():
         scaler.load_state_dict(checkpoint["scaler"])
-    best_loss = float(checkpoint["metrics"]["validation"]["loss"]) if checkpoint else float("inf")
-    history = []
+    metrics_path = output_dir / "metrics.json"
+    history = load_existing_history(metrics_path, start_epoch, model.config) if checkpoint else []
+    validation_losses = [float(item["validation"]["loss"]) for item in history]
+    if checkpoint:
+        validation_losses.append(float(checkpoint["metrics"]["validation"]["loss"]))
+    best_loss = min(validation_losses, default=float("inf"))
+    restore_lr_scheduler(scheduler, checkpoint, None if not validation_losses else best_loss)
+    scheduler_config = {
+        "name": args.lr_scheduler,
+        "factor": args.lr_decay_factor,
+        "patience": args.lr_patience,
+        "threshold": args.lr_threshold,
+        "threshold_mode": "abs",
+        "min_learning_rate": args.min_learning_rate,
+    }
     extra_metadata = {
         "teacher_sha256": FIRST_PLACE_TEACHER_SHA256,
         "source_student_checkpoint": source_checkpoint,
@@ -336,6 +441,7 @@ def main() -> None:
             "distill_weight": args.distill_weight,
             "hard_label_weight": args.hard_label_weight,
         },
+        "lr_scheduler_config": scheduler_config,
     }
     epochs = tqdm(
         range(start_epoch, args.epochs),
@@ -345,6 +451,7 @@ def main() -> None:
         dynamic_ncols=True,
     )
     for epoch in epochs:
+        epoch_learning_rate = float(optimizer.param_groups[0]["lr"])
         train = run_epoch(
             model,
             loaders["train"],
@@ -372,8 +479,21 @@ def main() -> None:
                 description=f"Validation {epoch + 1}/{args.epochs}",
                 show_progress=not args.no_progress,
             )
-        metrics = {"epoch": epoch, "train": train, "validation": validation}
+        if scheduler is not None:
+            scheduler.step(validation["loss"])
+        next_learning_rate = float(optimizer.param_groups[0]["lr"])
+        metrics = {
+            "epoch": epoch,
+            "learning_rate": epoch_learning_rate,
+            "next_learning_rate": next_learning_rate,
+            "train": train,
+            "validation": validation,
+        }
         history.append(metrics)
+        checkpoint_metadata = {
+            **extra_metadata,
+            "lr_scheduler_state": None if scheduler is None else scheduler.state_dict(),
+        }
         save_bc_checkpoint(
             output_dir / "latest.pt",
             model,
@@ -382,7 +502,7 @@ def main() -> None:
             metrics,
             split,
             scaler=scaler,
-            extra_metadata=extra_metadata,
+            extra_metadata=checkpoint_metadata,
         )
         if validation["loss"] < best_loss:
             best_loss = validation["loss"]
@@ -394,7 +514,7 @@ def main() -> None:
                 metrics,
                 split,
                 scaler=scaler,
-                extra_metadata=extra_metadata,
+                extra_metadata=checkpoint_metadata,
             )
         print(json.dumps(metrics, sort_keys=True))
         epochs.set_postfix(train=f"{train['loss']:.4f}", validation=f"{validation['loss']:.4f}")
@@ -423,7 +543,7 @@ def main() -> None:
         "test": test,
         **extra_metadata,
     }
-    (output_dir / "metrics.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    metrics_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps({"test": test}, sort_keys=True))
 
 

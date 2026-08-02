@@ -16,6 +16,8 @@ METRIC_NAMES = frozenset(
         "turn",
         "night",
         "cycle",
+        "turns_until_night",
+        "night_turns_remaining",
         "city_tiles",
         "units",
         "workers",
@@ -27,8 +29,35 @@ METRIC_NAMES = frozenset(
         "collected_fuel",
         "fuel_generated",
         "city_tiles_built",
+        "min_city_survival",
+        "city_tiles_at_risk",
+        "night_fuel_deficit",
+        "fuel_delivery_coverage",
+        "city_tile_loss",
+        "night_fuel_shortage",
+        "worker_resource_access",
+        "worker_cargo_fullness",
+        "unit_capacity_utilization",
+        "coal_unlocked",
+        "uranium_unlocked",
+        "own_min_city_survival",
+        "own_city_tiles_at_risk",
+        "own_night_fuel_deficit",
+        "own_fuel_delivery_coverage",
+        "own_city_tiles_lost",
+        "own_night_fuel_shortage",
     }
 )
+GATING_METRIC_NAMES = frozenset({"turn", "night", "cycle", "turns_until_night", "night_turns_remaining"})
+LOWER_IS_BETTER_METRIC_NAMES = frozenset(
+    {
+        "own_city_tiles_at_risk",
+        "own_night_fuel_deficit",
+        "own_city_tiles_lost",
+        "own_night_fuel_shortage",
+    }
+)
+DIRECT_REWARD_METRIC_NAMES = METRIC_NAMES - GATING_METRIC_NAMES
 METRIC_SELECTORS = frozenset(
     {
         "own_units",
@@ -43,6 +72,18 @@ METRIC_SELECTORS = frozenset(
         "coal_tiles",
         "uranium_tiles",
         "resource_tiles",
+        "own_at_risk_city_tiles",
+        "opponent_at_risk_city_tiles",
+        "own_safe_city_tiles",
+        "opponent_safe_city_tiles",
+        "own_fuel_carrying_workers",
+        "opponent_fuel_carrying_workers",
+        "own_full_workers",
+        "opponent_full_workers",
+        "own_actionable_workers",
+        "opponent_actionable_workers",
+        "own_harvestable_resource_tiles",
+        "opponent_harvestable_resource_tiles",
     }
 )
 METRIC_SUM_NAMES = frozenset(
@@ -56,6 +97,14 @@ METRIC_SUM_NAMES = frozenset(
         "wood_amount",
         "coal_amount",
         "uranium_amount",
+        "own_night_fuel_required",
+        "opponent_night_fuel_required",
+        "own_night_fuel_deficit",
+        "opponent_night_fuel_deficit",
+        "own_at_risk_delivery_fuel",
+        "opponent_at_risk_delivery_fuel",
+        "own_city_tiles_lost",
+        "opponent_city_tiles_lost",
     }
 )
 _UNARY_OPS = frozenset({"abs", "neg", "tanh", "exp_decay", "log1p_abs", "square"})

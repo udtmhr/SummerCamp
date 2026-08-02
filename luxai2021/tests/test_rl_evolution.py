@@ -40,10 +40,17 @@ from luxai2021.rl.evolution import (
     validate_candidate_mutation,
 )
 from luxai2021.rl.job_api import JobApiClient, JobApiServer
-from luxai2021.rl.metrics import GameMetrics, MetricContext
+from luxai2021.rl.metrics import GameMetrics, MetricContext, metrics_from_game
 from luxai2021.rl.policy import FullTurnActorCritic, RolloutAgent
 from luxai2021.rl.ppo import PPOConfig, PPOTrainer, collect_episode, collect_episodes_batched, warmup_value_head
-from luxai2021.rl.reward import RewardProgram, calibrate_reward_scale, default_reward_program
+from luxai2021.rl.reward import (
+    DIRECT_REWARD_METRIC_NAMES,
+    GATING_METRIC_NAMES,
+    LOWER_IS_BETTER_METRIC_NAMES,
+    RewardProgram,
+    calibrate_reward_scale,
+    default_reward_program,
+)
 
 
 def _small_policy():
@@ -64,6 +71,8 @@ def _metrics(**updates):
         "turn": 0.0,
         "night": 0.0,
         "cycle": 0.0,
+        "turns_until_night": 0.0,
+        "night_turns_remaining": 0.0,
         "city_tiles": 0.0,
         "units": 0.0,
         "workers": 0.0,
@@ -75,6 +84,23 @@ def _metrics(**updates):
         "collected_fuel": 0.0,
         "fuel_generated": 0.0,
         "city_tiles_built": 0.0,
+        "min_city_survival": 0.0,
+        "city_tiles_at_risk": 0.0,
+        "night_fuel_deficit": 0.0,
+        "fuel_delivery_coverage": 0.0,
+        "city_tile_loss": 0.0,
+        "night_fuel_shortage": 0.0,
+        "worker_resource_access": 0.0,
+        "worker_cargo_fullness": 0.0,
+        "unit_capacity_utilization": 0.0,
+        "coal_unlocked": 0.0,
+        "uranium_unlocked": 0.0,
+        "own_min_city_survival": 0.0,
+        "own_city_tiles_at_risk": 0.0,
+        "own_night_fuel_deficit": 0.0,
+        "own_fuel_delivery_coverage": 0.0,
+        "own_city_tiles_lost": 0.0,
+        "own_night_fuel_shortage": 0.0,
     }
     values.update(updates)
     return GameMetrics(0, values)
@@ -152,6 +178,101 @@ def test_metric_dsl_evaluates_bounded_board_queries():
     assert values["distance"] == pytest.approx(1.0)
 
 
+def test_metric_dsl_exposes_phase_local_city_risk_and_delivery():
+    game = Game({"seed": 13})
+    own_city = next(city for city in game.cities.values() if city.team == 0)
+    opponent_city = next(city for city in game.cities.values() if city.team == 1)
+    own_upkeep = float(own_city.get_light_upkeep())
+    opponent_upkeep = float(opponent_city.get_light_upkeep())
+    own_city.fuel = own_upkeep * 10.0 - 10.0
+    opponent_city.fuel = opponent_upkeep * 10.0 + 10.0
+    own_worker = next(iter(game.state["teamStates"][0]["units"].values()))
+    own_worker.cargo["wood"] = 20
+    game.state["turn"] = 29
+
+    metrics = metrics_from_game(game, 0)
+
+    assert metrics.get("turns_until_night") == pytest.approx(1.0 / 30.0)
+    assert metrics.get("night_turns_remaining") == 0.0
+    assert metrics.get("own_city_tiles_at_risk") == 1.0
+    assert metrics.get("city_tiles_at_risk") == -1.0
+    assert 0.0 < metrics.get("own_night_fuel_deficit") < 1.0
+    assert 0.0 <= metrics.get("own_fuel_delivery_coverage") <= 1.0
+    assert metrics.context is not None
+    assert metrics.context.positions["own_at_risk_city_tiles"]
+    assert metrics.context.positions["own_fuel_carrying_workers"]
+    assert metrics.context.sums["own_night_fuel_required"] == pytest.approx(own_upkeep * 10.0)
+    assert metrics.context.sums["own_night_fuel_deficit"] == pytest.approx(10.0)
+    program = RewardProgram.from_dict(
+        {
+            "version": 2,
+            "derived_metrics": [
+                {
+                    "name": "delivery_distance",
+                    "expression": {
+                        "op": "distance",
+                        "source": "own_fuel_carrying_workers",
+                        "target": "own_at_risk_city_tiles",
+                        "reduce": "min",
+                    },
+                }
+            ],
+            "components": [
+                {
+                    "name": "delivery_distance",
+                    "expression": {"op": "derived", "name": "delivery_distance"},
+                    "weight": -1.0,
+                },
+                {
+                    "name": "raw_deficit",
+                    "expression": {"op": "sum", "name": "own_night_fuel_deficit"},
+                    "weight": -0.5,
+                },
+            ],
+            "reward_scale": 0.2,
+            "gamma": 0.995,
+        }
+    )
+    potential, components = program.potential(metrics)
+    assert -1.0 <= potential <= 1.0
+    assert set(components) == {"delivery_distance", "raw_deficit"}
+
+
+def test_city_loss_metric_is_cumulative_for_potential_difference_reward():
+    game = Game({"seed": 13})
+    own_city = next(city for city in game.cities.values() if city.team == 0)
+    opponent_city = next(city for city in game.cities.values() if city.team == 1)
+    own_city.fuel = 0.0
+    opponent_city.fuel = float(opponent_city.get_light_upkeep()) * 10.0
+    game.state["turn"] = 30
+    before = metrics_from_game(game, 0)
+
+    game.handle_night()
+    after = metrics_from_game(game, 0)
+
+    assert before.get("own_city_tiles_lost") == 0.0
+    assert after.get("own_city_tiles_lost") > 0.0
+    assert after.get("own_night_fuel_shortage") > 0.0
+    assert after.get("city_tile_loss") < 0.0
+    program = RewardProgram.from_dict(
+        {
+            "version": 2,
+            "derived_metrics": [],
+            "components": [
+                {
+                    "name": "avoid_city_loss",
+                    "expression": {"op": "metric", "name": "own_city_tiles_lost"},
+                    "weight": -1.0,
+                }
+            ],
+            "reward_scale": 0.2,
+            "gamma": 1.0,
+        }
+    )
+    assert program.reward(before, after).shaping < 0.0
+    assert program.reward(after, after).shaping == pytest.approx(0.0)
+
+
 def test_sparse_component_is_not_used_for_inverse_rms_calibration():
     parent = default_reward_program()
     value = parent.to_dict()
@@ -219,6 +340,24 @@ def test_parameter_mutation_keeps_ast_shape_and_validates_island_contract():
     assert approximate_ast_distance(parent, child) <= 0.2
 
 
+def test_existing_feature_mutation_uses_safe_phase_and_risk_signs():
+    parent = initial_candidate(island=2, seed=12)
+    additions = 0
+    for seed in range(100):
+        child = mutate_candidate(parent, generation=1, island=2, seed=seed)
+        added = [component for component in child.reward_program.components if component.name.startswith("feature_")]
+        for component in added:
+            additions += 1
+            metric = str(component.expression["name"])
+            assert metric in DIRECT_REWARD_METRIC_NAMES
+            assert metric not in GATING_METRIC_NAMES
+            if metric in LOWER_IS_BETTER_METRIC_NAMES:
+                assert component.weight < 0.0
+            else:
+                assert component.weight > 0.0
+    assert additions > 0
+
+
 def test_codex_proposal_schema_uses_supported_structured_output_constructs():
     schema = proposal_schema()
 
@@ -235,6 +374,9 @@ def test_codex_proposal_schema_uses_supported_structured_output_constructs():
 
     visit(schema)
     assert schema["properties"]["reward_program"]["properties"]["version"]["type"] == "integer"
+    encoded = json.dumps(schema)
+    assert "own_at_risk_city_tiles" in encoded
+    assert "own_night_fuel_deficit" in encoded
 
 
 def test_candidate_content_hash_detects_manual_edit():

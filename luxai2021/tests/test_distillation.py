@@ -1,12 +1,14 @@
 # ruff: noqa: ANN001, ANN201, ANN202, ANN204, PLR2004, S101, SLF001
 
+import json
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
-from examples.train_distilled_bc import make_loader
+from examples.train_distilled_bc import load_existing_history, make_loader, make_lr_scheduler, restore_lr_scheduler
 from luxai2021.imitation.actions import (
     FIRST_PLACE_ACTION_SCHEMA,
     FIRST_PLACE_CART_ACTIONS,
@@ -77,6 +79,64 @@ def _small_flat_config(encoder_type):
         resattn8_layers=1,
         policy_schema=POLICY_SCHEMA_FIRST_PLACE_FLAT,
     )
+
+
+def test_plateau_scheduler_waits_for_three_non_improving_epochs():
+    parameter = torch.nn.Parameter(torch.ones(()))
+    optimizer = torch.optim.AdamW([parameter], lr=1e-4)
+    scheduler = make_lr_scheduler(
+        optimizer,
+        "plateau",
+        factor=0.5,
+        patience=2,
+        threshold=2e-3,
+        min_learning_rate=5e-6,
+    )
+    assert scheduler is not None
+
+    for validation_loss in (0.268, 0.267, 0.268):
+        scheduler.step(validation_loss)
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(1e-4)
+    scheduler.step(0.269)
+
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(5e-5)
+
+
+def test_old_checkpoint_validation_seeds_plateau_scheduler():
+    parameter = torch.nn.Parameter(torch.ones(()))
+    optimizer = torch.optim.AdamW([parameter], lr=1e-4)
+    scheduler = make_lr_scheduler(
+        optimizer,
+        "plateau",
+        factor=0.5,
+        patience=2,
+        threshold=2e-3,
+        min_learning_rate=5e-6,
+    )
+
+    restore_lr_scheduler(scheduler, {"metrics": {"validation": {"loss": 0.2684}}})
+
+    assert scheduler is not None
+    assert scheduler.best == pytest.approx(0.2684)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1e-4)
+
+
+def test_existing_metrics_history_is_preserved_before_resume_epoch(tmp_path):
+    config = _small_flat_config("resattn8")
+    metrics_path = tmp_path / "metrics.json"
+    metrics_path.write_text(
+        json.dumps(
+            {
+                "model_config": asdict(config),
+                "history": [{"epoch": epoch} for epoch in (17, 18, 19, 20)],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    history = load_existing_history(metrics_path, 20, config)
+
+    assert [item["epoch"] for item in history] == [17, 18, 19]
 
 
 def test_first_place_flat_action_order_and_rotation():

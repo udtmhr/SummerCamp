@@ -14,7 +14,15 @@ from pathlib import Path
 from typing import Any
 
 from luxai2021.rl.ppo import PPOConfig
-from luxai2021.rl.reward import METRIC_NAMES, METRIC_SELECTORS, METRIC_SUM_NAMES, RewardProgram, default_reward_program
+from luxai2021.rl.reward import (
+    DIRECT_REWARD_METRIC_NAMES,
+    LOWER_IS_BETTER_METRIC_NAMES,
+    METRIC_NAMES,
+    METRIC_SELECTORS,
+    METRIC_SUM_NAMES,
+    RewardProgram,
+    default_reward_program,
+)
 
 EVOLUTION_SCHEMA_VERSION = 2
 LEGACY_EVOLUTION_SCHEMA_VERSION = 1
@@ -567,6 +575,11 @@ Hard constraints:
   existing illegal-action mask; runtime masks may only become stricter.
 - Use the reported city-loss/night-fuel turns and parent deltas to explain the proposed change.
 - Emit reward_program version 2. Derived metrics must use only the safe Metric DSL in the schema.
+- turn/night/cycle/turns_until_night/night_turns_remaining describe phase and should be used as gate conditions,
+  not standalone objectives. Relative city-risk/loss/deficit metrics are oriented so larger is better. Absolute
+  own_city_tiles_at_risk, own_night_fuel_deficit, own_city_tiles_lost, and own_night_fuel_shortage are lower-is-better.
+- min_city_survival is the minimum over individual cities, while city_survival uses aggregate team fuel. Prefer the
+  minimum/risk/deficit signals when feedback reports a local night-fuel collapse despite adequate total fuel.
 - On island 2, odd generations use existing whitelist metrics and even generations use generated Metric DSL.
 - A restart sets primary_parent_id to null, inheritance_mode to base, and parameter_constraint_coefficient to 0.
 - mutation_kind, parent provenance, inheritance_mode, and changed_paths must truthfully describe the proposal.
@@ -1095,7 +1108,7 @@ def mutate_candidate(
             for index, component in enumerate(reward["components"])
             if component["expression"].get("op") == "metric"
         ]
-        available = sorted(METRIC_NAMES - used)
+        available = sorted(DIRECT_REWARD_METRIC_NAMES - used)
         if (
             generation % 2 == 1
             and existing_metric_indices
@@ -1108,11 +1121,12 @@ def mutate_candidate(
         elif generation % 2 == 1 and available:
             kind = "feature_existing"
             metric = rng.choice(available)
+            magnitude = rng.uniform(0.1, 0.5)
             reward["components"].append(
                 {
                     "name": f"feature_{metric}",
                     "expression": {"op": "metric", "name": metric},
-                    "weight": rng.uniform(0.1, 0.5),
+                    "weight": -magnitude if metric in LOWER_IS_BETTER_METRIC_NAMES else magnitude,
                 }
             )
             changed_paths.append("reward_program.components")
