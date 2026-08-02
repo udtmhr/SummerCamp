@@ -5,12 +5,20 @@ import copy
 import json
 import threading
 from collections import Counter
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
-from examples.evolve_rl import _sync_api_claim
+from examples.evolve_rl import (
+    _active_base_names,
+    _apply_coordinator_manifest,
+    _checkpoint_pair,
+    _evaluation_anchors,
+    _sync_api_claim,
+)
 from luxai2021.env.agent import Agent
 from luxai2021.game.actions import MoveAction
 from luxai2021.game.game import Game
@@ -1278,3 +1286,29 @@ def test_api_claim_preserves_completed_local_result_for_retry_upload(tmp_path):
     _sync_api_claim(store, claim)
 
     assert store.results() == [completed]
+
+
+def test_resattn8_only_removes_all_unet_runtime_inputs():
+    args = SimpleNamespace(
+        resattn8_only=True,
+        unet_checkpoint="models/unet.pt",
+        resattn8_checkpoint="models/resattn8.pt",
+        teacher_checkpoint="models/teacher.pt",
+    )
+
+    assert _active_base_names(args) == ("resattn8",)
+    assert [anchor.name for anchor in _evaluation_anchors(args)] == ["resattn8-base", "first-place"]
+    assert _checkpoint_pair(args, "resattn8") == (
+        Path("models/resattn8.pt"),
+        Path("models/resattn8.pt"),
+    )
+    with pytest.raises(ValueError, match="disabled"):
+        _checkpoint_pair(args, "unet")
+
+
+def test_worker_inherits_resattn8_only_from_coordinator_manifest():
+    worker_args = SimpleNamespace(resattn8_only=False)
+
+    _apply_coordinator_manifest(worker_args, {"arguments": {"resattn8_only": True}})
+
+    assert worker_args.resattn8_only is True

@@ -121,6 +121,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--job-heartbeat-seconds", type=float, default=600.0)
     parser.add_argument("--critic-warmup-episodes", type=int, default=8)
     parser.add_argument("--unet-probe-every", type=int, default=2)
+    parser.add_argument(
+        "--resattn8-only",
+        action="store_true",
+        help="Disable all UNet training, probing, opponents, and final evaluation.",
+    )
     return parser.parse_args()
 
 
@@ -131,6 +136,34 @@ def resolve_device(value: str) -> torch.device:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
     return device
+
+
+def _active_base_names(args: argparse.Namespace) -> tuple[str, ...]:
+    return ("resattn8",) if getattr(args, "resattn8_only", False) else ("unet", "resattn8")
+
+
+def _evaluation_anchors(args: argparse.Namespace) -> list[LeagueMember]:
+    anchors = []
+    if not getattr(args, "resattn8_only", False):
+        anchors.append(LeagueMember("unet-base", Path(args.unet_checkpoint)))
+    anchors.extend(
+        [
+            LeagueMember("resattn8-base", Path(args.resattn8_checkpoint)),
+            LeagueMember("first-place", Path(args.teacher_checkpoint), "first-place"),
+        ]
+    )
+    return anchors
+
+
+def _checkpoint_pair(args: argparse.Namespace, base_name: str) -> tuple[Path, Path]:
+    if base_name not in _active_base_names(args):
+        message = f"Architecture {base_name!r} is disabled for this run"
+        raise ValueError(message)
+    resattn8_checkpoint = Path(args.resattn8_checkpoint)
+    if base_name == "resattn8":
+        other = resattn8_checkpoint if args.resattn8_only else Path(args.unet_checkpoint)
+        return resattn8_checkpoint, other
+    return Path(args.unet_checkpoint), resattn8_checkpoint
 
 
 def git_revision(repository: Path) -> str:
@@ -722,11 +755,7 @@ def candidate_result(
             resume_budget_progress=resume_from == current_checkpoint,
             checkpoint_callback=checkpoint_callback,
         )
-        anchors = [
-            LeagueMember("unet-base", Path(args.unet_checkpoint)),
-            LeagueMember("resattn8-base", Path(args.resattn8_checkpoint)),
-            LeagueMember("first-place", Path(args.teacher_checkpoint), "first-place"),
-        ]
+        anchors = _evaluation_anchors(args)
         evaluation = evaluate_against_league(
             LeagueMember(f"{candidate.candidate_id}-{base_name}", checkpoint),
             anchors,
@@ -809,11 +838,7 @@ def execute_evolution_job(
     )
     if existing is not None:
         return existing
-    checkpoints = {
-        "unet": (Path(args.unet_checkpoint), Path(args.resattn8_checkpoint)),
-        "resattn8": (Path(args.resattn8_checkpoint), Path(args.unet_checkpoint)),
-    }
-    base_checkpoint, other_checkpoint = checkpoints[job.base_name]
+    base_checkpoint, other_checkpoint = _checkpoint_pair(args, job.base_name)
     decision_budget = job.decision_budget
     if decision_budget is None:
         if job.seconds <= 0:
@@ -859,6 +884,7 @@ def _apply_coordinator_manifest(args: argparse.Namespace, manifest: Mapping[str,
         "recover_stale_job_seconds",
         "critic_warmup_episodes",
         "unet_probe_every",
+        "resattn8_only",
     ):
         if name in coordinator_args:
             setattr(args, name, coordinator_args[name])
@@ -1195,7 +1221,7 @@ def main() -> None:
         "arguments": vars(args),
         "device": str(device),
         "codex_available": shutil.which(args.codex_executable) is not None,
-        "bases": {"unet": args.unet_checkpoint, "resattn8": args.resattn8_checkpoint},
+        "bases": {name: getattr(args, f"{name}_checkpoint") for name in _active_base_names(args)},
     }
     store.save_manifest(manifest)
     generator = None
@@ -1410,7 +1436,7 @@ def main() -> None:
                 register(child)
             wave.append(short_job(child))
         evaluate_jobs(wave)
-        if args.unet_probe_every > 0 and generation % args.unet_probe_every == 0:
+        if not args.resattn8_only and args.unet_probe_every > 0 and generation % args.unet_probe_every == 0:
             refreshed_elites = select_elites(candidates, results, count=1)
             if refreshed_elites:
                 probe = refreshed_elites[0]
@@ -1460,24 +1486,15 @@ def main() -> None:
             args.final_decisions,
         )
         for candidate in finalists
-        for base_name in ("unet", "resattn8")
+        for base_name in _active_base_names(args)
     ]
     evaluate_jobs(final_jobs)
-    anchors = [
-        LeagueMember("unet-base", Path(args.unet_checkpoint)),
-        LeagueMember("resattn8-base", Path(args.resattn8_checkpoint)),
-        LeagueMember("first-place", Path(args.teacher_checkpoint), "first-place"),
-    ]
+    anchors = _evaluation_anchors(args)
     baseline_dir = run_dir / "baselines"
     baseline_dir.mkdir(exist_ok=True)
     baseline_evaluations = {}
     for base_name, checkpoint in (
-        (
-            ("unet", Path(args.unet_checkpoint)),
-            ("resattn8", Path(args.resattn8_checkpoint)),
-        )
-        if finalists
-        else ()
+        ((name, Path(getattr(args, f"{name}_checkpoint"))) for name in _active_base_names(args)) if finalists else ()
     ):
         baseline_path = baseline_dir / f"final-{base_name}.json"
         if baseline_path.exists():

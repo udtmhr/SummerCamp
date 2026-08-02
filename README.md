@@ -671,16 +671,18 @@ Then launch the default staged run on one GPU:
 ```bash
 uv run --locked python examples/evolve_rl.py \
   --run-dir models/evolution/lux-s1-001 \
-  --device cuda
+  --device cuda \
+  --resattn8-only
 ```
 
-The defaults screen 24 ResAttn8 candidates for 550,000 sampled decisions, continue the best eight for another
-1,925,000 decisions, and train the best two from both UNet and ResAttn8 for 9,900,000 decisions each. A candidate runs
+`--resattn8-only` disables UNet opponents, probes, training, baselines, and final evaluation. The defaults screen 24
+ResAttn8 candidates for 550,000 sampled decisions, continue the best eight for another
+1,925,000 decisions, and train the best two with ResAttn8 for 9,900,000 decisions each. A candidate runs
 four Lux environments concurrently; candidate and opponent inference requests are collected into GPU batches while
 action decoding remains environment-local. PPO also evaluates all decisions of each entity type as tensors instead of
 one Python operation per unit. Tune `--rollout-envs` for each GPU and `--decisions-per-update` for the rollout/update
-balance. Final evaluation uses 50 fixed seeds, both player orientations,
-the two distilled bases plus the original first-place policy, no replay output, paired bootstrap reporting, and an
+balance. In ResAttn8-only mode, final evaluation uses 50 fixed seeds, both player orientations,
+the distilled ResAttn8 base plus the original first-place policy, no replay output, paired bootstrap reporting, and an
 inference-latency guard. Re-running the same command resumes completed candidates and stage checkpoints. Use
 `--no-codex` for deterministic numeric mutations, or `--overwrite-run` to intentionally start that run directory
 again. The Codex CLI must already be installed and authenticated when proposal generation is enabled.
@@ -710,7 +712,7 @@ also train candidates while serving ws3:
 export LUX_EVOLUTION_JOB_TOKEN='<same-random-token-on-both-machines>'
 uv run --locked python examples/evolve_rl.py \
   --run-dir /home/ueda/workspace/LuxPythonEnvGym/shared/lux-evolution \
-  --device cuda --distributed --job-api-listen 127.0.0.1:8765
+  --device cuda --resattn8-only --distributed --job-api-listen 127.0.0.1:8765
 ```
 
 When ws3 cannot authenticate to lyra with a forwarded agent, relay the API through the Mac that owns the working SSH
