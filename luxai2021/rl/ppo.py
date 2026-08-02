@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-# ruff: noqa: EM102, PLC0415, PLR0913, PLR0915, TC001, TC003
+# ruff: noqa: C901, EM102, FBT003, PLC0415, PLR0912, PLR0913, PLR0915, PLR2004, TC001, TC003
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict, dataclass
+from math import cos, pi
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -24,7 +25,7 @@ from luxai2021.rl.policy import (
 )
 from luxai2021.rl.reward import RewardProgram
 
-TRAINING_CHECKPOINT_SCHEMA_VERSION = 2
+TRAINING_CHECKPOINT_SCHEMA_VERSION = 3
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
@@ -79,6 +80,8 @@ class TrainingResumeState:
     elapsed_seconds: float = 0.0
     metrics: dict[str, Any] | None = None
     python_random_state: object | None = None
+    constraint_progress: int = 0
+    joint_update: int = 0
 
 
 def finish_episode(
@@ -119,6 +122,162 @@ def calculate_gae(episodes: Iterable[EpisodeTrajectory], config: PPOConfig) -> l
             next_advantage = record.advantage
         records.extend(episode.records)
     return records
+
+
+def apply_reward_program(episode: EpisodeTrajectory, reward_program: RewardProgram) -> None:
+    """Recompute an already collected trajectory under a calibrated reward."""
+    for index, record in enumerate(episode.records):
+        following = episode.records[index + 1].metrics if index + 1 < len(episode.records) else episode.final_metrics
+        terminal = episode.outcome if index + 1 == len(episode.records) else 0.0
+        breakdown = reward_program.reward(record.metrics, following, terminal_outcome=terminal)
+        record.reward = breakdown.total
+        record.reward_components = dict(breakdown.components)
+
+
+def _critic_examples(episodes: list[EpisodeTrajectory], gamma: float) -> tuple[Tensor, Tensor]:
+    records: list[TurnRecord] = []
+    returns: list[float] = []
+    for episode in episodes:
+        following_return = 0.0
+        episode_returns = []
+        for record in reversed(episode.records):
+            following_return = record.reward + gamma * following_return
+            episode_returns.append(following_return)
+        records.extend(episode.records)
+        returns.extend(reversed(episode_returns))
+    if not records:
+        raise ValueError("Critic calibration requires rollout turns")
+    return torch.stack([record.observation for record in records]), torch.tensor(returns, dtype=torch.float32)
+
+
+def value_head_calibration_loss(
+    actor_critic: FullTurnActorCritic,
+    episodes: list[EpisodeTrajectory],
+    config: PPOConfig,
+    device: torch.device,
+) -> dict[str, float | bool]:
+    """Measure inherited critic quality without modifying policy or value state."""
+    observations, targets = _critic_examples(episodes, config.gamma)
+    batch_size = max(1, config.minibatch_turns)
+    total_loss = 0.0
+    zero_loss = 0.0
+    policy_was_training = actor_critic.policy.training
+    value_was_training = actor_critic.value_head.training
+    actor_critic.eval()
+    try:
+        with torch.no_grad():
+            for start in range(0, len(targets), batch_size):
+                batch_targets = targets[start : start + batch_size].to(device)
+                _, values = actor_critic(observations[start : start + batch_size].to(device))
+                total_loss += float(torch.nn.functional.huber_loss(values.float(), batch_targets, reduction="sum"))
+                zero_loss += float(
+                    torch.nn.functional.huber_loss(torch.zeros_like(batch_targets), batch_targets, reduction="sum")
+                )
+    finally:
+        actor_critic.policy.train(policy_was_training)
+        actor_critic.value_head.train(value_was_training)
+    loss = total_loss / len(targets)
+    baseline = zero_loss / len(targets)
+    threshold = max(0.5, 4.0 * baseline)
+    return {
+        "turns": float(len(targets)),
+        "loss": loss,
+        "zero_baseline_loss": baseline,
+        "degradation_threshold": threshold,
+        "requires_warmup": bool(not torch.isfinite(torch.tensor(loss)) or loss > threshold),
+    }
+
+
+def warmup_value_head(
+    actor_critic: FullTurnActorCritic,
+    episodes: list[EpisodeTrajectory],
+    config: PPOConfig,
+    device: torch.device,
+    *,
+    max_epochs: int = 5,
+    minimum_epochs: int = 2,
+) -> dict[str, float]:
+    """Fit a reset critic to Monte-Carlo returns while leaving policy parameters untouched."""
+    observations, targets = _critic_examples(episodes, config.gamma)
+    split = max(1, min(len(targets) - 1, int(len(targets) * 0.8))) if len(targets) > 1 else 1
+    train_observations, validation_observations = observations[:split], observations[split:]
+    train_targets, validation_targets = targets[:split], targets[split:]
+    if not len(validation_targets):
+        validation_observations, validation_targets = train_observations, train_targets
+    policy_flags = [parameter.requires_grad for parameter in actor_critic.policy.parameters()]
+    actor_critic.policy.requires_grad_(False)
+    actor_critic.value_head.requires_grad_(True)
+    optimizer = torch.optim.AdamW(
+        actor_critic.value_head.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+    )
+    batch_size = max(1, config.minibatch_turns)
+    generator = torch.Generator().manual_seed(sum(episode.seed for episode in episodes))
+
+    def validation_loss(batch_observations: Tensor, batch_targets: Tensor) -> float:
+        total = 0.0
+        with torch.no_grad():
+            for start in range(0, len(batch_targets), batch_size):
+                targets_on_device = batch_targets[start : start + batch_size].to(device)
+                _, values = actor_critic(batch_observations[start : start + batch_size].to(device))
+                total += float(torch.nn.functional.huber_loss(values.float(), targets_on_device, reduction="sum"))
+        return total / len(batch_targets)
+
+    policy_was_training = actor_critic.policy.training
+    value_was_training = actor_critic.value_head.training
+    actor_critic.policy.eval()
+    actor_critic.value_head.eval()
+    initial_validation = validation_loss(validation_observations, validation_targets)
+    history = []
+    best = initial_validation
+    best_state = {name: value.detach().clone() for name, value in actor_critic.value_head.state_dict().items()}
+    stale = 0
+    try:
+        for epoch in range(max_epochs):
+            actor_critic.policy.eval()
+            actor_critic.value_head.train()
+            order = torch.randperm(len(train_targets), generator=generator)
+            train_total = 0.0
+            for start in range(0, len(order), batch_size):
+                indices = order[start : start + batch_size]
+                batch_targets = train_targets[indices].to(device)
+                _, values = actor_critic(train_observations[indices].to(device))
+                loss = torch.nn.functional.huber_loss(values.float(), batch_targets)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError("Critic warm-up produced a non-finite loss")
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(actor_critic.value_head.parameters(), config.gradient_clip)
+                optimizer.step()
+                train_total += float(loss.detach()) * len(indices)
+            actor_critic.value_head.eval()
+            validation = validation_loss(validation_observations, validation_targets)
+            history.append((train_total / len(train_targets), validation))
+            if validation < best - 1e-8:
+                best = validation
+                best_state = {
+                    name: value.detach().clone() for name, value in actor_critic.value_head.state_dict().items()
+                }
+                stale = 0
+            else:
+                stale += 1
+            if epoch + 1 >= minimum_epochs and stale >= 2:
+                break
+    finally:
+        if best_state is not None:
+            actor_critic.value_head.load_state_dict(best_state)
+        for parameter, requires_grad in zip(actor_critic.policy.parameters(), policy_flags):
+            parameter.requires_grad_(requires_grad)
+        actor_critic.policy.train(policy_was_training)
+        actor_critic.value_head.train(value_was_training)
+    return {
+        "epochs": float(len(history)),
+        "turns": float(len(targets)),
+        "initial_train_loss": history[0][0],
+        "final_train_loss": history[-1][0],
+        "initial_validation_loss": initial_validation,
+        "best_validation_loss": best,
+        "final_validation_loss": best,
+    }
 
 
 def collect_episode(
@@ -188,12 +347,39 @@ class PPOTrainer:
         device: torch.device,
         *,
         bc_batch_provider: Callable[[], Mapping[str, Tensor]] | None = None,
+        parameter_constraint_coefficient: float = 0.0,
+        parameter_constraint_decay_decisions: int = 1,
+        constrain_value_head: bool = False,
+        value_parameter_reference: Mapping[str, Tensor] | None = None,
+        illegal_action_coefficient: float = 0.01,
     ) -> None:
+        if parameter_constraint_coefficient < 0:
+            raise ValueError("parameter_constraint_coefficient must be non-negative")
         self.actor_critic = actor_critic
         self.reference_policy = reference_policy.eval().requires_grad_(requires_grad=False)
         self.config = config
         self.device = device
         self.bc_batch_provider = bc_batch_provider
+        self.parameter_constraint_coefficient = float(parameter_constraint_coefficient)
+        self.parameter_constraint_decay_decisions = max(1, int(parameter_constraint_decay_decisions))
+        self.parameter_constraint_progress = 0
+        self.illegal_action_coefficient = float(illegal_action_coefficient)
+        reference_named = {
+            f"policy.{name}": value.detach().clone() for name, value in self.reference_policy.named_parameters()
+        }
+        if constrain_value_head:
+            reference_named.update(
+                {
+                    f"value_head.{name}": (
+                        value_parameter_reference[name].detach().clone()
+                        if value_parameter_reference is not None
+                        else value.detach().clone()
+                    )
+                    for name, value in actor_critic.value_head.named_parameters()
+                }
+            )
+        self.parameter_reference = reference_named
+        self.actor_lr_multiplier = 1.0
         self.optimizer = torch.optim.AdamW(
             actor_critic.parameters(),
             lr=config.learning_rate,
@@ -230,6 +416,8 @@ class PPOTrainer:
                 policy_losses = []
                 entropies = []
                 kls = []
+                illegal_losses = []
+                illegal_masses = []
                 batch_advantages = advantages[indices].to(self.device)
                 for entity in output:
                     entity_decisions = [
@@ -248,13 +436,16 @@ class PPOTrainer:
                     logits = output[entity][local_indices, :, ys, xs]
                     reference_logits = reference_output[entity][local_indices, :, ys, xs]
                     masks = torch.stack([decision.legal_mask for _, decision in entity_decisions]).to(self.device)
+                    masks = masks.to(dtype=torch.bool)
+                    no_legal = ~masks.any(dim=-1)
+                    if no_legal.any():
+                        masks = masks.clone()
+                        masks[no_legal, 0] = True
                     distribution = Categorical(logits=apply_legal_action_mask(logits, masks).float())
                     reference_distribution = Categorical(
                         logits=apply_legal_action_mask(reference_logits, masks).float()
                     )
-                    actions = torch.tensor(
-                        [decision.action for _, decision in entity_decisions], device=self.device
-                    )
+                    actions = torch.tensor([decision.action for _, decision in entity_decisions], device=self.device)
                     old_log_probs = torch.tensor(
                         [decision.old_log_prob for _, decision in entity_decisions], device=self.device
                     )
@@ -265,6 +456,11 @@ class PPOTrainer:
                     policy_losses.append(-torch.minimum(unclipped, clipped))
                     entropies.append(distribution.entropy())
                     kls.append(kl_divergence(reference_distribution, distribution))
+                    legal_log_mass = torch.logsumexp(logits.float().masked_fill(~masks, -torch.inf), dim=-1)
+                    all_log_mass = torch.logsumexp(logits.float(), dim=-1)
+                    illegal_loss = all_log_mass - legal_log_mass
+                    illegal_losses.append(illegal_loss)
+                    illegal_masses.append((1.0 - torch.exp(-illegal_loss)).clamp(0.0, 1.0))
                 if not policy_losses:
                     continue
                 old_values = torch.tensor([record.value for record in batch_records], device=self.device)
@@ -280,17 +476,26 @@ class PPOTrainer:
                 entropy = torch.cat(entropies).mean()
                 kl = torch.cat(kls).mean()
                 bc_loss = self._distillation_anchor_loss(values)
+                parameter_constraint_loss = self._parameter_constraint_loss(values)
+                illegal_action_loss = torch.cat(illegal_losses).mean()
+                constraint_coefficient = self.current_parameter_constraint_coefficient()
                 loss = (
                     policy_loss
                     + self.config.value_coefficient * value_loss
                     - self.config.entropy_coefficient * entropy
                     + self.config.kl_coefficient * kl
                     + self.config.bc_coefficient * bc_loss
+                    + constraint_coefficient * parameter_constraint_loss
+                    + self.illegal_action_coefficient * illegal_action_loss
                 )
                 if not torch.isfinite(loss):
                     raise FloatingPointError("PPO produced a non-finite loss")
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                if self.actor_lr_multiplier != 1.0:
+                    for parameter in self.actor_critic.policy.parameters():
+                        if parameter.grad is not None:
+                            parameter.grad.mul_(self.actor_lr_multiplier)
                 gradient_norm = torch.nn.utils.clip_grad_norm_(
                     self.actor_critic.parameters(),
                     self.config.gradient_clip,
@@ -303,6 +508,12 @@ class PPOTrainer:
                     "entropy": entropy,
                     "kl": kl,
                     "bc_loss": bc_loss,
+                    "parameter_constraint_loss": parameter_constraint_loss,
+                    "parameter_constraint_coefficient": torch.as_tensor(constraint_coefficient),
+                    "illegal_action_loss": illegal_action_loss,
+                    "illegal_action_mass_mean": torch.cat(illegal_masses).mean(),
+                    "illegal_action_mass_p95": torch.quantile(torch.cat(illegal_masses), 0.95),
+                    "illegal_action_mass_max": torch.cat(illegal_masses).max(),
                     "gradient_norm": gradient_norm,
                 }
                 for name, value in batch_metrics.items():
@@ -337,6 +548,25 @@ class PPOTrainer:
             hard_label_weight=0.0,
         )["loss"]
 
+    def _parameter_constraint_loss(self, zero_source: Tensor) -> Tensor:
+        """L2-SP penalty that keeps fine-tuning close to its inherited policy."""
+        if self.parameter_constraint_coefficient == 0:
+            return zero_source.sum() * 0.0
+        current = dict(self.actor_critic.named_parameters())
+        losses = []
+        for name, reference in self.parameter_reference.items():
+            parameter = current[name]
+            losses.append((parameter - reference).square().mean() / (reference.square().mean() + 1e-6))
+        return torch.stack(losses).mean() if losses else zero_source.sum() * 0.0
+
+    def current_parameter_constraint_coefficient(self) -> float:
+        fraction = min(max(self.parameter_constraint_progress / self.parameter_constraint_decay_decisions, 0.0), 1.0)
+        return self.parameter_constraint_coefficient * 0.5 * (1.0 + cos(pi * fraction))
+
+    def set_schedule_state(self, *, constraint_progress: int, joint_update: int) -> None:
+        self.parameter_constraint_progress = max(0, int(constraint_progress))
+        self.actor_lr_multiplier = (0.25, 0.5, 1.0)[min(max(int(joint_update), 0), 2)]
+
     def save_training_checkpoint(
         self,
         path: Path,
@@ -354,6 +584,9 @@ class PPOTrainer:
                 "source_checkpoint": source_checkpoint,
                 "policy": self.actor_critic.policy.state_dict(),
                 "value_head": self.actor_critic.value_head.state_dict(),
+                "reference_policy": self.reference_policy.state_dict(),
+                "parameter_reference": {name: value.detach().cpu() for name, value in self.parameter_reference.items()},
+                "parameter_constraint_coefficient": self.parameter_constraint_coefficient,
                 "optimizer": self.optimizer.state_dict(),
                 "ppo_config": asdict(self.config),
                 "reward_program": reward_program.to_dict(),
@@ -377,7 +610,7 @@ class PPOTrainer:
     ) -> TrainingResumeState:
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         schema_version = int(checkpoint.get("schema_version", 1))
-        if schema_version not in {1, TRAINING_CHECKPOINT_SCHEMA_VERSION}:
+        if schema_version not in {1, 2, TRAINING_CHECKPOINT_SCHEMA_VERSION}:
             raise ValueError("Unsupported RL training checkpoint schema")
         if checkpoint.get("source_checkpoint") != source_checkpoint:
             raise ValueError("RL resume source checkpoint does not match")
@@ -387,20 +620,24 @@ class PPOTrainer:
             raise ValueError("RL resume PPO configuration does not match")
         self.actor_critic.policy.load_state_dict(checkpoint["policy"])
         self.actor_critic.value_head.load_state_dict(checkpoint["value_head"])
+        if checkpoint.get("reference_policy") is not None:
+            self.reference_policy.load_state_dict(checkpoint["reference_policy"])
+        if checkpoint.get("parameter_reference") is not None:
+            self.parameter_reference = {
+                str(name): value.to(self.device) for name, value in checkpoint["parameter_reference"].items()
+            }
+        if checkpoint.get("parameter_constraint_coefficient") is not None:
+            self.parameter_constraint_coefficient = float(checkpoint["parameter_constraint_coefficient"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         if checkpoint.get("torch_rng_state") is not None:
             torch.set_rng_state(checkpoint["torch_rng_state"].to(device="cpu", dtype=torch.uint8))
         if torch.cuda.is_available() and checkpoint.get("cuda_rng_state_all") is not None:
-            cuda_rng_states = [
-                state.to(device="cpu", dtype=torch.uint8) for state in checkpoint["cuda_rng_state_all"]
-            ]
+            cuda_rng_states = [state.to(device="cpu", dtype=torch.uint8) for state in checkpoint["cuda_rng_state_all"]]
             torch.cuda.set_rng_state_all(cuda_rng_states)
 
         metrics = dict(checkpoint.get("metrics", {}))
         state = (
-            dict(checkpoint.get("training_state", {}))
-            if schema_version >= TRAINING_CHECKPOINT_SCHEMA_VERSION
-            else {}
+            dict(checkpoint.get("training_state", {})) if schema_version >= TRAINING_CHECKPOINT_SCHEMA_VERSION else {}
         )
         elapsed_seconds = float(state.get("elapsed_seconds", metrics.get("elapsed_seconds", 0.0)))
         decisions = int(state.get("cumulative_decisions", metrics.get("cumulative_decisions", 0)))
@@ -415,6 +652,8 @@ class PPOTrainer:
             elapsed_seconds=elapsed_seconds,
             metrics=metrics,
             python_random_state=state.get("python_random_state"),
+            constraint_progress=int(state.get("constraint_progress", decisions)),
+            joint_update=int(state.get("joint_update", max(0, int(checkpoint["update"]) + 1))),
         )
 
     def load_training_checkpoint(

@@ -1,4 +1,4 @@
-# ruff: noqa: ANN001, ANN003, ANN201, ANN202, PLR2004, PT011, S101
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, PLR2004, PT011, S101, SLF001
 from __future__ import annotations
 
 import copy
@@ -32,16 +32,18 @@ from luxai2021.rl.evolution import (
     FilesystemJobQueue,
     OpponentMix,
     add_candidate_reflection,
+    approximate_ast_distance,
     build_codex_prompt,
     initial_candidate,
     mutate_candidate,
     proposal_schema,
+    validate_candidate_mutation,
 )
-from luxai2021.rl.job_api import JobApiClient, JobApiServer, extract_artifact_directory
-from luxai2021.rl.metrics import GameMetrics
+from luxai2021.rl.job_api import JobApiClient, JobApiServer
+from luxai2021.rl.metrics import GameMetrics, MetricContext
 from luxai2021.rl.policy import FullTurnActorCritic, RolloutAgent
-from luxai2021.rl.ppo import PPOConfig, PPOTrainer, collect_episode, collect_episodes_batched
-from luxai2021.rl.reward import RewardProgram, default_reward_program
+from luxai2021.rl.ppo import PPOConfig, PPOTrainer, collect_episode, collect_episodes_batched, warmup_value_head
+from luxai2021.rl.reward import RewardProgram, calibrate_reward_scale, default_reward_program
 
 
 def _small_policy():
@@ -109,6 +111,67 @@ def test_reward_program_rejects_unsafe_expressions(expression):
         )
 
 
+def test_metric_dsl_evaluates_bounded_board_queries():
+    context = MetricContext(
+        width=12,
+        height=12,
+        positions={"own_workers": ((0, 0),), "uranium_tiles": ((11, 11),)},
+        sums={},
+    )
+    metrics = _metrics()
+    object.__setattr__(metrics, "context", context)
+    program = RewardProgram.from_dict(
+        {
+            "version": 2,
+            "derived_metrics": [
+                {
+                    "name": "uranium_distance",
+                    "expression": {
+                        "op": "distance",
+                        "source": "own_workers",
+                        "target": "uranium_tiles",
+                        "reduce": "min",
+                    },
+                }
+            ],
+            "components": [
+                {
+                    "name": "distance",
+                    "expression": {"op": "derived", "name": "uranium_distance"},
+                    "weight": -1.0,
+                }
+            ],
+            "reward_scale": 0.2,
+            "gamma": 0.995,
+        }
+    )
+
+    potential, values = program.potential(metrics)
+
+    assert -1.0 <= potential <= 1.0
+    assert values["distance"] == pytest.approx(1.0)
+
+
+def test_sparse_component_is_not_used_for_inverse_rms_calibration():
+    parent = default_reward_program()
+    value = parent.to_dict()
+    value["components"].append(
+        {"name": "sparse_signal", "expression": {"op": "metric", "name": "cargo_fuel"}, "weight": 1.0}
+    )
+    child = RewardProgram.from_dict(value)
+    transitions = []
+    for index in range(300):
+        previous = _metrics(city_tiles=-0.5 if index % 2 else 0.5, cargo_fuel=0.0)
+        following = _metrics(city_tiles=0.5 if index % 2 else -0.5, cargo_fuel=1.0 if index == 0 else 0.0)
+        transitions.append((previous, following))
+
+    calibrated, report = calibrate_reward_scale(parent, child, transitions)
+
+    assert report["child_component_activity"]["sparse_signal"] < 0.01
+    assert "sparse_signal" not in report["child_dense_components"]
+    assert 0.01 <= calibrated.reward_scale <= 0.5
+
+
 def test_candidate_round_trip_and_resume_store(tmp_path):
     candidate = mutate_candidate(initial_candidate(island=1, seed=7), generation=2, island=1, seed=8)
     store = EvolutionStore(tmp_path)
@@ -120,6 +183,58 @@ def test_candidate_round_trip_and_resume_store(tmp_path):
     assert EvolutionCandidate.from_dict(candidate.to_dict()) == candidate
     assert proposal_schema()["additionalProperties"] is False
     assert sum(vars(OpponentMix()).values()) == pytest.approx(1.0)
+
+
+def test_v1_candidate_id_round_trip_is_unchanged():
+    proposal = {
+        "reward_program": default_reward_program().to_dict(),
+        "ppo_config": vars(PPOConfig()),
+        "opponent_mix": vars(OpponentMix()),
+        "rationale": "legacy",
+    }
+    proposal["reward_program"]["version"] = 1
+    proposal["reward_program"].pop("derived_metrics", None)
+    candidate = EvolutionCandidate.from_proposal(
+        proposal,
+        generation=1,
+        island=0,
+        parent_ids=(),
+        schema_version=1,
+    )
+
+    restored = EvolutionCandidate.from_dict(candidate.to_dict())
+
+    assert restored.candidate_id == candidate.candidate_id
+    assert restored.to_dict()["schema_version"] == 1
+
+
+def test_parameter_mutation_keeps_ast_shape_and_validates_island_contract():
+    parent = initial_candidate(island=0, seed=12)
+    child = mutate_candidate(parent, generation=1, island=0, seed=13)
+
+    validate_candidate_mutation([parent], child)
+
+    assert child.mutation_kind == "parameter"
+    assert child.inheritance_mode == "policy_value"
+    assert approximate_ast_distance(parent, child) <= 0.2
+
+
+def test_codex_proposal_schema_uses_supported_structured_output_constructs():
+    schema = proposal_schema()
+
+    def visit(value):
+        if isinstance(value, dict):
+            assert "oneOf" not in value
+            if value.get("type") == "object":
+                assert set(value.get("required", ())) == set(value.get("properties", ()))
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(schema)
+    assert schema["properties"]["reward_program"]["properties"]["version"]["type"] == "integer"
 
 
 def test_candidate_content_hash_detects_manual_edit():
@@ -174,6 +289,8 @@ def test_short_full_turn_ppo_smoke_updates_finite_parameters(tmp_path):
     assert metrics["decisions"] > 0
     assert all(torch.isfinite(value).all() for value in actor.parameters())
     assert any(not torch.equal(before[name], value) for name, value in actor.named_parameters())
+    assert 0.0 <= metrics["illegal_action_mass_mean"] <= 1.0
+    assert metrics["illegal_action_loss"] >= 0.0
     checkpoint_path = tmp_path / "latest_rl.pt"
     trainer.save_training_checkpoint(
         checkpoint_path,
@@ -200,6 +317,48 @@ def test_short_full_turn_ppo_smoke_updates_finite_parameters(tmp_path):
     )
 
 
+def test_parameter_constraint_is_relative_and_cosine_decays_to_zero():
+    actor = FullTurnActorCritic(_small_policy())
+    trainer = PPOTrainer(
+        actor,
+        copy.deepcopy(actor.policy),
+        PPOConfig(),
+        torch.device("cpu"),
+        parameter_constraint_coefficient=0.05,
+        parameter_constraint_decay_decisions=100,
+        constrain_value_head=True,
+    )
+    source = torch.zeros((), requires_grad=True)
+    assert float(trainer._parameter_constraint_loss(source)) == pytest.approx(0.0)
+    with torch.no_grad():
+        next(actor.policy.parameters()).add_(0.01)
+    assert float(trainer._parameter_constraint_loss(source)) > 0.0
+    trainer.set_schedule_state(constraint_progress=100, joint_update=3)
+    assert trainer.current_parameter_constraint_coefficient() == pytest.approx(0.0)
+
+
+def test_critic_warmup_never_changes_policy_parameters():
+    actor = FullTurnActorCritic(_small_policy())
+    snapshot = copy.deepcopy(actor).eval()
+    episode = collect_episode(
+        actor,
+        lambda: RolloutAgent(snapshot, device="cpu", deterministic=True),
+        default_reward_program(),
+        device=torch.device("cpu"),
+        seed=19,
+        opponent_name="small",
+        max_turns=4,
+    )
+    before = {name: value.detach().clone() for name, value in actor.policy.named_parameters()}
+
+    metrics = warmup_value_head(actor, [episode], PPOConfig(), torch.device("cpu"), max_epochs=2)
+
+    assert metrics["epochs"] >= 2
+    assert torch.isfinite(torch.tensor(metrics["final_validation_loss"]))
+    assert metrics["final_validation_loss"] <= metrics["initial_validation_loss"]
+    assert all(torch.equal(before[name], value) for name, value in actor.policy.named_parameters())
+
+
 def test_training_checkpoint_v2_restores_budget_progress_and_legacy_estimate(tmp_path):
     actor = FullTurnActorCritic(_small_policy())
     trainer = PPOTrainer(actor, copy.deepcopy(actor.policy), PPOConfig(), torch.device("cpu"))
@@ -215,6 +374,8 @@ def test_training_checkpoint_v2_restores_budget_progress_and_legacy_estimate(tmp
             "cumulative_turns": 456,
             "cumulative_episodes": 7,
             "elapsed_seconds": 25.0,
+            "constraint_progress": 789,
+            "joint_update": 2,
         },
     )
 
@@ -228,6 +389,13 @@ def test_training_checkpoint_v2_restores_budget_progress_and_legacy_estimate(tmp
     assert restored.cumulative_decisions == 1234
     assert restored.cumulative_turns == 456
     assert restored.cumulative_episodes == 7
+    assert restored.constraint_progress == 789
+    assert restored.joint_update == 2
+    trainer.set_schedule_state(
+        constraint_progress=restored.constraint_progress,
+        joint_update=restored.joint_update,
+    )
+    assert trainer.actor_lr_multiplier == 1.0
 
     legacy = torch.load(checkpoint_path, weights_only=False)
     legacy["schema_version"] = 1
@@ -408,6 +576,7 @@ def test_reflection_contains_parent_changes_improvement_and_diagnostic_turns():
     comparison = reflection["parent_comparisons"][0]
     assert comparison["changes"]
     assert comparison["improvement"]["score_rate_delta"] == pytest.approx(0.2)
+    assert reflected.fitness[0] == 0.0
     prompt = build_codex_prompt([child], [reflected], island=0, generation=2)
     assert '"city_tile_loss_turns": [' in prompt
     assert "31" in prompt
@@ -460,7 +629,7 @@ def test_job_api_claim_context_and_upload_artifacts(tmp_path):  # noqa: PLR0915
     try:
         host, port = server.address
         health = JobApiClient(f"http://{host}:{port}").health()
-        assert health == {"status": "ok", "api_version": 1}
+        assert health == {"status": "ok", "api_version": 2}
         unauthorized = JobApiClient(f"http://{host}:{port}", token=f"wrong-{candidate.candidate_id}")
         with pytest.raises(RuntimeError, match="HTTP 401"):
             unauthorized.claim("intruder")
@@ -509,9 +678,9 @@ def test_job_api_claim_context_and_upload_artifacts(tmp_path):  # noqa: PLR0915
         queue.enqueue(medium_job)
         medium_claim = client.claim("other-worker")
         assert medium_claim is not None
-        assert medium_claim["input_artifact"]["stage"] == "short-resattn8"
+        assert medium_claim["input_artifacts"][0]["stage"] == "short-resattn8"
         downloaded = tmp_path / "downloaded-input"
-        extract_artifact_directory(medium_claim["input_artifact"]["zip_base64"], downloaded)
+        client.download_artifact(medium_claim["input_artifacts"][0], tmp_path / "cache", downloaded)
         assert (downloaded / "latest_rl.pt").read_bytes() == b"training"
         medium_partial = tmp_path / "medium-partial"
         medium_partial.mkdir()
@@ -524,9 +693,9 @@ def test_job_api_claim_context_and_upload_artifacts(tmp_path):  # noqa: PLR0915
         client.release(lease_id=medium_claim["lease_id"], job=medium_job)
         medium_claim = client.claim("replacement-worker")
         assert medium_claim is not None
-        assert medium_claim["input_artifact"]["stage"] == "medium-resattn8"
+        assert medium_claim["input_artifacts"][0]["stage"] == "medium-resattn8"
         resumed_medium = tmp_path / "resumed-medium"
-        extract_artifact_directory(medium_claim["input_artifact"]["zip_base64"], resumed_medium)
+        client.download_artifact(medium_claim["input_artifacts"][0], tmp_path / "cache", resumed_medium)
         assert (resumed_medium / "latest_rl.pt").read_bytes() == b"medium-partial-training"
         failed = CandidateResult(
             candidate.candidate_id,
@@ -545,6 +714,27 @@ def test_job_api_claim_context_and_upload_artifacts(tmp_path):  # noqa: PLR0915
             result=failed,
             artifact_dir=tmp_path / "missing-artifacts",
         )
+        legacy_job = EvolutionJob(candidate.candidate_id, "legacy-check", "resattn8", 0, 1, 300)
+        queue.enqueue(legacy_job)
+        legacy_claim = client._post("/v1/claim", {"worker_id": "legacy-worker"})
+        assert legacy_claim["api_version"] == 1
+        assert legacy_claim["input_artifacts"] == []
+        client.complete(
+            lease_id=legacy_claim["lease_id"],
+            job=legacy_job,
+            result=CandidateResult(
+                candidate.candidate_id,
+                legacy_job.stage,
+                "failed",
+                0.0,
+                0.0,
+                float("inf"),
+                0.0,
+                {},
+                "legacy endpoint check",
+            ),
+            artifact_dir=tmp_path / "missing-legacy-artifacts",
+        )
     finally:
         server.close()
 
@@ -554,6 +744,41 @@ def test_job_api_claim_context_and_upload_artifacts(tmp_path):  # noqa: PLR0915
     assert queue.outstanding_ids() == set()
     stored = next(item for item in store.results() if item.stage == job.stage)
     assert stored.metrics["checkpoint"] == str(coordinator_artifacts / "best.pt")
+
+
+def test_job_api_v2_streams_and_caches_parent_checkpoint(tmp_path):
+    coordinator_dir = tmp_path / "coordinator"
+    store = EvolutionStore(coordinator_dir)
+    parent = initial_candidate(island=0, seed=21)
+    child = mutate_candidate(parent, generation=1, island=0, seed=22)
+    store.save_candidate(parent)
+    store.save_candidate(child)
+    store.save_manifest({"schema_version": 1, "arguments": {}})
+    parent_dir = coordinator_dir / "artifacts" / parent.candidate_id / "short-resattn8" / "resattn8"
+    parent_dir.mkdir(parents=True)
+    (parent_dir / "latest_rl.pt").write_bytes(b"parent-training-checkpoint")
+    queue = FilesystemJobQueue(coordinator_dir)
+    job = EvolutionJob(child.candidate_id, "short-resattn8", "resattn8", 0, 1, 100)
+    queue.enqueue(job)
+    server = JobApiServer("127.0.0.1:0", run_dir=coordinator_dir, queue=queue)
+    server.start()
+    try:
+        host, port = server.address
+        client = JobApiClient(f"http://{host}:{port}")
+        claim = client.claim("ws3")
+        descriptor = claim["input_artifacts"][0]
+        destination = tmp_path / "worker" / "parent"
+        cache = tmp_path / "worker" / "cache"
+
+        client.download_artifact(descriptor, cache, destination)
+        client.download_artifact(descriptor, cache, destination)
+
+        assert descriptor["kind"] == "parent"
+        assert descriptor["candidate_id"] == parent.candidate_id
+        assert (destination / "latest_rl.pt").read_bytes() == b"parent-training-checkpoint"
+        assert len(list(cache.glob("*.zip"))) == 1
+    finally:
+        server.close()
 
 
 def test_api_claim_discards_stale_local_result(tmp_path):

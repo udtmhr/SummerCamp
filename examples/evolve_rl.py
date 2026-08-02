@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-# ruff: noqa: BLE001, C901, INP001, PLR0912, PLR0913, PLR0915, S311, S607
+# ruff: noqa: BLE001, C901, INP001, PLR0912, PLR0913, PLR0915, PLR2004, S311, S607
 import argparse
 import atexit
 import copy
 import gzip
+import hashlib
 import json
 import os
 import random
@@ -39,13 +40,21 @@ from luxai2021.rl.evolution import (
     EvolutionStore,
     FilesystemJobQueue,
     add_candidate_reflection,
+    approximate_ast_distance,
     initial_candidate,
     mutate_candidate,
     select_elites,
 )
 from luxai2021.rl.job_api import JOB_API_VERSION, JobApiClient, JobApiServer, extract_artifact_directory
 from luxai2021.rl.policy import FullTurnActorCritic, RolloutAgent
-from luxai2021.rl.ppo import PPOTrainer, collect_episodes_batched
+from luxai2021.rl.ppo import (
+    PPOTrainer,
+    apply_reward_program,
+    collect_episodes_batched,
+    value_head_calibration_loss,
+    warmup_value_head,
+)
+from luxai2021.rl.reward import RewardProgram, calibrate_reward_scale
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
@@ -110,6 +119,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--job-api-url", help="Worker API URL reached through SSH, for example http://127.0.0.1:18765")
     parser.add_argument("--job-api-timeout-seconds", type=float, default=600.0)
     parser.add_argument("--job-heartbeat-seconds", type=float, default=600.0)
+    parser.add_argument("--critic-warmup-episodes", type=int, default=8)
+    parser.add_argument("--unet-probe-every", type=int, default=2)
     return parser.parse_args()
 
 
@@ -265,16 +276,39 @@ def train_candidate(
     device: torch.device,
     seed: int,
     max_turns: int,
+    inherit_from: Path | None = None,
+    parent_reward_program: RewardProgram | None = None,
+    parent_effective_scale: float | None = None,
+    critic_warmup_episodes: int = 8,
+    constraint_decay_decisions: int | None = None,
     resume_from: Path | None = None,
     resume_budget_progress: bool = True,
     checkpoint_callback: Callable[[Path, Mapping[str, object]], None] | None = None,
 ) -> tuple[Path, dict[str, object]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     actor_critic = FullTurnActorCritic.from_checkpoint(base_checkpoint, device)
+    inherited_modules: list[str] = []
+    inherited_hash = None
+    if inherit_from is not None and resume_from is None:
+        inherited = torch.load(inherit_from, map_location=device, weights_only=False)
+        actor_critic.policy.load_state_dict(inherited["policy"])
+        inherited_modules.append("policy")
+        if candidate.inheritance_mode == "policy_value":
+            actor_critic.value_head.load_state_dict(inherited["value_head"])
+            inherited_modules.append("value_head")
+        digest = hashlib.sha256()
+        with inherit_from.open("rb") as checkpoint_input:
+            while chunk := checkpoint_input.read(1024 * 1024):
+                digest.update(chunk)
+        inherited_hash = digest.hexdigest()
     if device.type == "cuda":
         actor_critic.policy.to(memory_format=torch.channels_last)
     reference_policy = copy.deepcopy(actor_critic.policy).to(device)
-    snapshot = copy.deepcopy(actor_critic).eval().requires_grad_(requires_grad=False)
+    parent_value_reference = (
+        {name: value.detach().clone() for name, value in actor_critic.value_head.named_parameters()}
+        if inherit_from is not None and candidate.inheritance_mode == "policy_value"
+        else None
+    )
     bc_provider = None
     if use_bc_anchor and candidate.ppo_config.bc_coefficient > 0:
         bc_provider = build_anchor_provider(
@@ -285,13 +319,6 @@ def train_candidate(
             replay_count=bc_replays,
             seed=seed,
         )
-    trainer = PPOTrainer(
-        actor_critic,
-        reference_policy,
-        candidate.ppo_config,
-        device,
-        bc_batch_provider=bc_provider,
-    )
     actor_critic.eval()
     start_update = 0
     cumulative_decisions = 0
@@ -300,6 +327,28 @@ def train_candidate(
     previous_elapsed_seconds = 0.0
     resumed_metrics: dict[str, object] | None = None
     rng = random.Random(seed)
+    constraint_progress = 0
+    joint_update = 0
+
+    def make_trainer() -> PPOTrainer:
+        return PPOTrainer(
+            actor_critic,
+            reference_policy,
+            candidate.ppo_config,
+            device,
+            bc_batch_provider=bc_provider,
+            parameter_constraint_coefficient=(
+                candidate.parameter_constraint_coefficient if inherit_from is not None else 0.0
+            ),
+            parameter_constraint_decay_decisions=max(
+                1,
+                constraint_decay_decisions or (decision_budget or decisions_per_update) // 2,
+            ),
+            constrain_value_head=candidate.inheritance_mode == "policy_value",
+            value_parameter_reference=parent_value_reference,
+        )
+
+    trainer = make_trainer()
     if resume_from is not None:
         resume_state = trainer.load_training_state(
             resume_from,
@@ -309,14 +358,17 @@ def train_candidate(
             legacy_stage_seconds=seconds,
         )
         start_update = resume_state.next_update
+        resumed_metrics = resume_state.metrics
+        constraint_progress = resume_state.constraint_progress
+        joint_update = resume_state.joint_update
         if resume_budget_progress:
             cumulative_decisions = resume_state.cumulative_decisions
             cumulative_turns = resume_state.cumulative_turns
             episode_index = resume_state.cumulative_episodes
             previous_elapsed_seconds = resume_state.elapsed_seconds
-            resumed_metrics = resume_state.metrics
         if resume_budget_progress and resume_state.python_random_state is not None:
             rng.setstate(resume_state.python_random_state)
+    snapshot = copy.deepcopy(actor_critic).eval().requires_grad_(requires_grad=False)
     candidate_batcher = ActorCriticBatcher(
         actor_critic,
         device,
@@ -331,6 +383,83 @@ def train_candidate(
         device=device,
         rollout_envs=rollout_envs,
     )
+    effective_reward_program = candidate.reward_program
+    reward_calibration: dict[str, object] = {
+        "proposed_scale": candidate.reward_program.reward_scale,
+        "effective_scale": candidate.reward_program.reward_scale,
+        "fallback": True,
+        "reason": "initial_or_resume",
+    }
+    critic_warmup: dict[str, float] | None = None
+    critic_calibration: dict[str, float | bool] | None = None
+    if resume_from is not None and isinstance(resumed_metrics, dict):
+        resumed_scale = float(resumed_metrics.get("effective_reward_scale", candidate.reward_program.reward_scale))
+        effective_reward_program = RewardProgram(
+            candidate.reward_program.components,
+            candidate.reward_program.derived_metrics,
+            reward_scale=resumed_scale,
+            gamma=candidate.reward_program.gamma,
+            version=candidate.reward_program.version,
+        )
+    elif resume_from is None:
+        calibration_specs = []
+        for offset, opponent_key in enumerate(("self_base", "other_base", "teacher", "snapshot")):
+            opponent_name, factory = pool[opponent_key]
+            calibration_specs.append((factory, seed + 9_000_000 + offset, opponent_name))
+        calibration_episodes = collect_episodes_batched(
+            actor_critic,
+            calibration_specs,
+            candidate.reward_program,
+            device=device,
+            inference_backend=candidate_batcher.submit,
+            max_turns=max_turns,
+        )
+        if parent_reward_program is not None:
+            transitions = [
+                (
+                    record.metrics,
+                    episode.records[index + 1].metrics if index + 1 < len(episode.records) else episode.final_metrics,
+                )
+                for episode in calibration_episodes
+                for index, record in enumerate(episode.records)
+            ]
+            effective_reward_program, reward_calibration = calibrate_reward_scale(
+                parent_reward_program,
+                candidate.reward_program,
+                transitions,
+                parent_effective_scale=parent_effective_scale,
+            )
+        for episode in calibration_episodes:
+            apply_reward_program(episode, effective_reward_program)
+        needs_warmup = candidate.inheritance_mode != "policy_value"
+        if candidate.inheritance_mode == "policy_value":
+            critic_calibration = value_head_calibration_loss(
+                actor_critic,
+                calibration_episodes,
+                candidate.ppo_config,
+                device,
+            )
+            needs_warmup = bool(critic_calibration["requires_warmup"])
+        if needs_warmup:
+            warmup_episodes = list(calibration_episodes)
+            warmup_turns = sum(len(episode.records) for episode in warmup_episodes)
+            next_key = 0
+            while len(warmup_episodes) < critic_warmup_episodes or warmup_turns < 1024:
+                opponent_key = ("self_base", "other_base", "teacher", "snapshot")[next_key % 4]
+                opponent_name, factory = pool[opponent_key]
+                wave = collect_episodes_batched(
+                    actor_critic,
+                    [(factory, seed + 9_100_000 + next_key, opponent_name)],
+                    effective_reward_program,
+                    device=device,
+                    inference_backend=candidate_batcher.submit,
+                    max_turns=max_turns,
+                )
+                warmup_episodes.extend(wave)
+                warmup_turns += sum(len(episode.records) for episode in wave)
+                next_key += 1
+            critic_warmup = warmup_value_head(actor_critic, warmup_episodes, candidate.ppo_config, device)
+            trainer = make_trainer()
     deadline = time.monotonic() + max(0.0, seconds - previous_elapsed_seconds)
     history = []
     diagnostic_events: list[dict[str, object]] = []
@@ -363,7 +492,7 @@ def train_candidate(
                 wave = collect_episodes_batched(
                     actor_critic,
                     specs,
-                    candidate.reward_program,
+                    effective_reward_program,
                     device=device,
                     inference_backend=candidate_batcher.submit,
                     max_turns=max_turns,
@@ -371,9 +500,12 @@ def train_candidate(
                 episodes.extend(wave)
                 update_decisions += sum(len(record.decisions) for episode in wave for record in episode.records)
             actor_critic.train()
+            trainer.set_schedule_state(constraint_progress=constraint_progress, joint_update=joint_update)
             metrics = trainer.update(episodes)
             actor_critic.eval()
             cumulative_decisions += int(metrics["decisions"])
+            constraint_progress += int(metrics["decisions"])
+            joint_update += 1
             cumulative_turns += int(metrics["turns"])
             diagnostic_events.extend(event for episode in episodes for event in episode.diagnostic_events)
             metrics.update(
@@ -388,6 +520,10 @@ def train_candidate(
                     "candidate_inference": candidate_batcher.metrics(),
                     "opponent_inference": opponent_resources.metrics(),
                     "rollout_envs": rollout_envs,
+                    "effective_reward_scale": effective_reward_program.reward_scale,
+                    "constraint_progress": constraint_progress,
+                    "joint_update": joint_update,
+                    "actor_lr_multiplier": trainer.actor_lr_multiplier,
                 }
             )
             history.append(metrics)
@@ -403,6 +539,8 @@ def train_candidate(
                     "cumulative_episodes": episode_index,
                     "elapsed_seconds": metrics["elapsed_seconds"],
                     "python_random_state": rng.getstate(),
+                    "constraint_progress": constraint_progress,
+                    "joint_update": joint_update,
                 },
             )
             if checkpoint_callback is not None:
@@ -422,6 +560,16 @@ def train_candidate(
         "base_name": base_name,
         "base_checkpoint": str(base_checkpoint),
         "reward_program": candidate.reward_program.to_dict(),
+        "effective_reward_program": effective_reward_program.to_dict(),
+        "reward_calibration": reward_calibration,
+        "critic_warmup": critic_warmup,
+        "critic_calibration": critic_calibration,
+        "inheritance": {
+            "mode": candidate.inheritance_mode,
+            "checkpoint": str(inherit_from) if inherit_from is not None else None,
+            "checkpoint_sha256": inherited_hash,
+            "modules": inherited_modules,
+        },
         "ppo_config": asdict(candidate.ppo_config),
         "opponent_mix": asdict(candidate.opponent_mix),
         "decision_budget": decision_budget,
@@ -441,6 +589,55 @@ def train_candidate(
     return output_dir / "best.pt", summary
 
 
+def _artifact_checkpoint(run_dir: Path, candidate_id: str, base_name: str) -> Path | None:
+    stages = (
+        (f"final-{base_name}", f"probe-{base_name}", f"medium-{base_name}", f"short-{base_name}")
+        if base_name == "unet"
+        else (f"final-{base_name}", f"medium-{base_name}", f"short-{base_name}")
+    )
+    for stage in stages:
+        checkpoint = run_dir / "artifacts" / candidate_id / stage / base_name / "latest_rl.pt"
+        if checkpoint.exists():
+            return checkpoint
+    return None
+
+
+def _resolve_parent_checkpoint(
+    run_dir: Path,
+    candidate: EvolutionCandidate,
+    candidates: Mapping[str, EvolutionCandidate],
+    base_name: str,
+) -> tuple[Path, EvolutionCandidate] | None:
+    if candidate.inheritance_mode == "base" or candidate.mutation_kind == "restart":
+        return None
+    pending = [candidate.primary_parent_id or (candidate.parent_ids[0] if candidate.parent_ids else None)]
+    visited = set()
+    while pending:
+        candidate_id = pending.pop(0)
+        if candidate_id is None or candidate_id in visited:
+            continue
+        visited.add(candidate_id)
+        parent = candidates.get(candidate_id)
+        checkpoint = _artifact_checkpoint(run_dir, candidate_id, base_name)
+        if checkpoint is not None and parent is not None:
+            return checkpoint, parent
+        if parent is not None:
+            pending.extend((parent.primary_parent_id, *parent.parent_ids))
+    if base_name == "unet":
+        return None
+    message = f"No inherited {base_name} checkpoint for {candidate.candidate_id}"
+    raise FileNotFoundError(message)
+
+
+def _effective_scale_from_artifact(checkpoint: Path, fallback: float) -> float:
+    metrics_path = checkpoint.with_name("metrics.json")
+    if not metrics_path.exists():
+        return fallback
+    value = json.loads(metrics_path.read_text(encoding="utf-8"))
+    effective = value.get("effective_reward_program", {})
+    return float(effective.get("reward_scale", fallback)) if isinstance(effective, dict) else fallback
+
+
 def candidate_result(
     candidate: EvolutionCandidate,
     *,
@@ -454,22 +651,47 @@ def candidate_result(
     decision_budget: int | None,
     eval_seeds: int,
     eval_seed_start: int,
+    candidates: Mapping[str, EvolutionCandidate],
     checkpoint_callback: Callable[[Path, Mapping[str, object]], None] | None = None,
 ) -> CandidateResult:
     started_at = time.monotonic()
     output_dir = Path(args.run_dir) / "artifacts" / candidate.candidate_id / stage / base_name
     current_checkpoint = output_dir / "latest_rl.pt"
     prior_short_checkpoint = (
-        Path(args.run_dir)
-        / "artifacts"
-        / candidate.candidate_id
-        / "short-resattn8"
-        / "resattn8"
-        / "latest_rl.pt"
+        Path(args.run_dir) / "artifacts" / candidate.candidate_id / "short-resattn8" / "resattn8" / "latest_rl.pt"
     )
     resume_from = current_checkpoint if current_checkpoint.exists() else None
-    if resume_from is None and stage == "medium-resattn8" and prior_short_checkpoint.exists():
-        resume_from = prior_short_checkpoint
+    predecessor_paths = [prior_short_checkpoint] if stage == "medium-resattn8" else []
+    if stage == "final-resattn8":
+        predecessor_paths.extend(
+            [
+                Path(args.run_dir)
+                / "artifacts"
+                / candidate.candidate_id
+                / "medium-resattn8"
+                / "resattn8"
+                / "latest_rl.pt",
+                prior_short_checkpoint,
+            ]
+        )
+    if stage == "final-unet":
+        predecessor_paths.append(
+            Path(args.run_dir) / "artifacts" / candidate.candidate_id / "probe-unet" / "unet" / "latest_rl.pt"
+        )
+    if resume_from is None:
+        resume_from = next((path for path in predecessor_paths if path.exists()), None)
+    inheritance = (
+        None
+        if resume_from is not None
+        else _resolve_parent_checkpoint(Path(args.run_dir), candidate, candidates, base_name)
+    )
+    inherit_from = inheritance[0] if inheritance is not None else None
+    parent = inheritance[1] if inheritance is not None else None
+    parent_effective_scale = (
+        _effective_scale_from_artifact(inherit_from, parent.reward_program.reward_scale)
+        if inherit_from is not None and parent is not None
+        else None
+    )
     try:
         checkpoint, training = train_candidate(
             candidate,
@@ -491,6 +713,11 @@ def candidate_result(
             device=device,
             seed=args.seed + candidate.generation * 10_000 + candidate.island * 100,
             max_turns=args.max_turns,
+            inherit_from=inherit_from,
+            parent_reward_program=parent.reward_program if parent is not None else None,
+            parent_effective_scale=parent_effective_scale,
+            critic_warmup_episodes=args.critic_warmup_episodes,
+            constraint_decay_decisions=max(1, args.short_decisions // 2),
             resume_from=resume_from,
             resume_budget_progress=resume_from == current_checkpoint,
             checkpoint_callback=checkpoint_callback,
@@ -609,6 +836,7 @@ def execute_evolution_job(
         decision_budget=decision_budget,
         eval_seeds=job.eval_seeds,
         eval_seed_start=job.eval_seed_start,
+        candidates=candidates,
         checkpoint_callback=checkpoint_callback,
     )
     result = add_candidate_reflection(result, candidate, candidates, prior_results)
@@ -629,13 +857,19 @@ def _apply_coordinator_manifest(args: argparse.Namespace, manifest: Mapping[str,
         "no_bc_anchor",
         "max_turns",
         "recover_stale_job_seconds",
+        "critic_warmup_episodes",
+        "unet_probe_every",
     ):
         if name in coordinator_args:
             setattr(args, name, coordinator_args[name])
 
 
-def _sync_api_claim(store: EvolutionStore, claim: Mapping[str, object]) -> tuple[EvolutionJob, str]:
-    if int(claim.get("api_version", 0)) != JOB_API_VERSION:
+def _sync_api_claim(
+    store: EvolutionStore,
+    claim: Mapping[str, object],
+    api: JobApiClient | None = None,
+) -> tuple[EvolutionJob, str]:
+    if int(claim.get("api_version", 0)) not in {1, JOB_API_VERSION}:
         raise ValueError("Coordinator Job API version is incompatible")
     manifest = claim["manifest"]
     if not isinstance(manifest, dict):
@@ -664,11 +898,22 @@ def _sync_api_claim(store: EvolutionStore, claim: Mapping[str, object]) -> tuple
         destination = (
             store.run_dir
             / "artifacts"
-            / job.candidate_id
+            / str(input_artifact.get("candidate_id", job.candidate_id))
             / str(input_artifact["stage"])
             / str(input_artifact["base_name"])
         )
         extract_artifact_directory(str(input_artifact["zip_base64"]), destination)
+    for descriptor in claim.get("input_artifacts", []):
+        if not isinstance(descriptor, dict) or api is None:
+            raise TypeError("Streaming input artifact requires a Job API client")
+        destination = (
+            store.run_dir
+            / "artifacts"
+            / str(descriptor["candidate_id"])
+            / str(descriptor["stage"])
+            / str(descriptor["base_name"])
+        )
+        api.download_artifact(descriptor, store.run_dir / "artifact-cache", destination)
     return job, str(claim["lease_id"])
 
 
@@ -730,7 +975,7 @@ def run_worker(args: argparse.Namespace) -> None:
             if claim is None:
                 claimed = None
             else:
-                job, lease_id = _sync_api_claim(store, claim)
+                job, lease_id = _sync_api_claim(store, claim, api)
                 _apply_coordinator_manifest(args, claim["manifest"])
                 claimed = (job, lease_id)
         else:
@@ -1096,7 +1341,30 @@ def main() -> None:
         evaluate_jobs(wave)
 
     for generation in range(1, args.generations + 1):
-        global_elites = select_elites(candidates, results, count=2)
+        global_elites = select_elites(candidates, results, count=max(4, args.islands * 2))
+        champion = global_elites[0] if global_elites else None
+        best_by_generation = {
+            prior_generation: max(
+                (
+                    result.score_rate
+                    for result in results
+                    if result.status == "completed"
+                    and candidates.get(result.candidate_id) is not None
+                    and candidates[result.candidate_id].generation == prior_generation
+                ),
+                default=float("-inf"),
+            )
+            for prior_generation in range(generation)
+        }
+        earlier_best = max(
+            (score for prior_generation, score in best_by_generation.items() if prior_generation < generation - 2),
+            default=float("-inf"),
+        )
+        recent_best = max(
+            (score for prior_generation, score in best_by_generation.items() if prior_generation >= generation - 2),
+            default=float("-inf"),
+        )
+        stagnated = generation >= 3 and recent_best <= earlier_best
         wave = []
         for island in range(args.islands):
             existing_generation = [
@@ -1107,11 +1375,16 @@ def main() -> None:
             if existing_generation:
                 child = existing_generation[0]
             else:
-                parent = _best_parent(candidates, results, island)
+                if island in {0, 1} and champion is not None:
+                    parent = champion
+                elif island == 2 and champion is not None and len(global_elites) > 1:
+                    parent = max(global_elites[1:], key=lambda item: approximate_ast_distance(champion, item))
+                else:
+                    parent = _best_parent(candidates, results, island)
                 parents = [parent]
-                if generation % 2 == 0:
+                if island == 3:
                     parents.extend(elite for elite in global_elites if elite.candidate_id != parent.candidate_id)
-                    parents = parents[:2]
+                    parents = parents[:3]
                 if generator is not None:
                     try:
                         child = generator.generate(parents, results, generation=generation, island=island)
@@ -1122,6 +1395,8 @@ def main() -> None:
                             generation=generation,
                             island=island,
                             seed=args.seed + generation * 1000 + island,
+                            secondary_parents=tuple(parents[1:]),
+                            stagnated=stagnated,
                         )
                 else:
                     child = mutate_candidate(
@@ -1129,10 +1404,29 @@ def main() -> None:
                         generation=generation,
                         island=island,
                         seed=args.seed + generation * 1000 + island,
+                        secondary_parents=tuple(parents[1:]),
+                        stagnated=stagnated,
                     )
                 register(child)
             wave.append(short_job(child))
         evaluate_jobs(wave)
+        if args.unet_probe_every > 0 and generation % args.unet_probe_every == 0:
+            refreshed_elites = select_elites(candidates, results, count=1)
+            if refreshed_elites:
+                probe = refreshed_elites[0]
+                evaluate_jobs(
+                    [
+                        EvolutionJob(
+                            probe.candidate_id,
+                            "probe-unet",
+                            "unet",
+                            args.short_seconds,
+                            args.screening_seeds,
+                            args.screening_seed_start + 50_000 + generation * 100,
+                            args.short_decisions,
+                        )
+                    ]
+                )
 
     if args.dry_run:
         print(json.dumps({"run_dir": str(run_dir), "candidates": len(candidates), "dry_run": True}))
@@ -1210,6 +1504,12 @@ def main() -> None:
             continue
         evaluations = {result.stage.removeprefix("final-"): result.metrics["evaluation"] for result in values}
         acceptance = acceptance_report(evaluations, baseline_evaluations, seed=args.seed)
+        illegal_action_count = sum(
+            int(result.metrics.get("reflection", {}).get("diagnostics", {}).get("illegal_action_count", 0))
+            for result in values
+        )
+        acceptance["illegal_action_count"] = illegal_action_count
+        acceptance["promote"] = bool(acceptance["promote"] and illegal_action_count == 0)
         ranking_rows.append(
             {
                 "candidate_id": candidate_id,

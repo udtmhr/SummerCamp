@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-# ruff: noqa: C901, EM102, PLR0911, PLR2004, TC001, TRY004
-from collections.abc import Mapping
+# ruff: noqa: C901, EM102, PLR0911, PLR0912, PLR0913, PLR0915, PLR2004, TC001, TRY004
+from collections import defaultdict
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from math import isfinite, tanh
+from math import copysign, exp, isclose, isfinite, log1p, sqrt, tanh
 from typing import Any
 
 from luxai2021.rl.metrics import GameMetrics
 
-REWARD_PROGRAM_VERSION = 1
+REWARD_PROGRAM_VERSION = 2
+SUPPORTED_REWARD_PROGRAM_VERSIONS = frozenset({1, REWARD_PROGRAM_VERSION})
 METRIC_NAMES = frozenset(
     {
         "turn",
@@ -27,7 +29,36 @@ METRIC_NAMES = frozenset(
         "city_tiles_built",
     }
 )
-_UNARY_OPS = frozenset({"abs", "neg", "tanh"})
+METRIC_SELECTORS = frozenset(
+    {
+        "own_units",
+        "own_workers",
+        "own_carts",
+        "opponent_units",
+        "opponent_workers",
+        "opponent_carts",
+        "own_city_tiles",
+        "opponent_city_tiles",
+        "wood_tiles",
+        "coal_tiles",
+        "uranium_tiles",
+        "resource_tiles",
+    }
+)
+METRIC_SUM_NAMES = frozenset(
+    {
+        "own_city_fuel",
+        "opponent_city_fuel",
+        "own_city_upkeep",
+        "opponent_city_upkeep",
+        "own_cargo_fuel",
+        "opponent_cargo_fuel",
+        "wood_amount",
+        "coal_amount",
+        "uranium_amount",
+    }
+)
+_UNARY_OPS = frozenset({"abs", "neg", "tanh", "exp_decay", "log1p_abs", "square"})
 _BINARY_OPS = frozenset({"add", "sub", "mul", "safe_div", "min", "max"})
 _MAX_DEPTH = 12
 _MAX_NODES = 128
@@ -51,16 +82,41 @@ class RewardComponent:
 
 
 @dataclass(frozen=True)
+class DerivedMetric:
+    name: str
+    expression: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
 class RewardProgram:
     components: tuple[RewardComponent, ...]
+    derived_metrics: tuple[DerivedMetric, ...] = ()
     reward_scale: float = 0.2
     gamma: float = 0.995
-    version: int = REWARD_PROGRAM_VERSION
+    version: int = 1
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> RewardProgram:
-        if int(value.get("version", REWARD_PROGRAM_VERSION)) != REWARD_PROGRAM_VERSION:
+        version = int(value.get("version", 1))
+        if version not in SUPPORTED_REWARD_PROGRAM_VERSIONS:
             raise ValueError("Unsupported reward program version")
+        raw_derived = value.get("derived_metrics", [])
+        if version == 1 and raw_derived:
+            raise ValueError("Reward program v1 cannot contain derived metrics")
+        if not isinstance(raw_derived, list) or len(raw_derived) > 16:
+            raise ValueError("Reward program allows at most 16 derived metrics")
+        derived_metrics = []
+        derived_names: set[str] = set()
+        for raw in raw_derived:
+            if not isinstance(raw, Mapping):
+                raise ValueError("Derived metrics must be objects")
+            name = str(raw.get("name", ""))
+            if not name or name in derived_names or name in METRIC_NAMES or not name.replace("_", "").isalnum():
+                raise ValueError(f"Invalid or duplicate derived metric name: {name!r}")
+            expression = raw.get("expression")
+            _validate_expression(expression, derived_names=derived_names)
+            derived_names.add(name)
+            derived_metrics.append(DerivedMetric(name, expression))
         raw_components = value.get("components")
         if not isinstance(raw_components, list) or not 1 <= len(raw_components) <= 16:
             raise ValueError("Reward program requires 1 to 16 components")
@@ -73,7 +129,7 @@ class RewardProgram:
             if not name or name in names or not name.replace("_", "").isalnum():
                 raise ValueError(f"Invalid or duplicate reward component name: {name!r}")
             expression = raw.get("expression")
-            _validate_expression(expression)
+            _validate_expression(expression, derived_names=derived_names)
             weight = float(raw.get("weight", 1.0))
             if not isfinite(weight) or not -5.0 <= weight <= 5.0:
                 raise ValueError("Reward component weights must be finite and in [-5, 5]")
@@ -85,10 +141,16 @@ class RewardProgram:
             raise ValueError("reward_scale must be in [0, 0.5]")
         if not isfinite(gamma) or not 0.9 <= gamma <= 1.0:
             raise ValueError("reward gamma must be in [0.9, 1.0]")
-        return cls(tuple(components), reward_scale=reward_scale, gamma=gamma)
+        return cls(
+            tuple(components),
+            tuple(derived_metrics),
+            reward_scale=reward_scale,
+            gamma=gamma,
+            version=version,
+        )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "version": self.version,
             "components": [
                 {"name": item.name, "expression": dict(item.expression), "weight": item.weight}
@@ -97,10 +159,24 @@ class RewardProgram:
             "reward_scale": self.reward_scale,
             "gamma": self.gamma,
         }
+        if self.version >= 2:
+            value["derived_metrics"] = [
+                {"name": item.name, "expression": dict(item.expression)} for item in self.derived_metrics
+            ]
+        return value
 
     def potential(self, metrics: GameMetrics) -> tuple[float, dict[str, float]]:
+        derived_values: dict[str, float] = {}
+        for derived in self.derived_metrics:
+            derived_values[derived.name] = max(
+                -1.0,
+                min(1.0, _evaluate_expression(derived.expression, metrics, derived_values)),
+            )
         values = {
-            component.name: max(-1.0, min(1.0, _evaluate_expression(component.expression, metrics)))
+            component.name: max(
+                -1.0,
+                min(1.0, _evaluate_expression(component.expression, metrics, derived_values)),
+            )
             for component in self.components
         }
         potential = tanh(sum(component.weight * values[component.name] for component in self.components))
@@ -131,8 +207,9 @@ class RewardProgram:
         )
 
 
-def _validate_expression(expression: object) -> None:
+def _validate_expression(expression: object, *, derived_names: set[str] | None = None) -> None:
     nodes = 0
+    known_derived = derived_names or set()
 
     def visit(node: object, depth: int) -> None:
         nonlocal nodes
@@ -150,6 +227,31 @@ def _validate_expression(expression: object) -> None:
         if op == "metric":
             if node.get("name") not in METRIC_NAMES:
                 raise ValueError(f"Unknown reward metric: {node.get('name')}")
+            return
+        if op == "derived":
+            if node.get("name") not in known_derived:
+                raise ValueError(f"Unknown or forward-referenced derived metric: {node.get('name')}")
+            return
+        if op == "count":
+            if node.get("selector") not in METRIC_SELECTORS:
+                raise ValueError(f"Unknown metric selector: {node.get('selector')}")
+            return
+        if op == "sum":
+            if node.get("name") not in METRIC_SUM_NAMES:
+                raise ValueError(f"Unknown metric sum: {node.get('name')}")
+            return
+        if op == "distance":
+            if node.get("source") not in METRIC_SELECTORS or node.get("target") not in METRIC_SELECTORS:
+                raise ValueError("Unknown distance selector")
+            if node.get("reduce") not in {"min", "mean", "max"}:
+                raise ValueError("Distance reduction must be min, mean, or max")
+            return
+        if op == "density":
+            if node.get("source") not in METRIC_SELECTORS or node.get("target") not in METRIC_SELECTORS:
+                raise ValueError("Unknown density selector")
+            radius = int(node.get("radius", 0))
+            if not 1 <= radius <= 8:
+                raise ValueError("Density radius must be in [1, 8]")
             return
         if op in _UNARY_OPS:
             visit(node.get("value"), depth + 1)
@@ -174,18 +276,62 @@ def _validate_expression(expression: object) -> None:
     visit(expression, 0)
 
 
-def _evaluate_expression(expression: Mapping[str, Any], metrics: GameMetrics) -> float:
+def _evaluate_expression(
+    expression: Mapping[str, Any],
+    metrics: GameMetrics,
+    derived_values: Mapping[str, float] | None = None,
+) -> float:
     op = expression["op"]
     if op == "constant":
         return float(expression["value"])
     if op == "metric":
         return metrics.get(str(expression["name"]))
+    if op == "derived":
+        values = derived_values or {}
+        return float(values[str(expression["name"])])
+    context = metrics.context
+    if op in {"count", "sum", "distance", "density"} and context is None:
+        return 0.0
+    if op == "count":
+        return min(len(context.positions[str(expression["selector"])]) / 32.0, 1.0)
+    if op == "sum":
+        return tanh(log1p(max(0.0, context.sums[str(expression["name"])])) / 8.0)
+    if op == "distance":
+        source = context.positions[str(expression["source"])]
+        target = context.positions[str(expression["target"])]
+        if not source or not target:
+            return 1.0
+        distances = [abs(ax - bx) + abs(ay - by) for ax, ay in source for bx, by in target]
+        reduction = str(expression["reduce"])
+        distance = (
+            min(distances)
+            if reduction == "min"
+            else max(distances)
+            if reduction == "max"
+            else sum(distances) / len(distances)
+        )
+        return min(float(distance) / max(context.width + context.height - 2, 1), 1.0)
+    if op == "density":
+        source = context.positions[str(expression["source"])]
+        target = context.positions[str(expression["target"])]
+        if not source:
+            return 0.0
+        radius = int(expression["radius"])
+        counts = [sum(abs(ax - bx) + abs(ay - by) <= radius for bx, by in target) for ax, ay in source]
+        return min((sum(counts) / len(counts)) / max((2 * radius + 1) ** 2, 1), 1.0)
     if op in _UNARY_OPS:
-        value = _evaluate_expression(expression["value"], metrics)
-        return {"abs": abs, "neg": lambda item: -item, "tanh": tanh}[op](value)
+        value = _evaluate_expression(expression["value"], metrics, derived_values)
+        return {
+            "abs": abs,
+            "neg": lambda item: -item,
+            "tanh": tanh,
+            "exp_decay": lambda item: exp(-abs(item)),
+            "log1p_abs": lambda item: copysign(log1p(abs(item)), item),
+            "square": lambda item: item * item,
+        }[op](value)
     if op in _BINARY_OPS:
-        left = _evaluate_expression(expression["left"], metrics)
-        right = _evaluate_expression(expression["right"], metrics)
+        left = _evaluate_expression(expression["left"], metrics, derived_values)
+        right = _evaluate_expression(expression["right"], metrics, derived_values)
         if op == "add":
             return left + right
         if op == "sub":
@@ -196,11 +342,11 @@ def _evaluate_expression(expression: Mapping[str, Any], metrics: GameMetrics) ->
             return left / (right if abs(right) >= 1e-6 else (1e-6 if right >= 0 else -1e-6))
         return min(left, right) if op == "min" else max(left, right)
     if op == "clip":
-        value = _evaluate_expression(expression["value"], metrics)
+        value = _evaluate_expression(expression["value"], metrics, derived_values)
         return max(float(expression["low"]), min(float(expression["high"]), value))
-    condition = _evaluate_expression(expression["condition"], metrics)
+    condition = _evaluate_expression(expression["condition"], metrics, derived_values)
     branch = "when_true" if condition > 0 else "when_false"
-    return _evaluate_expression(expression[branch], metrics)
+    return _evaluate_expression(expression[branch], metrics, derived_values)
 
 
 def default_reward_program() -> RewardProgram:
@@ -221,3 +367,89 @@ def default_reward_program() -> RewardProgram:
             "gamma": 0.995,
         }
     )
+
+
+def calibrate_reward_scale(
+    parent: RewardProgram,
+    child: RewardProgram,
+    transitions: Iterable[tuple[GameMetrics, GameMetrics]],
+    *,
+    parent_effective_scale: float | None = None,
+    minimum_samples: int = 256,
+    activity_threshold: float = 0.01,
+) -> tuple[RewardProgram, dict[str, Any]]:
+    """Match dense shaping RMS without amplifying unseen sparse components."""
+    pairs = list(transitions)
+    if not pairs:
+        raise ValueError("Reward calibration requires transitions")
+
+    def traces(program: RewardProgram) -> tuple[dict[str, list[float]], list[dict[str, float]], list[dict[str, float]]]:
+        deltas: dict[str, list[float]] = defaultdict(list)
+        previous_values = []
+        following_values = []
+        for previous, following in pairs:
+            _, before = program.potential(previous)
+            _, after = program.potential(following)
+            previous_values.append(before)
+            following_values.append(after)
+            for component in program.components:
+                deltas[component.name].append(program.gamma * after[component.name] - before[component.name])
+        return deltas, previous_values, following_values
+
+    def dense_rms(program: RewardProgram) -> tuple[float | None, dict[str, float], list[str], float]:
+        deltas, before, after = traces(program)
+        rates = {name: sum(abs(value) > 1e-6 for value in values) / len(values) for name, values in deltas.items()}
+        dense = [component for component in program.components if rates[component.name] >= activity_threshold]
+        if len(pairs) < minimum_samples or not dense:
+            return None, rates, [], 0.0
+        potential_before = [
+            tanh(sum(component.weight * values[component.name] for component in dense)) for values in before
+        ]
+        potential_after = [
+            tanh(sum(component.weight * values[component.name] for component in dense)) for values in after
+        ]
+        shaping = [
+            program.gamma * following - previous for previous, following in zip(potential_before, potential_after)
+        ]
+        absolute = sorted(abs(value) for value in shaping)
+        cap = absolute[min(len(absolute) - 1, int(0.99 * (len(absolute) - 1)))]
+        winsorized_fraction = sum(abs(value) > cap for value in shaping) / len(shaping)
+        rms = sqrt(sum(min(abs(value), cap) ** 2 for value in shaping) / len(shaping))
+        return rms, rates, [component.name for component in dense], winsorized_fraction
+
+    parent_rms, parent_rates, parent_dense, parent_winsorized = dense_rms(parent)
+    child_rms, child_rates, child_dense, child_winsorized = dense_rms(child)
+    parent_scale = float(parent_effective_scale if parent_effective_scale is not None else parent.reward_scale)
+    nominal_ratio = max(0.8, min(1.25, child.reward_scale / max(parent.reward_scale, 1e-6)))
+    fallback = parent_rms is None or child_rms is None or parent_rms < 1e-8 or child_rms < 1e-8
+    unbounded = parent_scale * nominal_ratio if fallback else parent_scale * parent_rms * nominal_ratio / child_rms
+    effective = max(0.01, min(0.5, max(parent_scale * 0.5, min(parent_scale * 2.0, unbounded))))
+    if not isfinite(effective):
+        raise ValueError("Reward calibration produced a non-finite scale")
+    calibrated = RewardProgram(
+        child.components,
+        child.derived_metrics,
+        reward_scale=effective,
+        gamma=child.gamma,
+        version=child.version,
+    )
+    return calibrated, {
+        "parent_effective_scale": parent_scale,
+        "proposed_scale": child.reward_scale,
+        "effective_scale": effective,
+        "unbounded_scale": unbounded,
+        "clipped": not isclose(effective, unbounded, rel_tol=1e-9, abs_tol=1e-12),
+        "fallback": fallback,
+        "sample_count": len(pairs),
+        "activity_threshold": activity_threshold,
+        "parent_dense_components": parent_dense,
+        "child_dense_components": child_dense,
+        "parent_sparse_components": [name for name in parent_rates if name not in parent_dense],
+        "child_sparse_components": [name for name in child_rates if name not in child_dense],
+        "parent_component_activity": parent_rates,
+        "child_component_activity": child_rates,
+        "parent_winsorized_fraction": parent_winsorized,
+        "child_winsorized_fraction": child_winsorized,
+        "parent_dense_rms": parent_rms,
+        "child_dense_rms": child_rms,
+    }

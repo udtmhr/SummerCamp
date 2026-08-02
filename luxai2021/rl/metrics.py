@@ -14,11 +14,32 @@ _FUEL_RATE = {"wood": 1.0, "coal": 10.0, "uranium": 40.0}
 
 
 @dataclass(frozen=True)
+class MetricContext:
+    """Immutable, candidate-independent board data exposed to the metric DSL."""
+
+    width: int
+    height: int
+    positions: Mapping[str, tuple[tuple[int, int], ...]]
+    sums: Mapping[str, float]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "positions",
+            MappingProxyType({str(name): tuple(value) for name, value in self.positions.items()}),
+        )
+        object.__setattr__(
+            self, "sums", MappingProxyType({str(name): float(value) for name, value in self.sums.items()})
+        )
+
+
+@dataclass(frozen=True)
 class GameMetrics:
     """Normalized, team-relative state exposed to evolved reward programs."""
 
     turn: int
     values: Mapping[str, float]
+    context: MetricContext | None = None
 
     def __post_init__(self) -> None:
         clean = {str(name): float(value) for name, value in self.values.items()}
@@ -106,4 +127,58 @@ def metrics_from_game(game: object, team: int) -> GameMetrics:
             8.0,
         ),
     }
-    return GameMetrics(turn=turn, values=values)
+    own_units = tuple(game.state["teamStates"][team]["units"].values())
+    opponent_units = tuple(game.state["teamStates"][1 - team]["units"].values())
+    own_city_cells = tuple(cell for city in game.cities.values() if city.team == team for cell in city.city_cells)
+    opponent_city_cells = tuple(
+        cell for city in game.cities.values() if city.team == 1 - team for cell in city.city_cells
+    )
+    resources = tuple(cell for cell in game.map.resources if cell.has_resource())
+
+    def unit_positions(units: tuple[object, ...], kind: str | None = None) -> tuple[tuple[int, int], ...]:
+        selected = units
+        if kind == "worker":
+            selected = tuple(unit for unit in units if unit.is_worker())
+        elif kind == "cart":
+            selected = tuple(unit for unit in units if unit.is_cart())
+        return tuple((int(unit.pos.x), int(unit.pos.y)) for unit in selected)
+
+    def cell_positions(cells: tuple[object, ...]) -> tuple[tuple[int, int], ...]:
+        return tuple((int(cell.pos.x), int(cell.pos.y)) for cell in cells)
+
+    resource_positions = {
+        resource: cell_positions(tuple(cell for cell in resources if cell.resource.type == resource))
+        for resource in _FUEL_RATE
+    }
+    positions = {
+        "own_units": unit_positions(own_units),
+        "own_workers": unit_positions(own_units, "worker"),
+        "own_carts": unit_positions(own_units, "cart"),
+        "opponent_units": unit_positions(opponent_units),
+        "opponent_workers": unit_positions(opponent_units, "worker"),
+        "opponent_carts": unit_positions(opponent_units, "cart"),
+        "own_city_tiles": cell_positions(own_city_cells),
+        "opponent_city_tiles": cell_positions(opponent_city_cells),
+        "wood_tiles": resource_positions["wood"],
+        "coal_tiles": resource_positions["coal"],
+        "uranium_tiles": resource_positions["uranium"],
+        "resource_tiles": cell_positions(resources),
+    }
+    sums = {
+        "own_city_fuel": own["city_fuel"],
+        "opponent_city_fuel": opponent["city_fuel"],
+        "own_city_upkeep": own["city_upkeep"],
+        "opponent_city_upkeep": opponent["city_upkeep"],
+        "own_cargo_fuel": own["cargo_fuel"],
+        "opponent_cargo_fuel": opponent["cargo_fuel"],
+        "wood_amount": sum(float(cell.resource.amount) for cell in resources if cell.resource.type == "wood"),
+        "coal_amount": sum(float(cell.resource.amount) for cell in resources if cell.resource.type == "coal"),
+        "uranium_amount": sum(float(cell.resource.amount) for cell in resources if cell.resource.type == "uranium"),
+    }
+    context = MetricContext(
+        width=int(game.map.width),
+        height=int(game.map.height),
+        positions=positions,
+        sums=sums,
+    )
+    return GameMetrics(turn=turn, values=values, context=context)

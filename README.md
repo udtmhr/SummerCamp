@@ -593,6 +593,13 @@ upkeep at destruction, illegal actions rejected by the engine, the candidate's s
 the resulting score/teacher-score/KL deltas. Dynamic action restrictions are applied only by intersecting them with
 the existing legal-action mask, so an existing forbidden action can never be re-enabled by evolution.
 
+The four islands have fixed roles: `i00` makes one or two coefficient changes, `i01` makes one local AST edit,
+`i02` adds or removes a feature, and `i03` performs large edits, crossover, generated Metric DSL, or restart.
+Non-restart candidates inherit the primary parent's policy checkpoint; only `i00` also inherits its value head.
+Value-head resets run a critic-only warm-up before PPO, and inherited tensors use a relative L2-SP constraint with
+cosine decay. The illegal-action auxiliary loss acts on unmasked logits while sampling still uses the hard mask.
+Generated metrics are bounded JSON DSL expressions rather than Python code.
+
 First verify the 24-candidate schedule without training:
 
 ```bash
@@ -632,10 +639,10 @@ uv run --locked python examples/evolve_rl.py \
 ```
 
 Candidate definitions, failures, training checkpoints, league games, and the promotion report are written under the
-run directory so an interrupted search remains inspectable and resumable. `latest_rl.pt` uses checkpoint schema v2 and
-stores cumulative decisions, turns, episodes, optimizer state, and RNG state. Re-running a stage resumes its remaining
-decision budget. Schema-v1 checkpoints remain loadable; their consumed budget is conservatively estimated from their
-recorded elapsed-time fraction.
+run directory so an interrupted search remains inspectable and resumable. `latest_rl.pt` uses checkpoint schema v3 and
+stores cumulative decisions, turns, episodes, optimizer/RNG state, constraint progress, and the joint-update ramp.
+Re-running a stage resumes its remaining decision budget. Schema-v1/v2 checkpoints remain loadable; a v1 checkpoint's
+consumed budget is conservatively estimated from its recorded elapsed-time fraction.
 
 Independent candidates can use another GPU machine without a shared filesystem. The coordinator keeps the authoritative
 queue and artifacts locally and exposes a loopback-only Job API. Start it on PC1; omitting `--coordinator-only` lets PC1
@@ -671,7 +678,7 @@ Keep both Mac SSH processes running. In a ws3 terminal, verify the forwarded end
 curl http://127.0.0.1:18765/healthz
 ```
 
-It should return `{"status":"ok","api_version":1}`. `Connection refused` means the SSH tunnel is not running on
+It should return `{"status":"ok","api_version":2}`. `Connection refused` means the SSH tunnel is not running on
 ws3; checking PC1's port `8765` does not verify ws3's forwarded port `18765`.
 
 Start the ws3 Docker worker in another terminal. Host networking lets the container reach the loopback SSH tunnel;
@@ -696,8 +703,9 @@ docker run --rm --gpus all --network host \
 
 The repository revision and base model files must exist in the image on both machines. Checkpoint/cache path flags are
 local to each machine, so pass ws3-specific paths after the image command when needed. The API sends candidate context
-to preserve parent-change feedback, returns completed checkpoints and diagnostics to PC1, and downloads the short-stage
-checkpoint when a medium-stage job moves to another machine. Completion uploads are idempotent, while stale claims older
+to preserve parent-change feedback, returns completed checkpoints and diagnostics to PC1, and streams parent/resume
+checkpoints with SHA-256 descriptors. Workers cache downloads by content hash. The v1 claim/upload routes remain
+available for older workers. Completion uploads are idempotent, while stale claims older
 than 12 hours are requeued. Every 10 minutes by default, ws3 uploads `latest_rl.pt` with a lease heartbeat; a restarted
 worker downloads that partial stage and continues its remaining decision budget. Ctrl-C releases the lease after a
 best-effort final checkpoint upload. Change the transfer interval with `--job-heartbeat-seconds`. Set

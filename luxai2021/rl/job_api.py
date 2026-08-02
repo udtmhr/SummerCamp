@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-# ruff: noqa: S310
+# ruff: noqa: C901, S310
 import base64
+import hashlib
 import hmac
 import io
 import json
@@ -22,22 +23,31 @@ from luxai2021.rl.evolution import (
     FilesystemJobQueue,
 )
 
-JOB_API_VERSION = 1
+JOB_API_VERSION = 2
 
 
-def encode_artifact_directory(path: Path) -> str | None:
-    """Return a zip archive suitable for JSON transport, or None when absent."""
+def archive_artifact_directory(path: Path) -> bytes | None:
     if not path.exists():
         return None
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for artifact in sorted(item for item in path.rglob("*") if item.is_file()):
             archive.write(artifact, artifact.relative_to(path).as_posix())
-    return base64.b64encode(output.getvalue()).decode("ascii")
+    return output.getvalue()
+
+
+def encode_artifact_directory(path: Path) -> str | None:
+    """Return a zip archive suitable for JSON transport, or None when absent."""
+    payload = archive_artifact_directory(path)
+    return base64.b64encode(payload).decode("ascii") if payload is not None else None
 
 
 def extract_artifact_directory(encoded: str, destination: Path) -> None:
     payload = base64.b64decode(encoded, validate=True)
+    extract_artifact_bytes(payload, destination)
+
+
+def extract_artifact_bytes(payload: bytes, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
         for info in archive.infolist():
@@ -80,7 +90,28 @@ class JobApiClient:
             raise RuntimeError(message) from error
 
     def claim(self, worker_id: str) -> dict[str, Any] | None:
-        return self._post("/v1/claim", {"worker_id": worker_id})
+        return self._post("/v2/claim", {"worker_id": worker_id})
+
+    def download_artifact(self, descriptor: dict[str, Any], cache_dir: Path, destination: Path) -> None:
+        digest = str(descriptor["sha256"])
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cached = cache_dir / f"{digest}.zip"
+        payload = cached.read_bytes() if cached.exists() else None
+        if payload is None or hashlib.sha256(payload).hexdigest() != digest:
+            headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+            request = urllib.request.Request(
+                f"{self.base_url}{descriptor['download_url']}",
+                headers=headers,
+                method="GET",
+            )
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                payload = response.read()
+            if hashlib.sha256(payload).hexdigest() != digest:
+                raise ValueError("Downloaded artifact checksum does not match descriptor")
+            temporary = cached.with_suffix(".tmp")
+            temporary.write_bytes(payload)
+            temporary.replace(cached)
+        extract_artifact_bytes(payload, destination)
 
     def health(self) -> dict[str, Any]:
         request = urllib.request.Request(f"{self.base_url}/healthz", method="GET")
@@ -147,19 +178,111 @@ class JobApiServer:
         self.store = EvolutionStore(run_dir)
         self.queue = queue
         self.token = token
+        self.transport_dir = run_dir / "job-api-artifacts"
+        self.transport_dir.mkdir(parents=True, exist_ok=True)
+        self.artifacts: dict[str, Path] = {}
         self.httpd = _JobApiHttpServer((host, int(port_text)), self._handler_class())
         self.thread: threading.Thread | None = None
+
+    def _artifact_descriptor(
+        self,
+        path: Path,
+        *,
+        candidate_id: str,
+        stage: str,
+        base_name: str,
+        kind: str,
+    ) -> dict[str, Any]:
+        payload = archive_artifact_directory(path)
+        if payload is None:
+            raise FileNotFoundError(path)
+        digest = hashlib.sha256(payload).hexdigest()
+        archive_path = self.transport_dir / f"{digest}.zip"
+        if not archive_path.exists():
+            temporary = archive_path.with_suffix(".tmp")
+            temporary.write_bytes(payload)
+            temporary.replace(archive_path)
+        self.artifacts[digest] = archive_path
+        return {
+            "kind": kind,
+            "candidate_id": candidate_id,
+            "stage": stage,
+            "base_name": base_name,
+            "sha256": digest,
+            "size": len(payload),
+            "download_url": f"/v2/artifacts/{digest}",
+        }
+
+    def _input_artifact(self, job: EvolutionJob, candidate: object) -> dict[str, Any] | None:
+        current = self.run_dir / "artifacts" / job.candidate_id / job.stage / job.base_name
+        if current.exists():
+            return self._artifact_descriptor(
+                current,
+                candidate_id=job.candidate_id,
+                stage=job.stage,
+                base_name=job.base_name,
+                kind="resume",
+            )
+        predecessor_stages = []
+        if job.stage == "medium-resattn8":
+            predecessor_stages = ["short-resattn8"]
+        elif job.stage == "final-resattn8":
+            predecessor_stages = ["medium-resattn8", "short-resattn8"]
+        elif job.stage == "final-unet":
+            predecessor_stages = ["probe-unet"]
+        for stage in predecessor_stages:
+            path = self.run_dir / "artifacts" / job.candidate_id / stage / job.base_name
+            if path.exists():
+                return self._artifact_descriptor(
+                    path,
+                    candidate_id=job.candidate_id,
+                    stage=stage,
+                    base_name=job.base_name,
+                    kind="resume",
+                )
+        candidates = {item.candidate_id: item for item in self.store.candidates()}
+        primary = getattr(candidate, "primary_parent_id", None)
+        parent_ids = tuple(getattr(candidate, "parent_ids", ()))
+        pending = [primary or (parent_ids[0] if parent_ids else None)]
+        visited = set()
+        stages = (
+            ("final-unet", "probe-unet", "medium-unet", "short-unet")
+            if job.base_name == "unet"
+            else ("final-resattn8", "medium-resattn8", "short-resattn8")
+        )
+        while pending:
+            parent_id = pending.pop(0)
+            if parent_id is None or parent_id in visited:
+                continue
+            visited.add(parent_id)
+            parent = candidates.get(parent_id)
+            for stage in stages:
+                path = self.run_dir / "artifacts" / parent_id / stage / job.base_name
+                if path.exists():
+                    return self._artifact_descriptor(
+                        path,
+                        candidate_id=parent_id,
+                        stage=stage,
+                        base_name=job.base_name,
+                        kind="parent",
+                    )
+            if parent is not None:
+                pending.extend((parent.primary_parent_id, *parent.parent_ids))
+        if getattr(candidate, "inheritance_mode", "base") != "base" and job.base_name != "unet":
+            message = f"Candidate {job.candidate_id} is missing its inherited checkpoint"
+            raise ValueError(message)
+        return None
 
     @property
     def address(self) -> tuple[str, int]:
         host, port = self.httpd.server_address[:2]
         return str(host), int(port)
 
-    def _handler_class(self) -> type[BaseHTTPRequestHandler]:  # noqa: C901
+    def _handler_class(self) -> type[BaseHTTPRequestHandler]:
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
-            server_version = "LuxEvolutionJobAPI/1"
+            server_version = "LuxEvolutionJobAPI/2"
 
             def log_message(self, _format: str, *_args: object) -> None:
                 return
@@ -183,6 +306,22 @@ class JobApiServer:
             def do_GET(self) -> None:
                 if self.path in {"/", "/healthz"}:
                     self._json(HTTPStatus.OK, {"status": "ok", "api_version": JOB_API_VERSION})
+                elif self.path.startswith("/v2/artifacts/"):
+                    if not self._authorized():
+                        self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+                        return
+                    digest = self.path.removeprefix("/v2/artifacts/")
+                    artifact = owner.artifacts.get(digest)
+                    if artifact is None or not artifact.exists():
+                        self._json(HTTPStatus.NOT_FOUND, {"error": "artifact not found"})
+                        return
+                    payload = artifact.read_bytes()
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "application/zip")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.send_header("X-Artifact-SHA256", digest)
+                    self.end_headers()
+                    self.wfile.write(payload)
                 else:
                     self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
@@ -193,7 +332,7 @@ class JobApiServer:
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
                     payload = json.loads(self.rfile.read(length)) if length else {}
-                    if self.path == "/v1/claim":
+                    if self.path in {"/v1/claim", "/v2/claim"}:
                         self._claim(payload)
                     elif self.path == "/v1/complete":
                         self._complete(payload)
@@ -216,31 +355,34 @@ class JobApiServer:
                 candidates = owner.store.candidates()
                 candidate = next(item for item in candidates if item.candidate_id == job.candidate_id)
                 manifest = json.loads((owner.run_dir / "manifest.json").read_text(encoding="utf-8"))
+                try:
+                    descriptor = owner._input_artifact(job, candidate)
+                except Exception:
+                    owner.queue.release(claimed_path)
+                    raise
                 input_artifact = None
-                current_dir = owner.run_dir / "artifacts" / job.candidate_id / job.stage / job.base_name
-                current_encoded = encode_artifact_directory(current_dir)
-                if current_encoded is not None:
-                    input_artifact = {
-                        "stage": job.stage,
-                        "base_name": job.base_name,
-                        "zip_base64": current_encoded,
-                    }
-                elif job.stage == "medium-resattn8":
-                    input_stage = "short-resattn8"
-                    input_base = "resattn8"
-                    input_dir = owner.run_dir / "artifacts" / job.candidate_id / input_stage / input_base
-                    encoded = encode_artifact_directory(input_dir)
-                    if encoded is None:
-                        raise ValueError("Medium job is missing its short-stage checkpoint")
-                    input_artifact = {
-                        "stage": input_stage,
-                        "base_name": input_base,
-                        "zip_base64": encoded,
-                    }
+                input_artifacts = []
+                if descriptor is not None:
+                    if self.path == "/v1/claim":
+                        source = (
+                            owner.run_dir
+                            / "artifacts"
+                            / str(descriptor["candidate_id"])
+                            / str(descriptor["stage"])
+                            / str(descriptor["base_name"])
+                        )
+                        input_artifact = {
+                            "candidate_id": descriptor["candidate_id"],
+                            "stage": descriptor["stage"],
+                            "base_name": descriptor["base_name"],
+                            "zip_base64": encode_artifact_directory(source),
+                        }
+                    else:
+                        input_artifacts = [descriptor]
                 self._json(
                     HTTPStatus.OK,
                     {
-                        "api_version": JOB_API_VERSION,
+                        "api_version": 1 if self.path == "/v1/claim" else JOB_API_VERSION,
                         "lease_id": claimed_path.name,
                         "job": job.to_dict(),
                         "candidate": candidate.to_dict(),
@@ -248,6 +390,7 @@ class JobApiServer:
                         "results": [asdict(item) for item in owner.store.results()],
                         "manifest": manifest,
                         "input_artifact": input_artifact,
+                        "input_artifacts": input_artifacts,
                     },
                 )
 
