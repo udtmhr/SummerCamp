@@ -82,6 +82,20 @@ class TrainingResumeState:
     python_random_state: object | None = None
     constraint_progress: int = 0
     joint_update: int = 0
+    source_checkpoint: str | None = None
+    source_checkpoint_mismatch: bool = False
+
+
+def _checkpoint_cuda_rng_state(checkpoint: Mapping[str, Any], device_index: int) -> torch.Tensor | None:
+    state = checkpoint.get("cuda_rng_state")
+    if isinstance(state, torch.Tensor):
+        return state
+    legacy_states = checkpoint.get("cuda_rng_state_all")
+    if not isinstance(legacy_states, (list, tuple)) or not legacy_states:
+        return None
+    if 0 <= device_index < len(legacy_states):
+        return legacy_states[device_index]
+    return legacy_states[0]
 
 
 def finish_episode(
@@ -578,6 +592,11 @@ class PPOTrainer:
         training_state: Mapping[str, Any] | None = None,
     ) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        cuda_rng_state = (
+            torch.cuda.get_rng_state(self.device).to(device="cpu", dtype=torch.uint8)
+            if self.device.type == "cuda" and torch.cuda.is_available()
+            else None
+        )
         torch.save(
             {
                 "schema_version": TRAINING_CHECKPOINT_SCHEMA_VERSION,
@@ -594,7 +613,9 @@ class PPOTrainer:
                 "metrics": metrics,
                 "training_state": dict(training_state or {}),
                 "torch_rng_state": torch.get_rng_state(),
-                "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                "cuda_rng_state": cuda_rng_state,
+                # Keep the old field readable by schema-v3 consumers without coupling it to visible GPU count.
+                "cuda_rng_state_all": [cuda_rng_state] if cuda_rng_state is not None else None,
             },
             path,
         )
@@ -607,12 +628,15 @@ class PPOTrainer:
         reward_program: RewardProgram,
         legacy_target_decisions: int | None = None,
         legacy_stage_seconds: int | None = None,
+        allow_compatible_source_checkpoint: bool = False,
     ) -> TrainingResumeState:
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         schema_version = int(checkpoint.get("schema_version", 1))
         if schema_version not in {1, 2, TRAINING_CHECKPOINT_SCHEMA_VERSION}:
             raise ValueError("Unsupported RL training checkpoint schema")
-        if checkpoint.get("source_checkpoint") != source_checkpoint:
+        stored_source_checkpoint = checkpoint.get("source_checkpoint")
+        source_checkpoint_mismatch = stored_source_checkpoint != source_checkpoint
+        if source_checkpoint_mismatch and not allow_compatible_source_checkpoint:
             raise ValueError("RL resume source checkpoint does not match")
         if checkpoint.get("reward_program") != reward_program.to_dict():
             raise ValueError("RL resume reward program does not match")
@@ -631,9 +655,16 @@ class PPOTrainer:
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         if checkpoint.get("torch_rng_state") is not None:
             torch.set_rng_state(checkpoint["torch_rng_state"].to(device="cpu", dtype=torch.uint8))
-        if torch.cuda.is_available() and checkpoint.get("cuda_rng_state_all") is not None:
-            cuda_rng_states = [state.to(device="cpu", dtype=torch.uint8) for state in checkpoint["cuda_rng_state_all"]]
-            torch.cuda.set_rng_state_all(cuda_rng_states)
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            device_index = self.device.index
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            cuda_rng_state = _checkpoint_cuda_rng_state(checkpoint, device_index)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(
+                    cuda_rng_state.to(device="cpu", dtype=torch.uint8),
+                    self.device,
+                )
 
         metrics = dict(checkpoint.get("metrics", {}))
         state = (
@@ -654,6 +685,8 @@ class PPOTrainer:
             python_random_state=state.get("python_random_state"),
             constraint_progress=int(state.get("constraint_progress", decisions)),
             joint_update=int(state.get("joint_update", max(0, int(checkpoint["update"]) + 1))),
+            source_checkpoint=str(stored_source_checkpoint) if stored_source_checkpoint is not None else None,
+            source_checkpoint_mismatch=source_checkpoint_mismatch,
         )
 
     def load_training_checkpoint(

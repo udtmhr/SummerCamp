@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# ruff: noqa: BLE001, C901, INP001, PLR0912, PLR0913, PLR0915, PLR2004, S311, S607
+# ruff: noqa: C901, INP001, PLR0912, PLR0913, PLR0915, PLR2004, S311, S607
 import argparse
 import atexit
 import copy
@@ -14,6 +14,7 @@ import socket
 import subprocess
 import threading
 import time
+import traceback
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -66,6 +67,65 @@ DEFAULT_RESATTN8 = "models/distilled/resattn8_v2_selfplay_ft/best.pt"
 DEFAULT_TEACHER = "models/teachers/lux_2021_first_place/062179520_weights.pt"
 DEFAULT_TEACHER_CACHE = "models/teachers/lux_2021_first_place/cache"
 DEFAULT_PREPARED_CACHE = "models/teachers/lux_2021_first_place/prepared"
+
+_FATAL_CUDA_ERROR_MARKERS = (
+    "unspecified launch failure",
+    "device-side assert triggered",
+    "illegal memory access",
+    "device is lost",
+    "driver shutting down",
+)
+
+_RUN_MANIFEST_ARGUMENTS = (
+    "unet_checkpoint",
+    "resattn8_checkpoint",
+    "teacher_checkpoint",
+    "teacher_cache_dir",
+    "prepared_cache_dir",
+    "seed",
+    "islands",
+    "initial_per_island",
+    "generations",
+    "short_seconds",
+    "medium_seconds",
+    "final_seconds",
+    "short_decisions",
+    "medium_decisions",
+    "final_decisions",
+    "decisions_per_update",
+    "rollout_envs",
+    "medium_count",
+    "final_count",
+    "episodes_per_update",
+    "max_turns",
+    "screening_seeds",
+    "medium_seeds",
+    "final_seeds",
+    "screening_seed_start",
+    "final_seed_start",
+    "bc_batch_size",
+    "bc_replays",
+    "no_bc_anchor",
+    "recover_stale_job_seconds",
+    "critic_warmup_episodes",
+    "unet_probe_every",
+    "resattn8_only",
+)
+
+
+def _is_fatal_cuda_error(error: BaseException) -> bool:
+    message = str(error).lower()
+    return "cuda" in message and any(marker in message for marker in _FATAL_CUDA_ERROR_MARKERS)
+
+
+def _synchronize_cuda(device: torch.device, phase: str) -> None:
+    if device.type != "cuda":
+        return
+    try:
+        torch.cuda.synchronize(device)
+    except RuntimeError as error:
+        message = f"CUDA failure during {phase}: {error}"
+        raise RuntimeError(message) from error
 
 
 def parse_args() -> argparse.Namespace:
@@ -362,6 +422,7 @@ def train_candidate(
     rng = random.Random(seed)
     constraint_progress = 0
     joint_update = 0
+    resume_metadata: dict[str, object] | None = None
 
     def make_trainer() -> PPOTrainer:
         return PPOTrainer(
@@ -389,7 +450,15 @@ def train_candidate(
             reward_program=candidate.reward_program,
             legacy_target_decisions=decision_budget,
             legacy_stage_seconds=seconds,
+            allow_compatible_source_checkpoint=True,
         )
+        resume_metadata = {
+            "checkpoint": str(resume_from),
+            "stored_source_checkpoint": resume_state.source_checkpoint,
+            "requested_source_checkpoint": str(base_checkpoint),
+            "source_checkpoint_mismatch": resume_state.source_checkpoint_mismatch,
+            "budget_progress_resumed": resume_budget_progress,
+        }
         start_update = resume_state.next_update
         resumed_metrics = resume_state.metrics
         constraint_progress = resume_state.constraint_progress
@@ -532,9 +601,11 @@ def train_candidate(
                 )
                 episodes.extend(wave)
                 update_decisions += sum(len(record.decisions) for episode in wave for record in episode.records)
+            _synchronize_cuda(device, "rollout collection")
             actor_critic.train()
             trainer.set_schedule_state(constraint_progress=constraint_progress, joint_update=joint_update)
             metrics = trainer.update(episodes)
+            _synchronize_cuda(device, "PPO update")
             actor_critic.eval()
             cumulative_decisions += int(metrics["decisions"])
             constraint_progress += int(metrics["decisions"])
@@ -603,6 +674,7 @@ def train_candidate(
             "checkpoint_sha256": inherited_hash,
             "modules": inherited_modules,
         },
+        "resume": resume_metadata,
         "ppo_config": asdict(candidate.ppo_config),
         "opponent_mix": asdict(candidate.opponent_mix),
         "decision_budget": decision_budget,
@@ -808,6 +880,8 @@ def candidate_result(
             metrics,
         )
     except Exception as error:
+        if _is_fatal_cuda_error(error):
+            raise
         return CandidateResult(
             candidate.candidate_id,
             stage,
@@ -816,7 +890,13 @@ def candidate_result(
             0.0,
             float("inf"),
             time.monotonic() - started_at,
-            {},
+            {
+                "failure": {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                    "traceback": traceback.format_exc(limit=20),
+                }
+            },
             error=f"{type(error).__name__}: {error}",
         )
 
@@ -836,7 +916,7 @@ def execute_evolution_job(
         (result for result in prior_results if result.candidate_id == job.candidate_id and result.stage == job.stage),
         None,
     )
-    if existing is not None:
+    if existing is not None and existing.status == "completed":
         return existing
     base_checkpoint, other_checkpoint = _checkpoint_pair(args, job.base_name)
     decision_budget = job.decision_budget
@@ -873,19 +953,7 @@ def _apply_coordinator_manifest(args: argparse.Namespace, manifest: Mapping[str,
     coordinator_args = manifest.get("arguments", {})
     if not isinstance(coordinator_args, dict):
         raise TypeError("Coordinator manifest arguments are invalid")
-    for name in (
-        "seed",
-        "episodes_per_update",
-        "decisions_per_update",
-        "bc_batch_size",
-        "bc_replays",
-        "no_bc_anchor",
-        "max_turns",
-        "recover_stale_job_seconds",
-        "critic_warmup_episodes",
-        "unet_probe_every",
-        "resattn8_only",
-    ):
+    for name in _RUN_MANIFEST_ARGUMENTS:
         if name in coordinator_args:
             setattr(args, name, coordinator_args[name])
 
@@ -1145,7 +1213,9 @@ def run_worker(args: argparse.Namespace) -> None:
                 store=store,
                 checkpoint_callback=checkpoint_callback,
             )
-        except KeyboardInterrupt:
+        except BaseException:
+            lease_stop.set()
+            lease_thread.join(timeout=5)
             if api is None:
                 queue.release(lease)
             else:
@@ -1196,6 +1266,133 @@ def _best_parent(
     return max(island_candidates.values(), key=lambda candidate: candidate.generation)
 
 
+def _legacy_stage_selection(run_dir: Path, stage: str, count: int) -> list[str]:
+    evidence: list[tuple[float, str]] = []
+    for directory in ("completed", "pending", "running"):
+        for path in (run_dir / "jobs" / directory).glob("*.json"):
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if value.get("stage") != stage:
+                continue
+            timestamp = float(value.get("completed_at", path.stat().st_mtime))
+            evidence.append((timestamp, str(value["candidate_id"])))
+    if not evidence:
+        for path in (run_dir / "results").glob(f"*-{stage}.json"):
+            value = json.loads(path.read_text(encoding="utf-8"))
+            evidence.append((path.stat().st_mtime, str(value["candidate_id"])))
+    selected = []
+    for _, candidate_id in sorted(evidence):
+        if candidate_id not in selected:
+            selected.append(candidate_id)
+        if len(selected) >= count:
+            break
+    return selected
+
+
+def _select_completed_stage(
+    candidates: Mapping[str, EvolutionCandidate],
+    results: list[CandidateResult],
+    *,
+    stage: str,
+    count: int,
+) -> list[str]:
+    ranked = sorted(
+        (
+            result
+            for result in results
+            if result.stage == stage and result.status == "completed" and result.candidate_id in candidates
+        ),
+        key=lambda result: result.fitness,
+        reverse=True,
+    )
+    return [result.candidate_id for result in ranked[:count]]
+
+
+def _load_or_create_stage_selection(
+    store: EvolutionStore,
+    candidates: Mapping[str, EvolutionCandidate],
+    results: list[CandidateResult],
+    *,
+    name: str,
+    target_stage: str,
+    source_stage: str,
+    count: int,
+) -> list[EvolutionCandidate]:
+    path = store.run_dir / "selections" / f"{name}.json"
+    if path.exists():
+        value = json.loads(path.read_text(encoding="utf-8"))
+        candidate_ids = [str(candidate_id) for candidate_id in value.get("candidate_ids", [])]
+    else:
+        candidate_ids = _legacy_stage_selection(store.run_dir, target_stage, count)
+        source = "legacy_jobs" if candidate_ids else source_stage
+        if not candidate_ids:
+            candidate_ids = _select_completed_stage(candidates, results, stage=source_stage, count=count)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        EvolutionStore.write_json(
+            path,
+            {
+                "schema_version": 1,
+                "name": name,
+                "source": source,
+                "source_stage": source_stage,
+                "target_stage": target_stage,
+                "candidate_ids": candidate_ids,
+                "created_at": time.time(),
+            },
+        )
+    missing = [candidate_id for candidate_id in candidate_ids if candidate_id not in candidates]
+    if missing:
+        message = f"Selection {name!r} references missing candidates: {missing}"
+        raise ValueError(message)
+    return [candidates[candidate_id] for candidate_id in candidate_ids]
+
+
+def _archive_unselected_stage_jobs(run_dir: Path, stage: str, selected_ids: set[str]) -> list[Path]:
+    archived = []
+    destination_dir = run_dir / "jobs" / "obsolete"
+    for directory in (run_dir / "jobs" / "pending", run_dir / "jobs" / "running"):
+        for path in sorted(directory.glob("*.json")):
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if value.get("stage") != stage or value.get("candidate_id") in selected_ids:
+                continue
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            destination = _unused_history_path(destination_dir, path.name)
+            path.replace(destination)
+            archived.append(destination)
+    return archived
+
+
+def _archive_failed_results(store: EvolutionStore, jobs: list[EvolutionJob]) -> None:
+    retry_keys = {(job.candidate_id, job.stage) for job in jobs}
+    history_dir = store.result_dir / "failed_history"
+    for path in sorted(store.result_dir.glob("*.json")):
+        value = json.loads(path.read_text(encoding="utf-8"))
+        key = (str(value.get("candidate_id")), str(value.get("stage")))
+        if key not in retry_keys or value.get("status") == "completed":
+            continue
+        history_dir.mkdir(parents=True, exist_ok=True)
+        destination = _unused_history_path(history_dir, path.name)
+        path.replace(destination)
+
+
+def _unused_history_path(directory: Path, filename: str) -> Path:
+    timestamp = int(time.time())
+    destination = directory / f"{timestamp}-{filename}"
+    suffix = 1
+    while destination.exists():
+        destination = directory / f"{timestamp}-{suffix}-{filename}"
+        suffix += 1
+    return destination
+
+
+def _archive_stale_summary(run_dir: Path) -> None:
+    summary = run_dir / "summary.json"
+    if not summary.exists():
+        return
+    history = run_dir / "summaries"
+    history.mkdir(parents=True, exist_ok=True)
+    summary.replace(_unused_history_path(history, "summary.json"))
+
+
 def main() -> None:
     args = parse_args()
     if args.worker:
@@ -1203,27 +1400,38 @@ def main() -> None:
         return
     if args.job_api_url:
         raise ValueError("--job-api-url is only valid with --worker")
-    if args.islands < 1 or args.initial_per_island < 1 or args.generations < 0:
-        raise ValueError("Population sizes must be positive")
-    if args.rollout_envs < 1 or args.decisions_per_update < 1:
-        raise ValueError("Rollout environment and decision budgets must be positive")
     run_dir = Path(args.run_dir)
     if args.overwrite_run and run_dir.exists():
         shutil.rmtree(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / "manifest.json"
+    existing_manifest = (
+        json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest_path.exists() and not args.overwrite_run
+        else None
+    )
+    if existing_manifest is not None:
+        _apply_coordinator_manifest(args, existing_manifest)
+    if args.islands < 1 or args.initial_per_island < 1 or args.generations < 0:
+        raise ValueError("Population sizes must be positive")
+    if args.rollout_envs < 1 or args.decisions_per_update < 1:
+        raise ValueError("Rollout environment and decision budgets must be positive")
     repository = Path(__file__).resolve().parents[1]
     device = resolve_device(args.device)
     store = EvolutionStore(run_dir)
-    manifest = {
-        "schema_version": 1,
-        "created_at": time.time(),
-        "git_revision": git_revision(repository),
-        "arguments": vars(args),
-        "device": str(device),
-        "codex_available": shutil.which(args.codex_executable) is not None,
-        "bases": {name: getattr(args, f"{name}_checkpoint") for name in _active_base_names(args)},
-    }
-    store.save_manifest(manifest)
+    if existing_manifest is None:
+        manifest = {
+            "schema_version": 1,
+            "created_at": time.time(),
+            "git_revision": git_revision(repository),
+            "arguments": vars(args),
+            "device": str(device),
+            "codex_available": shutil.which(args.codex_executable) is not None,
+            "bases": {name: getattr(args, f"{name}_checkpoint") for name in _active_base_names(args)},
+        }
+        store.save_manifest(manifest)
+    else:
+        manifest = existing_manifest
     generator = None
     if not args.no_codex and not args.dry_run:
         generator = CodexCandidateGenerator(
@@ -1256,26 +1464,36 @@ def main() -> None:
         store.save_candidate(candidate)
 
     def refresh_results() -> None:
-        known = {(result.candidate_id, result.stage) for result in results}
+        latest = {(result.candidate_id, result.stage): result for result in results}
         for stored in store.results():
             key = (stored.candidate_id, stored.stage)
-            if key not in known:
-                results.append(stored)
-                known.add(key)
+            latest[key] = stored
+        results[:] = list(latest.values())
 
     def evaluate_jobs(jobs: list[EvolutionJob]) -> None:
         if args.dry_run or not jobs:
             return
         refresh_results()
-        completed_keys = {(result.candidate_id, result.stage) for result in results}
+        completed_keys = {(result.candidate_id, result.stage) for result in results if result.status == "completed"}
         jobs = [job for job in jobs if (job.candidate_id, job.stage) not in completed_keys]
         if not jobs:
             return
+        _archive_stale_summary(run_dir)
+        _archive_failed_results(store, jobs)
+        retry_keys = {(job.candidate_id, job.stage) for job in jobs}
+        results[:] = [
+            result
+            for result in results
+            if (result.candidate_id, result.stage) not in retry_keys or result.status == "completed"
+        ]
         if queue is None:
             for job in jobs:
                 result = execute_evolution_job(job, args=args, device=device, store=store)
                 results.append(result)
                 print(json.dumps(asdict(result), sort_keys=True))
+                if result.status != "completed":
+                    message = f"Evolution job failed: {job.job_id}: {result.error}"
+                    raise RuntimeError(message)
             return
         for job in jobs:
             queue.enqueue(job)
@@ -1285,9 +1503,18 @@ def main() -> None:
         worker_id = f"coordinator-{socket.gethostname()}-{os.getpid()}"
         while True:
             refresh_results()
-            completed = {(result.candidate_id, result.stage) for result in results}
+            completed = {(result.candidate_id, result.stage) for result in results if result.status == "completed"}
             if expected <= completed:
                 return
+            failed = [
+                result
+                for result in results
+                if (result.candidate_id, result.stage) in expected and result.status != "completed"
+            ]
+            if failed:
+                detail = ", ".join(f"{result.candidate_id}--{result.stage}: {result.error}" for result in failed)
+                message = f"Evolution jobs failed; fix the cause and resume: {detail}"
+                raise RuntimeError(message)
             queue.recover_stale(args.recover_stale_job_seconds)
             if time.monotonic() >= deadline:
                 missing = sorted(expected - completed)
@@ -1296,7 +1523,11 @@ def main() -> None:
             claimed = None if args.coordinator_only else queue.claim(worker_id)
             if claimed is not None:
                 job, claimed_path = claimed
-                result = execute_evolution_job(job, args=args, device=device, store=store)
+                try:
+                    result = execute_evolution_job(job, args=args, device=device, store=store)
+                except BaseException:
+                    queue.release(claimed_path)
+                    raise
                 queue.complete(claimed_path, result)
                 refresh_results()
                 print(json.dumps(asdict(result), sort_keys=True))
@@ -1458,7 +1689,20 @@ def main() -> None:
         print(json.dumps({"run_dir": str(run_dir), "candidates": len(candidates), "dry_run": True}))
         return
 
-    medium = select_elites(candidates, results, count=args.medium_count)
+    medium = _load_or_create_stage_selection(
+        store,
+        candidates,
+        results,
+        name="medium",
+        target_stage="medium-resattn8",
+        source_stage="short-resattn8",
+        count=args.medium_count,
+    )
+    _archive_unselected_stage_jobs(
+        run_dir,
+        "medium-resattn8",
+        {candidate.candidate_id for candidate in medium},
+    )
     evaluate_jobs(
         [
             EvolutionJob(
@@ -1474,7 +1718,21 @@ def main() -> None:
         ]
     )
 
-    finalists = select_elites(candidates, results, count=args.final_count)
+    finalists = _load_or_create_stage_selection(
+        store,
+        candidates,
+        results,
+        name="final",
+        target_stage="final-resattn8",
+        source_stage="medium-resattn8",
+        count=args.final_count,
+    )
+    for base_name in _active_base_names(args):
+        _archive_unselected_stage_jobs(
+            run_dir,
+            f"final-{base_name}",
+            {candidate.candidate_id for candidate in finalists},
+        )
     final_jobs = [
         EvolutionJob(
             candidate.candidate_id,
@@ -1542,7 +1800,13 @@ def main() -> None:
         reverse=True,
     )
     promoted = next((row["candidate_id"] for row in ranking if row["acceptance"]["promote"]), None)
-    summary = {"ranking": ranking, "promoted_candidate": promoted}
+    summary = {
+        "status": "completed",
+        "medium_selection": [candidate.candidate_id for candidate in medium],
+        "final_selection": [candidate.candidate_id for candidate in finalists],
+        "ranking": ranking,
+        "promoted_candidate": promoted,
+    }
     store.write_json(run_dir / "summary.json", summary)
     print(json.dumps(summary, sort_keys=True))
     if job_api_server is not None:

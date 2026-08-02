@@ -304,11 +304,18 @@ class FilesystemJobQueue:
 
     def enqueue(self, job: EvolutionJob) -> None:
         filename = f"{job.job_id}.json"
-        if any((directory / filename).exists() for directory in (self.pending_dir, self.completed_dir)):
+        pending = self.pending_dir / filename
+        completed = self.completed_dir / filename
+        if pending.exists():
             return
+        if completed.exists():
+            payload = json.loads(completed.read_text(encoding="utf-8"))
+            if payload.get("result_status") == "completed":
+                return
+            completed.unlink()
         if any(self.running_dir.glob(f"*--{filename}")):
             return
-        EvolutionStore.write_json(self.pending_dir / filename, job.to_dict())
+        EvolutionStore.write_json(pending, job.to_dict())
 
     def claim(self, worker_id: str) -> tuple[EvolutionJob, Path] | None:
         safe_worker = "".join(character if character.isalnum() or character in "-_" else "_" for character in worker_id)

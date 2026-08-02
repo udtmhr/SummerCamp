@@ -704,6 +704,18 @@ stores cumulative decisions, turns, episodes, optimizer/RNG state, constraint pr
 Re-running a stage resumes its remaining decision budget. Schema-v1/v2 checkpoints remain loadable; a v1 checkpoint's
 consumed budget is conservatively estimated from its recorded elapsed-time fraction.
 
+The first coordinator invocation owns the run manifest: later invocations reuse its checkpoint paths and training
+budgets instead of overwriting them with new CLI defaults. Medium and final candidate IDs are frozen under
+`selections/` when each stage starts, so an interrupted run does not select a different population from partial later
+results. Failed result markers are archived and retried, while completed results remain immutable. A compatible local
+`latest_rl.pt` is authoritative for same-candidate resume even if an older run recorded a different textual base-model
+path; the mismatch is retained in result metadata. CUDA RNG is restored only for the active training device, so a
+checkpoint remains resumable when the source and destination workers expose different GPU counts. Fatal CUDA context
+errors such as `unspecified launch failure` stop
+the worker after releasing its lease. Restart that worker process to recreate the CUDA context; the job is then claimed
+again from its last checkpoint. A valid terminal `summary.json` has `status: "completed"` and records both frozen
+selection lists.
+
 Independent candidates can use another GPU machine without a shared filesystem. The coordinator keeps the authoritative
 queue and artifacts locally and exposes a loopback-only Job API. Start it on PC1; omitting `--coordinator-only` lets PC1
 also train candidates while serving ws3:

@@ -15,9 +15,13 @@ import torch
 from examples.evolve_rl import (
     _active_base_names,
     _apply_coordinator_manifest,
+    _archive_unselected_stage_jobs,
     _checkpoint_pair,
     _evaluation_anchors,
+    _is_fatal_cuda_error,
+    _load_or_create_stage_selection,
     _sync_api_claim,
+    execute_evolution_job,
 )
 from luxai2021.env.agent import Agent
 from luxai2021.game.actions import MoveAction
@@ -51,7 +55,14 @@ from luxai2021.rl.evolution import (
 from luxai2021.rl.job_api import JobApiClient, JobApiServer
 from luxai2021.rl.metrics import GameMetrics, MetricContext, metrics_from_game
 from luxai2021.rl.policy import FullTurnActorCritic, RolloutAgent
-from luxai2021.rl.ppo import PPOConfig, PPOTrainer, collect_episode, collect_episodes_batched, warmup_value_head
+from luxai2021.rl.ppo import (
+    PPOConfig,
+    PPOTrainer,
+    _checkpoint_cuda_rng_state,
+    collect_episode,
+    collect_episodes_batched,
+    warmup_value_head,
+)
 from luxai2021.rl.reward import (
     DIRECT_REWARD_METRIC_NAMES,
     GATING_METRIC_NAMES,
@@ -858,6 +869,47 @@ def test_training_checkpoint_v2_restores_budget_progress_and_legacy_estimate(tmp
     assert restored_legacy.cumulative_decisions == 500
 
 
+def test_training_checkpoint_can_resume_compatible_weights_from_an_older_base_path(tmp_path):
+    actor = FullTurnActorCritic(_small_policy())
+    trainer = PPOTrainer(actor, copy.deepcopy(actor.policy), PPOConfig(), torch.device("cpu"))
+    checkpoint_path = tmp_path / "latest_rl.pt"
+    trainer.save_training_checkpoint(
+        checkpoint_path,
+        source_checkpoint="models/old-base.pt",
+        reward_program=default_reward_program(),
+        update=0,
+        metrics={},
+    )
+
+    with pytest.raises(ValueError, match="source checkpoint"):
+        trainer.load_training_state(
+            checkpoint_path,
+            source_checkpoint="models/new-base.pt",
+            reward_program=default_reward_program(),
+        )
+    restored = trainer.load_training_state(
+        checkpoint_path,
+        source_checkpoint="models/new-base.pt",
+        reward_program=default_reward_program(),
+        allow_compatible_source_checkpoint=True,
+    )
+
+    assert restored.source_checkpoint == "models/old-base.pt"
+    assert restored.source_checkpoint_mismatch is True
+
+
+def test_cuda_rng_resume_is_portable_across_visible_gpu_counts():
+    first = torch.tensor([1, 2], dtype=torch.uint8)
+    second = torch.tensor([3, 4], dtype=torch.uint8)
+
+    assert torch.equal(_checkpoint_cuda_rng_state({"cuda_rng_state_all": [first, second]}, 0), first)
+    assert torch.equal(_checkpoint_cuda_rng_state({"cuda_rng_state_all": [first, second]}, 7), first)
+    assert torch.equal(
+        _checkpoint_cuda_rng_state({"cuda_rng_state": second, "cuda_rng_state_all": [first]}, 0),
+        second,
+    )
+
+
 def test_inference_batcher_and_parallel_rollout_batch_requests():
     barrier = threading.Barrier(2)
 
@@ -1040,6 +1092,43 @@ def test_filesystem_job_queue_claim_and_complete(tmp_path):
     queue.complete(claimed_path, result)
     assert queue.outstanding_ids() == set()
     assert (tmp_path / "jobs" / "completed" / f"{job.job_id}.json").exists()
+
+
+def test_filesystem_job_queue_retries_failed_completion(tmp_path):
+    queue = FilesystemJobQueue(tmp_path)
+    job = EvolutionJob("candidate", "medium-resattn8", "resattn8", 1, 1, 100)
+    queue.enqueue(job)
+    _, claimed_path = queue.claim("pc1")
+    failed = CandidateResult("candidate", job.stage, "failed", 0.0, 0.0, float("inf"), 1.0, {}, "boom")
+    queue.complete(claimed_path, failed)
+
+    queue.enqueue(job)
+
+    assert (queue.pending_dir / f"{job.job_id}.json").exists()
+    assert not (queue.completed_dir / f"{job.job_id}.json").exists()
+
+
+def test_execute_job_retries_an_existing_failed_result(tmp_path, monkeypatch):
+    store = EvolutionStore(tmp_path)
+    candidate = initial_candidate(island=0, seed=17)
+    store.save_candidate(candidate)
+    job = EvolutionJob(candidate.candidate_id, "medium-resattn8", "resattn8", 1, 1, 100)
+    failed = CandidateResult(candidate.candidate_id, job.stage, "failed", 0.0, 0.0, 1.0, 1.0, {}, "old")
+    store.save_result(failed)
+    completed = CandidateResult(candidate.candidate_id, job.stage, "completed", 1.0, 1.0, 0.0, 1.0, {})
+    monkeypatch.setattr("examples.evolve_rl._checkpoint_pair", lambda *_: (tmp_path / "base.pt", None))
+    monkeypatch.setattr("examples.evolve_rl.candidate_result", lambda *_, **__: completed)
+    monkeypatch.setattr("examples.evolve_rl.add_candidate_reflection", lambda result, *_: result)
+
+    result = execute_evolution_job(
+        job,
+        args=SimpleNamespace(medium_decisions=100),
+        device=torch.device("cpu"),
+        store=store,
+    )
+
+    assert result.status == "completed"
+    assert store.results()[0].status == "completed"
 
 
 def test_filesystem_job_completion_recovers_a_requeued_lease(tmp_path):
@@ -1307,8 +1396,84 @@ def test_resattn8_only_removes_all_unet_runtime_inputs():
 
 
 def test_worker_inherits_resattn8_only_from_coordinator_manifest():
-    worker_args = SimpleNamespace(resattn8_only=False)
+    worker_args = SimpleNamespace(resattn8_only=False, resattn8_checkpoint="new.pt")
 
-    _apply_coordinator_manifest(worker_args, {"arguments": {"resattn8_only": True}})
+    _apply_coordinator_manifest(
+        worker_args,
+        {"arguments": {"resattn8_only": True, "resattn8_checkpoint": "original.pt"}},
+    )
 
     assert worker_args.resattn8_only is True
+    assert worker_args.resattn8_checkpoint == "original.pt"
+
+
+def test_stage_selection_is_frozen_and_uses_only_completed_source_stage(tmp_path):
+    store = EvolutionStore(tmp_path)
+    candidates = {
+        candidate.candidate_id: candidate
+        for candidate in (
+            initial_candidate(island=0, seed=1),
+            initial_candidate(island=1, seed=2),
+            initial_candidate(island=2, seed=3),
+        )
+    }
+    for candidate in candidates.values():
+        store.save_candidate(candidate)
+    ordered = list(candidates.values())
+    results = [
+        CandidateResult(ordered[0].candidate_id, "short-resattn8", "completed", 0.9, 0.0, 0.0, 1.0, {}),
+        CandidateResult(ordered[1].candidate_id, "short-resattn8", "completed", 0.8, 0.0, 0.0, 1.0, {}),
+        CandidateResult(ordered[2].candidate_id, "short-resattn8", "failed", 1.0, 1.0, 0.0, 1.0, {}),
+        CandidateResult(ordered[2].candidate_id, "final-resattn8", "completed", 1.0, 1.0, 0.0, 1.0, {}),
+    ]
+
+    first = _load_or_create_stage_selection(
+        store,
+        candidates,
+        results,
+        name="medium",
+        target_stage="medium-resattn8",
+        source_stage="short-resattn8",
+        count=2,
+    )
+    changed_results = [CandidateResult(ordered[2].candidate_id, "short-resattn8", "completed", 1.0, 1.0, 0.0, 1.0, {})]
+    resumed = _load_or_create_stage_selection(
+        store,
+        candidates,
+        changed_results,
+        name="medium",
+        target_stage="medium-resattn8",
+        source_stage="short-resattn8",
+        count=2,
+    )
+
+    assert [candidate.candidate_id for candidate in first] == [
+        ordered[0].candidate_id,
+        ordered[1].candidate_id,
+    ]
+    assert [candidate.candidate_id for candidate in resumed] == [
+        ordered[0].candidate_id,
+        ordered[1].candidate_id,
+    ]
+
+
+def test_unselected_running_stage_job_is_archived(tmp_path):
+    queue = FilesystemJobQueue(tmp_path)
+    selected = EvolutionJob("selected", "medium-resattn8", "resattn8", 1, 1, 100)
+    extra = EvolutionJob("extra", "medium-resattn8", "resattn8", 1, 1, 100)
+    queue.enqueue(selected)
+    queue.enqueue(extra)
+    queue.claim("coordinator-host-123")
+    queue.claim("coordinator-host-123")
+
+    archived = _archive_unselected_stage_jobs(tmp_path, "medium-resattn8", {"selected"})
+
+    assert len(archived) == 1
+    assert json.loads(archived[0].read_text())["candidate_id"] == "extra"
+    assert queue.outstanding_ids() == {selected.job_id}
+
+
+def test_fatal_cuda_context_errors_are_distinguished_from_oom():
+    assert _is_fatal_cuda_error(RuntimeError("CUDA error: unspecified launch failure"))
+    assert _is_fatal_cuda_error(RuntimeError("CUDA error: an illegal memory access was encountered"))
+    assert not _is_fatal_cuda_error(RuntimeError("CUDA out of memory"))
