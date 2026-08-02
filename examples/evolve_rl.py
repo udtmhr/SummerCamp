@@ -62,7 +62,7 @@ if TYPE_CHECKING:
     from luxai2021.env.agent import Agent
 
 DEFAULT_UNET = "models/distilled/unet_v3/best.pt"
-DEFAULT_RESATTN8 = "models/distilled/resattn8_v2/best.pt"
+DEFAULT_RESATTN8 = "models/distilled/resattn8_v2_selfplay_ft/best.pt"
 DEFAULT_TEACHER = "models/teachers/lux_2021_first_place/062179520_weights.pt"
 DEFAULT_TEACHER_CACHE = "models/teachers/lux_2021_first_place/cache"
 DEFAULT_PREPARED_CACHE = "models/teachers/lux_2021_first_place/prepared"
