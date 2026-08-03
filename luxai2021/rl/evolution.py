@@ -860,7 +860,8 @@ def validate_candidate_mutation(parents: list[EvolutionCandidate], candidate: Ev
         if primary.reward_program == candidate.reward_program:
             raise ValueError("Island-3 structural mutation must change the reward program")
         if not _I03_STRUCTURAL_DISTANCE_MIN <= distance <= _I03_STRUCTURAL_DISTANCE_MAX:
-            raise ValueError("Island-3 structural mutation AST distance must be in [0.20, 0.65]")
+            message = f"Island-3 structural mutation AST distance must be in [0.20, 0.65]; actual={distance:.6f}"
+            raise ValueError(message)
         if candidate.inheritance_mode != "policy":
             raise ValueError("Island-3 structural mutation must inherit policy only")
         if candidate.parameter_constraint_coefficient <= 0.0:
@@ -1042,14 +1043,87 @@ class CodexCandidateGenerator:
         executable: str = "codex",
         model: str | None = None,
         timeout_seconds: int = 900,
+        validation_retries: int = 2,
     ) -> None:
         self.repository = repository
         self.run_dir = run_dir
         self.executable = executable
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.validation_retries = max(0, int(validation_retries))
         self.schema_path = run_dir / "codex-proposal-schema.json"
         self.schema_path.write_text(json.dumps(proposal_schema(), indent=2, sort_keys=True), encoding="utf-8")
+
+    def output_path(self, generation: int, island: int) -> Path:
+        return self.run_dir / f"codex-g{generation:02d}-i{island:02d}.json"
+
+    def metadata_path(self, generation: int, island: int) -> Path:
+        return self.run_dir / f"codex-g{generation:02d}-i{island:02d}.meta.json"
+
+    def error_path(self, generation: int, island: int) -> Path:
+        return self.run_dir / f"codex-g{generation:02d}-i{island:02d}.error.json"
+
+    @staticmethod
+    def _validate_completed_process(completed: subprocess.CompletedProcess[str]) -> None:
+        if completed.returncode == 0:
+            return
+        detail = completed.stderr[-4000:] or completed.stdout[-4000:]
+        message = f"Codex candidate generation failed: {detail}"
+        raise RuntimeError(message)
+
+    def _archive_prior_failure(self, generation: int, island: int) -> None:
+        error_path = self.error_path(generation, island)
+        if not error_path.exists():
+            return
+        archive_dir = self.run_dir / "codex-rejections"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        stamp = int(time.time() * 1000)
+        paths = [error_path, self.output_path(generation, island)]
+        paths.extend(self.run_dir.glob(f"codex-g{generation:02d}-i{island:02d}.attempt-*"))
+        for path in paths:
+            if path.exists():
+                path.replace(archive_dir / f"{stamp}-{path.name}")
+
+    @staticmethod
+    def _repair_prompt(base_prompt: str, proposal: str, error: Exception) -> str:
+        return (
+            f"{base_prompt}\n\n"
+            "VALIDATOR REPAIR REQUIRED. The previous proposal passed the JSON schema but was rejected by the "
+            "deterministic server-side mutation validator. The validator is authoritative. Return a corrected full "
+            "proposal JSON, not a patch. Do not merely change mutation_manifest.summary. If an island-3 structural "
+            "distance is above 0.65, simplify the actual reward AST or use a valid restart proposal; if below 0.20, "
+            "make a larger real AST change.\n"
+            f"Validator error: {type(error).__name__}: {error}\n"
+            f"Rejected proposal:\n{proposal}"
+        )
+
+    def _failure_payload(
+        self,
+        *,
+        parents: list[EvolutionCandidate],
+        generation: int,
+        island: int,
+        attempt: int,
+        started_at: float,
+        completed: subprocess.CompletedProcess[str] | None,
+        error: Exception,
+    ) -> dict[str, Any]:
+        return {
+            "status": "failed",
+            "generation": generation,
+            "island": island,
+            "attempt": attempt,
+            "parent_ids": [parent.candidate_id for parent in parents],
+            "model": self.model,
+            "executable": self.executable,
+            "started_at": started_at,
+            "failed_at": time.time(),
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "returncode": completed.returncode if completed is not None else None,
+            "stdout": completed.stdout[-8000:] if completed is not None else "",
+            "stderr": completed.stderr[-8000:] if completed is not None else "",
+        }
 
     def generate(
         self,
@@ -1059,49 +1133,103 @@ class CodexCandidateGenerator:
         generation: int,
         island: int,
     ) -> EvolutionCandidate:
-        prompt = build_codex_prompt(parents, results, island=island, generation=generation)
-        output_path = self.run_dir / f"codex-g{generation:02d}-i{island:02d}.json"
-        command = [
-            self.executable,
-            "exec",
-            "--ephemeral",
-            "--sandbox",
-            "read-only",
-            "--output-schema",
-            str(self.schema_path),
-            "-o",
-            str(output_path),
-        ]
-        if self.model:
-            command.extend(("--model", self.model))
-        command.append(prompt)
-        completed = subprocess.run(
-            command,
-            cwd=self.repository,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=self.timeout_seconds,
+        base_prompt = build_codex_prompt(parents, results, island=island, generation=generation)
+        prompt = base_prompt
+        output_path = self.output_path(generation, island)
+        self._archive_prior_failure(generation, island)
+        rejected_attempts = []
+        first_started_at = time.time()
+        for attempt_index in range(self.validation_retries + 1):
+            attempt = attempt_index + 1
+            output_path.unlink(missing_ok=True)
+            command = [
+                self.executable,
+                "exec",
+                "--ephemeral",
+                "--sandbox",
+                "read-only",
+                "--output-schema",
+                str(self.schema_path),
+                "-o",
+                str(output_path),
+            ]
+            if self.model:
+                command.extend(("--model", self.model))
+            command.append(prompt)
+            completed: subprocess.CompletedProcess[str] | None = None
+            started_at = time.time()
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=self.repository,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout_seconds,
+                )
+                self._validate_completed_process(completed)
+                proposal_text = output_path.read_text(encoding="utf-8")
+                proposal = json.loads(proposal_text)
+                candidate = EvolutionCandidate.from_proposal(
+                    proposal,
+                    generation=generation,
+                    island=island,
+                    parent_ids=tuple(parent.candidate_id for parent in parents),
+                )
+                validate_candidate_mutation(parents, candidate)
+            except Exception as error:
+                payload = self._failure_payload(
+                    parents=parents,
+                    generation=generation,
+                    island=island,
+                    attempt=attempt,
+                    started_at=started_at,
+                    completed=completed,
+                    error=error,
+                )
+                repairable = (
+                    completed is not None
+                    and completed.returncode == 0
+                    and output_path.exists()
+                    and isinstance(error, (KeyError, TypeError, ValueError))
+                )
+                if repairable:
+                    rejected_path = self.run_dir / (
+                        f"codex-g{generation:02d}-i{island:02d}.attempt-{attempt:02d}.rejected.json"
+                    )
+                    rejected_path.write_bytes(output_path.read_bytes())
+                    attempt_error_path = self.run_dir / (
+                        f"codex-g{generation:02d}-i{island:02d}.attempt-{attempt:02d}.error.json"
+                    )
+                    EvolutionStore.write_json(attempt_error_path, payload)
+                    rejected_attempts.append(
+                        {"attempt": attempt, "proposal_path": rejected_path.name, "error_path": attempt_error_path.name}
+                    )
+                    if attempt_index < self.validation_retries:
+                        prompt = self._repair_prompt(base_prompt, output_path.read_text(encoding="utf-8"), error)
+                        continue
+                EvolutionStore.write_json(self.error_path(generation, island), payload)
+                raise
+            break
+        proposal_sha256 = hashlib.sha256(output_path.read_bytes()).hexdigest()
+        EvolutionStore.write_json(
+            self.metadata_path(generation, island),
+            {
+                "status": "accepted",
+                "generation": generation,
+                "island": island,
+                "candidate_id": candidate.candidate_id,
+                "parent_ids": [parent.candidate_id for parent in parents],
+                "model": self.model,
+                "executable": self.executable,
+                "started_at": first_started_at,
+                "completed_at": time.time(),
+                "attempts": attempt,
+                "rejected_attempts": rejected_attempts,
+                "proposal_path": output_path.name,
+                "proposal_sha256": proposal_sha256,
+            },
         )
-        if completed.returncode != 0:
-            EvolutionStore.write_json(
-                self.run_dir / f"codex-g{generation:02d}-i{island:02d}.error.json",
-                {
-                    "returncode": completed.returncode,
-                    "stdout": completed.stdout[-8000:],
-                    "stderr": completed.stderr[-8000:],
-                },
-            )
-            message = completed.stderr[-4000:] or completed.stdout[-4000:]
-            raise RuntimeError(f"Codex candidate generation failed: {message}")
-        proposal = json.loads(output_path.read_text(encoding="utf-8"))
-        candidate = EvolutionCandidate.from_proposal(
-            proposal,
-            generation=generation,
-            island=island,
-            parent_ids=tuple(parent.candidate_id for parent in parents),
-        )
-        validate_candidate_mutation(parents, candidate)
         return candidate
 
 

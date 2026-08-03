@@ -662,7 +662,7 @@ First verify the 24-candidate schedule without training:
 
 ```bash
 uv run --locked python examples/evolve_rl.py \
-  --run-dir models/evolution/lux-s1-001 \
+  --run-dir models/evolution/lux-s1-001-dry-run \
   --dry-run
 ```
 
@@ -685,7 +685,46 @@ balance. In ResAttn8-only mode, final evaluation uses 50 fixed seeds, both playe
 the distilled ResAttn8 base plus the original first-place policy, no replay output, paired bootstrap reporting, and an
 inference-latency guard. Re-running the same command resumes completed candidates and stage checkpoints. Use
 `--no-codex` for deterministic numeric mutations, or `--overwrite-run` to intentionally start that run directory
-again. The Codex CLI must already be installed and authenticated when proposal generation is enabled.
+again. A dry-run directory cannot be reused for training because its candidates were generated without Codex. The
+Codex CLI must already be installed and authenticated when proposal generation is enabled. A schema-valid proposal
+rejected by the deterministic mutation validator is returned to Codex with the exact validator error and retried twice
+by default (`--codex-validation-retries`). Rejected proposals and errors are retained beside the accepted proposal for
+audit. After repair retries are exhausted, proposal errors stop the coordinator before registering or training that
+candidate; deterministic fallback is available only with the explicit `--allow-codex-fallback` option.
+
+#### Smartphone notifications
+
+The coordinator can notify run start, each completed generation, medium/final stage transitions, expired worker leases,
+final completion, failures, and Ctrl+C. Delivery is best-effort and never changes a job result. Delivered event IDs are
+stored in `<run-dir>/notifications/sent.json`, so resuming a run does not resend old progress events. Credentials are
+read only from environment variables and are never written to the run manifest or notification state.
+
+For Gmail, enable Google Account 2-Step Verification, create a dedicated App Password, and configure PC1 only:
+
+```bash
+export LUX_EVOLUTION_GMAIL_USER='your-address@gmail.com'
+export LUX_EVOLUTION_GMAIL_APP_PASSWORD='xxxx xxxx xxxx xxxx'
+export LUX_EVOLUTION_NOTIFY_EMAIL_TO='your-phone-address@gmail.com'
+
+uv run --locked python examples/test_evolution_notification.py \
+  --run-dir /home/ueda/workspace/LuxPythonEnvGym/shared/lux-evolution-v3
+```
+
+For faster native phone push, install the ntfy phone app, subscribe to a private random topic, and configure:
+
+```bash
+export LUX_EVOLUTION_NTFY_TOPIC='replace-with-a-long-random-topic'
+# Optional for an authenticated/self-hosted server:
+export LUX_EVOLUTION_NTFY_SERVER='https://ntfy.example.com'
+export LUX_EVOLUTION_NTFY_TOKEN='tk_...'
+
+uv run --locked python examples/test_evolution_notification.py \
+  --run-dir /home/ueda/workspace/LuxPythonEnvGym/shared/lux-evolution-v3
+```
+
+The public `ntfy.sh` service has open topics by default, so use an unguessable topic and do not include sensitive run
+data, or use an authenticated self-hosted server. Gmail and ntfy may be enabled together. Workers on ws3 need no
+notification credentials because the PC1 coordinator sends run-level notifications.
 
 Run a short end-to-end check before committing a long GPU allocation:
 
@@ -704,17 +743,18 @@ stores cumulative decisions, turns, episodes, optimizer/RNG state, constraint pr
 Re-running a stage resumes its remaining decision budget. Schema-v1/v2 checkpoints remain loadable; a v1 checkpoint's
 consumed budget is conservatively estimated from its recorded elapsed-time fraction.
 
-The first coordinator invocation owns the run manifest: later invocations reuse its checkpoint paths and training
-budgets instead of overwriting them with new CLI defaults. Medium and final candidate IDs are frozen under
-`selections/` when each stage starts, so an interrupted run does not select a different population from partial later
-results. Failed result markers are archived and retried, while completed results remain immutable. A compatible local
-`latest_rl.pt` is authoritative for same-candidate resume even if an older run recorded a different textual base-model
-path; the mismatch is retained in result metadata. CUDA RNG is restored only for the active training device, so a
-checkpoint remains resumable when the source and destination workers expose different GPU counts. Fatal CUDA context
-errors such as `unspecified launch failure` stop
+The first coordinator invocation owns the schema-v2 run manifest: later invocations reuse its checkpoint paths,
+SHA-256 descriptors, Codex/deterministic generation mode, model, and training budgets instead of overwriting them with
+new CLI defaults. Every candidate has a separate immutable record under `provenance/`; accepted Codex outputs also have
+`codex-gXX-iXX.meta.json` with their proposal hash. Medium and final candidate IDs are frozen under `selections/` when
+each stage starts, and final selection is rejected unless every candidate has a completed medium result. Failed result
+markers are archived and retried, while completed results remain immutable. Same-candidate resume may tolerate a
+different textual base-model path only when available SHA-256 lineage remains identical. CUDA RNG is restored only for
+the active training device, so a checkpoint remains resumable when the source and destination workers expose different
+GPU counts. Fatal CUDA context errors such as `unspecified launch failure` stop
 the worker after releasing its lease. Restart that worker process to recreate the CUDA context; the job is then claimed
-again from its last checkpoint. A valid terminal `summary.json` has `status: "completed"` and records both frozen
-selection lists.
+again from its last checkpoint. A valid terminal `summary.json` has `status: "completed"`, records both frozen selection
+lists, and requires `integrity.valid_for_promotion: true` before any candidate can be promoted.
 
 Independent candidates can use another GPU machine without a shared filesystem. The coordinator keeps the authoritative
 queue and artifacts locally and exposes a loopback-only Job API. Start it on PC1; omitting `--coordinator-only` lets PC1

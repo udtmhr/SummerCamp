@@ -84,6 +84,8 @@ class TrainingResumeState:
     joint_update: int = 0
     source_checkpoint: str | None = None
     source_checkpoint_mismatch: bool = False
+    source_checkpoint_sha256: str | None = None
+    source_checkpoint_sha256_mismatch: bool = False
 
 
 def _checkpoint_cuda_rng_state(checkpoint: Mapping[str, Any], device_index: int) -> torch.Tensor | None:
@@ -586,6 +588,7 @@ class PPOTrainer:
         path: Path,
         *,
         source_checkpoint: str,
+        source_checkpoint_sha256: str | None = None,
         reward_program: RewardProgram,
         update: int,
         metrics: dict[str, Any],
@@ -601,6 +604,7 @@ class PPOTrainer:
             {
                 "schema_version": TRAINING_CHECKPOINT_SCHEMA_VERSION,
                 "source_checkpoint": source_checkpoint,
+                "source_checkpoint_sha256": source_checkpoint_sha256,
                 "policy": self.actor_critic.policy.state_dict(),
                 "value_head": self.actor_critic.value_head.state_dict(),
                 "reference_policy": self.reference_policy.state_dict(),
@@ -625,6 +629,7 @@ class PPOTrainer:
         path: Path,
         *,
         source_checkpoint: str,
+        source_checkpoint_sha256: str | None = None,
         reward_program: RewardProgram,
         legacy_target_decisions: int | None = None,
         legacy_stage_seconds: int | None = None,
@@ -638,6 +643,14 @@ class PPOTrainer:
         source_checkpoint_mismatch = stored_source_checkpoint != source_checkpoint
         if source_checkpoint_mismatch and not allow_compatible_source_checkpoint:
             raise ValueError("RL resume source checkpoint does not match")
+        stored_source_sha256 = checkpoint.get("source_checkpoint_sha256")
+        source_sha256_mismatch = bool(
+            source_checkpoint_sha256 is not None
+            and stored_source_sha256 is not None
+            and stored_source_sha256 != source_checkpoint_sha256
+        )
+        if source_sha256_mismatch:
+            raise ValueError("RL resume source checkpoint SHA-256 does not match")
         if checkpoint.get("reward_program") != reward_program.to_dict():
             raise ValueError("RL resume reward program does not match")
         if checkpoint.get("ppo_config") != asdict(self.config):
@@ -687,6 +700,8 @@ class PPOTrainer:
             joint_update=int(state.get("joint_update", max(0, int(checkpoint["update"]) + 1))),
             source_checkpoint=str(stored_source_checkpoint) if stored_source_checkpoint is not None else None,
             source_checkpoint_mismatch=source_checkpoint_mismatch,
+            source_checkpoint_sha256=str(stored_source_sha256) if stored_source_sha256 is not None else None,
+            source_checkpoint_sha256_mismatch=source_sha256_mismatch,
         )
 
     def load_training_checkpoint(

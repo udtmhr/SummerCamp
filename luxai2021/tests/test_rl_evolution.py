@@ -16,11 +16,17 @@ from examples.evolve_rl import (
     _active_base_names,
     _apply_coordinator_manifest,
     _archive_unselected_stage_jobs,
+    _checkpoint_descriptors,
     _checkpoint_pair,
     _evaluation_anchors,
+    _final_training_metrics,
     _is_fatal_cuda_error,
     _load_or_create_stage_selection,
+    _save_candidate_provenance,
     _sync_api_claim,
+    _validate_candidate_provenance,
+    _validate_checkpoint_descriptors,
+    _validate_run_kind,
     execute_evolution_job,
 )
 from luxai2021.env.agent import Agent
@@ -39,6 +45,7 @@ from luxai2021.rl.batched_rollout import ActorCriticBatcher, InferenceBatcher
 from luxai2021.rl.evaluation import acceptance_report, paired_seed_deltas
 from luxai2021.rl.evolution import (
     CandidateResult,
+    CodexCandidateGenerator,
     EvolutionCandidate,
     EvolutionJob,
     EvolutionStore,
@@ -691,6 +698,175 @@ def test_codex_proposal_schema_uses_supported_structured_output_constructs():
     assert "prefer the single targeted change" not in island3_prompt
 
 
+def test_codex_generator_records_all_failure_types(tmp_path, monkeypatch):
+    generator = CodexCandidateGenerator(repository=tmp_path, run_dir=tmp_path, executable="codex", model="test")
+    parent = initial_candidate(island=0, seed=1)
+
+    monkeypatch.setattr(
+        "luxai2021.rl.evolution.subprocess.run",
+        lambda *_, **__: SimpleNamespace(returncode=1, stdout="stdout", stderr="authentication failed"),
+    )
+
+    with pytest.raises(RuntimeError, match="authentication failed"):
+        generator.generate([parent], [], generation=1, island=0)
+    error = json.loads((tmp_path / "codex-g01-i00.error.json").read_text())
+    assert error["status"] == "failed"
+    assert error["error_type"] == "RuntimeError"
+    assert error["model"] == "test"
+    assert error["parent_ids"] == [parent.candidate_id]
+
+
+def test_codex_generator_records_accepted_proposal_hash(tmp_path, monkeypatch):
+    generator = CodexCandidateGenerator(repository=tmp_path, run_dir=tmp_path, executable="codex", model="test")
+    parent = initial_candidate(island=0, seed=1)
+    proposal = _candidate_proposal(parent, mutation_kind="parameter")
+    proposal["inheritance_mode"] = "policy_value"
+    proposal["reward_program"]["components"][0]["weight"] += 0.1
+    proposal["mutation_manifest"] = {
+        "changed_paths": ["reward_program.components[0].weight"],
+        "summary": "one numeric mutation",
+    }
+
+    def fake_run(command, **_):
+        output_path = Path(command[command.index("-o") + 1])
+        output_path.write_text(json.dumps(proposal))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("luxai2021.rl.evolution.subprocess.run", fake_run)
+
+    candidate = generator.generate([parent], [], generation=1, island=0)
+    metadata = json.loads(generator.metadata_path(1, 0).read_text())
+
+    assert metadata["status"] == "accepted"
+    assert metadata["candidate_id"] == candidate.candidate_id
+    assert metadata["proposal_sha256"]
+    assert not (tmp_path / "codex-g01-i00.error.json").exists()
+    _save_candidate_provenance(
+        tmp_path,
+        candidate,
+        {
+            "candidate_id": candidate.candidate_id,
+            "source": "codex",
+            "proposal_path": metadata["proposal_path"],
+            "proposal_metadata": generator.metadata_path(1, 0).name,
+            "proposal_sha256": metadata["proposal_sha256"],
+        },
+    )
+    audit = _validate_candidate_provenance(
+        tmp_path,
+        {candidate.candidate_id: candidate},
+        {"candidate_generation": {"mode": "codex", "allow_fallback": False, "model": "test"}},
+    )
+    assert audit["valid"] is True
+    assert audit["fully_codex_guided"] is True
+
+
+def test_codex_generator_repairs_semantically_invalid_proposal(tmp_path, monkeypatch):
+    generator = CodexCandidateGenerator(
+        repository=tmp_path,
+        run_dir=tmp_path,
+        executable="codex",
+        model="test",
+        validation_retries=2,
+    )
+    parent = initial_candidate(island=3, seed=1)
+    invalid = _candidate_proposal(parent, mutation_kind="structural")
+    invalid["reward_program"]["reward_scale"] *= 1.1
+    invalid["mutation_manifest"] = {
+        "changed_paths": [
+            "reward_program.reward_scale",
+            "parameter_constraint_coefficient",
+        ],
+        "summary": "too small structural mutation",
+    }
+    invalid["parameter_constraint_coefficient"] = 0.05
+    repaired = _candidate_proposal(parent, mutation_kind="restart")
+    proposals = [invalid, repaired]
+    prompts = []
+
+    def fake_run(command, **_):
+        prompts.append(command[-1])
+        output_path = Path(command[command.index("-o") + 1])
+        output_path.write_text(json.dumps(proposals[len(prompts) - 1]))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("luxai2021.rl.evolution.subprocess.run", fake_run)
+
+    candidate = generator.generate([parent], [], generation=1, island=3)
+    metadata = json.loads(generator.metadata_path(1, 3).read_text())
+
+    assert candidate.mutation_kind == "restart"
+    assert len(prompts) == 2
+    assert "VALIDATOR REPAIR REQUIRED" in prompts[1]
+    assert "actual=" in prompts[1]
+    assert metadata["attempts"] == 2
+    assert len(metadata["rejected_attempts"]) == 1
+    assert (tmp_path / "codex-g01-i03.attempt-01.rejected.json").exists()
+    assert (tmp_path / "codex-g01-i03.attempt-01.error.json").exists()
+    assert not generator.error_path(1, 3).exists()
+
+
+def test_candidate_provenance_rejects_silent_codex_fallback(tmp_path):
+    initial = initial_candidate(island=0, seed=1)
+    child = mutate_candidate(initial, generation=1, island=0, seed=2)
+    candidates = {candidate.candidate_id: candidate for candidate in (initial, child)}
+    _save_candidate_provenance(
+        tmp_path,
+        initial,
+        {"candidate_id": initial.candidate_id, "source": "initial"},
+    )
+    _save_candidate_provenance(
+        tmp_path,
+        child,
+        {"candidate_id": child.candidate_id, "source": "codex_fallback"},
+    )
+
+    strict = _validate_candidate_provenance(
+        tmp_path,
+        candidates,
+        {"candidate_generation": {"mode": "codex", "allow_fallback": False}},
+    )
+    explicit = _validate_candidate_provenance(
+        tmp_path,
+        candidates,
+        {"candidate_generation": {"mode": "codex", "allow_fallback": True}},
+    )
+
+    assert strict["valid"] is False
+    assert strict["fully_codex_guided"] is False
+    assert explicit["valid"] is True
+    assert explicit["fully_codex_guided"] is False
+    assert explicit["counts"] == {"initial": 1, "codex_fallback": 1}
+
+
+def test_checkpoint_descriptors_detect_content_replacement(tmp_path):
+    base = tmp_path / "base.pt"
+    teacher = tmp_path / "teacher.pt"
+    base.write_bytes(b"base-a")
+    teacher.write_bytes(b"teacher")
+    args = SimpleNamespace(
+        resattn8_only=True,
+        resattn8_checkpoint=str(base),
+        teacher_checkpoint=str(teacher),
+    )
+    descriptors = _checkpoint_descriptors(args)
+    manifest = {"checkpoint_descriptors": descriptors}
+    _validate_checkpoint_descriptors(args, manifest)
+
+    base.write_bytes(b"base-b")
+
+    with pytest.raises(ValueError, match=r"SHA-256|sha256"):
+        _validate_checkpoint_descriptors(args, manifest)
+
+
+def test_dry_run_cannot_be_resumed_as_training():
+    manifest = {"run_kind": "dry-run"}
+
+    _validate_run_kind(manifest, dry_run=True)
+    with pytest.raises(ValueError, match="new --run-dir"):
+        _validate_run_kind(manifest, dry_run=False)
+
+
 def test_candidate_content_hash_detects_manual_edit():
     value = initial_candidate(island=0, seed=42).to_dict()
     value["reward_program"]["reward_scale"] = 0.3
@@ -876,6 +1052,7 @@ def test_training_checkpoint_can_resume_compatible_weights_from_an_older_base_pa
     trainer.save_training_checkpoint(
         checkpoint_path,
         source_checkpoint="models/old-base.pt",
+        source_checkpoint_sha256="old-sha256",
         reward_program=default_reward_program(),
         update=0,
         metrics={},
@@ -896,6 +1073,15 @@ def test_training_checkpoint_can_resume_compatible_weights_from_an_older_base_pa
 
     assert restored.source_checkpoint == "models/old-base.pt"
     assert restored.source_checkpoint_mismatch is True
+    assert restored.source_checkpoint_sha256 == "old-sha256"
+    with pytest.raises(ValueError, match="SHA-256"):
+        trainer.load_training_state(
+            checkpoint_path,
+            source_checkpoint="models/new-base.pt",
+            source_checkpoint_sha256="new-sha256",
+            reward_program=default_reward_program(),
+            allow_compatible_source_checkpoint=True,
+        )
 
 
 def test_cuda_rng_resume_is_portable_across_visible_gpu_counts():
@@ -908,6 +1094,15 @@ def test_cuda_rng_resume_is_portable_across_visible_gpu_counts():
         _checkpoint_cuda_rng_state({"cuda_rng_state": second, "cuda_rng_state_all": [first]}, 0),
         second,
     )
+
+
+def test_final_training_metrics_supports_an_inference_only_resume():
+    resumed = {"kl": 0.125, "cumulative_decisions": 2_000_000}
+
+    assert _final_training_metrics({"history": [], "final_metrics": resumed}) is resumed
+    assert _final_training_metrics({"history": [resumed]}) is resumed
+    with pytest.raises(RuntimeError, match="final PPO metrics"):
+        _final_training_metrics({"history": []})
 
 
 def test_inference_batcher_and_parallel_rollout_batch_requests():
@@ -1455,6 +1650,66 @@ def test_stage_selection_is_frozen_and_uses_only_completed_source_stage(tmp_path
         ordered[0].candidate_id,
         ordered[1].candidate_id,
     ]
+
+
+def test_final_selection_ignores_legacy_jobs_without_completed_medium(tmp_path):
+    store = EvolutionStore(tmp_path)
+    candidates = {
+        candidate.candidate_id: candidate
+        for candidate in (
+            initial_candidate(island=0, seed=1),
+            initial_candidate(island=1, seed=2),
+            initial_candidate(island=2, seed=3),
+        )
+    }
+    ordered = list(candidates.values())
+    for candidate in ordered:
+        store.save_candidate(candidate)
+    results = [
+        CandidateResult(ordered[0].candidate_id, "medium-resattn8", "completed", 0.8, 0.0, 0.0, 1.0, {}),
+        CandidateResult(ordered[1].candidate_id, "medium-resattn8", "completed", 0.7, 0.0, 0.0, 1.0, {}),
+        CandidateResult(ordered[2].candidate_id, "short-resattn8", "completed", 1.0, 0.0, 0.0, 1.0, {}),
+    ]
+    queue = FilesystemJobQueue(tmp_path)
+    legacy_final = EvolutionJob(ordered[2].candidate_id, "final-resattn8", "resattn8", 1, 1, 100)
+    queue.enqueue(legacy_final)
+
+    selected = _load_or_create_stage_selection(
+        store,
+        candidates,
+        results,
+        name="final",
+        target_stage="final-resattn8",
+        source_stage="medium-resattn8",
+        count=2,
+    )
+
+    assert [candidate.candidate_id for candidate in selected] == [
+        ordered[0].candidate_id,
+        ordered[1].candidate_id,
+    ]
+    saved = json.loads((tmp_path / "selections" / "final.json").read_text())
+    assert saved["source_stage_verified"] is True
+
+
+def test_existing_final_selection_without_completed_medium_is_rejected(tmp_path):
+    store = EvolutionStore(tmp_path)
+    candidate = initial_candidate(island=0, seed=1)
+    store.save_candidate(candidate)
+    selection = tmp_path / "selections" / "final.json"
+    selection.parent.mkdir()
+    EvolutionStore.write_json(selection, {"candidate_ids": [candidate.candidate_id]})
+
+    with pytest.raises(ValueError, match="without completed medium-resattn8"):
+        _load_or_create_stage_selection(
+            store,
+            {candidate.candidate_id: candidate},
+            [],
+            name="final",
+            target_stage="final-resattn8",
+            source_stage="medium-resattn8",
+            count=1,
+        )
 
 
 def test_unselected_running_stage_job_is_archived(tmp_path):

@@ -12,6 +12,7 @@ import random
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -47,6 +48,7 @@ from luxai2021.rl.evolution import (
     select_elites,
 )
 from luxai2021.rl.job_api import JOB_API_VERSION, JobApiClient, JobApiServer, extract_artifact_directory
+from luxai2021.rl.notifications import EvolutionNotifier
 from luxai2021.rl.policy import FullTurnActorCritic, RolloutAgent
 from luxai2021.rl.ppo import (
     PPOTrainer,
@@ -110,6 +112,12 @@ _RUN_MANIFEST_ARGUMENTS = (
     "critic_warmup_episodes",
     "unet_probe_every",
     "resattn8_only",
+    "codex_executable",
+    "codex_model",
+    "codex_timeout",
+    "codex_validation_retries",
+    "no_codex",
+    "allow_codex_fallback",
 )
 
 
@@ -163,7 +171,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codex-executable", default="codex")
     parser.add_argument("--codex-model")
     parser.add_argument("--codex-timeout", type=int, default=900)
+    parser.add_argument(
+        "--codex-validation-retries",
+        type=int,
+        default=2,
+        help="Retry schema-valid Codex proposals rejected by the mutation validator (default: 2).",
+    )
     parser.add_argument("--no-codex", action="store_true")
+    parser.add_argument(
+        "--allow-codex-fallback",
+        action="store_true",
+        help="Explicitly allow deterministic candidates after a Codex proposal failure.",
+    )
     parser.add_argument("--no-bc-anchor", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite-run", action="store_true")
@@ -235,6 +254,147 @@ def git_revision(repository: Path) -> str:
         text=True,
     )
     return completed.stdout.strip() if completed.returncode == 0 else "unknown"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as input_file:
+        while chunk := input_file.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _checkpoint_descriptors(args: argparse.Namespace) -> dict[str, dict[str, object]]:
+    paths = {name: Path(getattr(args, f"{name}_checkpoint")) for name in _active_base_names(args)}
+    paths["teacher"] = Path(args.teacher_checkpoint)
+    descriptors = {}
+    for name, path in paths.items():
+        if not path.is_file():
+            message = f"Required checkpoint does not exist: {path}"
+            raise FileNotFoundError(message)
+        descriptors[name] = {
+            "path": str(path),
+            "size": path.stat().st_size,
+            "sha256": _sha256_file(path),
+        }
+    return descriptors
+
+
+def _validate_checkpoint_descriptors(args: argparse.Namespace, manifest: Mapping[str, object]) -> None:
+    expected = manifest.get("checkpoint_descriptors")
+    if expected is None:
+        return
+    if not isinstance(expected, dict):
+        raise TypeError("Run manifest checkpoint descriptors are invalid")
+    if not expected:
+        return
+    actual = _checkpoint_descriptors(args)
+    for name, descriptor in expected.items():
+        if name not in actual or not isinstance(descriptor, dict):
+            message = f"Run manifest checkpoint descriptor is invalid: {name}"
+            raise ValueError(message)
+        for key in ("path", "size", "sha256"):
+            if actual[name][key] != descriptor.get(key):
+                message = (
+                    f"Checkpoint integrity mismatch for {name}: {key} expected={descriptor.get(key)!r} "
+                    f"actual={actual[name][key]!r}"
+                )
+                raise ValueError(message)
+
+
+def _candidate_provenance_path(run_dir: Path, candidate_id: str) -> Path:
+    return run_dir / "provenance" / f"{candidate_id}.json"
+
+
+def _save_candidate_provenance(run_dir: Path, candidate: EvolutionCandidate, value: Mapping[str, object]) -> None:
+    path = _candidate_provenance_path(run_dir, candidate.candidate_id)
+    if path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if existing != dict(value):
+            message = f"Candidate provenance changed for {candidate.candidate_id}"
+            raise ValueError(message)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    EvolutionStore.write_json(path, value)
+
+
+def _candidate_provenance(run_dir: Path, candidate_id: str) -> dict[str, object] | None:
+    path = _candidate_provenance_path(run_dir, candidate_id)
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+
+def _validate_candidate_provenance(
+    run_dir: Path,
+    candidates: Mapping[str, EvolutionCandidate],
+    manifest: Mapping[str, object],
+) -> dict[str, object]:
+    generation = manifest.get("candidate_generation", {})
+    if not isinstance(generation, dict):
+        raise TypeError("Run manifest candidate-generation policy is invalid")
+    expected_mode = str(generation.get("mode", "legacy"))
+    allow_fallback = bool(generation.get("allow_fallback", False))
+    counts: dict[str, int] = {}
+    errors = []
+    for candidate in candidates.values():
+        provenance = _candidate_provenance(run_dir, candidate.candidate_id)
+        if provenance is None:
+            errors.append(f"{candidate.candidate_id}: missing provenance")
+            continue
+        source = str(provenance.get("source", "unknown"))
+        counts[source] = counts.get(source, 0) + 1
+        is_initial = candidate.mutation_kind == "initial" and not candidate.parent_ids
+        allowed_sources = {"initial"} if is_initial else {expected_mode}
+        if expected_mode == "codex" and allow_fallback and not is_initial:
+            allowed_sources.add("codex_fallback")
+        if source not in allowed_sources:
+            errors.append(f"{candidate.candidate_id}: source={source!r}, expected={sorted(allowed_sources)}")
+        if source == "codex":
+            proposal_name = str(provenance.get("proposal_path", ""))
+            metadata_name = str(provenance.get("proposal_metadata", ""))
+            if Path(proposal_name).name != proposal_name or Path(metadata_name).name != metadata_name:
+                errors.append(f"{candidate.candidate_id}: unsafe Codex provenance path")
+                continue
+            proposal_path = run_dir / proposal_name
+            metadata_path = run_dir / metadata_name
+            if not proposal_path.is_file() or not metadata_path.is_file():
+                errors.append(f"{candidate.candidate_id}: Codex proposal or metadata file is missing")
+                continue
+            proposal_sha256 = _sha256_file(proposal_path)
+            if proposal_sha256 != provenance.get("proposal_sha256"):
+                errors.append(f"{candidate.candidate_id}: Codex proposal SHA-256 changed")
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if (
+                metadata.get("candidate_id") != candidate.candidate_id
+                or metadata.get("proposal_sha256") != proposal_sha256
+            ):
+                errors.append(f"{candidate.candidate_id}: Codex metadata does not match candidate/proposal")
+            if metadata.get("model") != generation.get("model"):
+                errors.append(f"{candidate.candidate_id}: Codex model does not match run manifest")
+            proposal = json.loads(proposal_path.read_text(encoding="utf-8"))
+            reconstructed = EvolutionCandidate.from_proposal(
+                proposal,
+                generation=candidate.generation,
+                island=candidate.island,
+                parent_ids=candidate.parent_ids,
+            )
+            if reconstructed.candidate_id != candidate.candidate_id:
+                errors.append(f"{candidate.candidate_id}: Codex proposal no longer reconstructs the candidate")
+    return {
+        "expected_mode": expected_mode,
+        "allow_fallback": allow_fallback,
+        "counts": counts,
+        "errors": errors,
+        "valid": not errors,
+        "fully_codex_guided": expected_mode == "codex" and counts.get("codex_fallback", 0) == 0 and not errors,
+    }
+
+
+def _validate_run_kind(manifest: Mapping[str, object], *, dry_run: bool) -> None:
+    run_kind = manifest.get("run_kind")
+    requested_kind = "dry-run" if dry_run else "training"
+    if run_kind is not None and run_kind != requested_kind:
+        message = f"Cannot resume a {run_kind!r} run as {requested_kind!r}; use a new --run-dir or --overwrite-run"
+        raise ValueError(message)
 
 
 def build_anchor_provider(
@@ -379,6 +539,7 @@ def train_candidate(
     checkpoint_callback: Callable[[Path, Mapping[str, object]], None] | None = None,
 ) -> tuple[Path, dict[str, object]]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    base_checkpoint_sha256 = _sha256_file(base_checkpoint)
     actor_critic = FullTurnActorCritic.from_checkpoint(base_checkpoint, device)
     inherited_modules: list[str] = []
     inherited_hash = None
@@ -447,6 +608,7 @@ def train_candidate(
         resume_state = trainer.load_training_state(
             resume_from,
             source_checkpoint=str(base_checkpoint),
+            source_checkpoint_sha256=base_checkpoint_sha256,
             reward_program=candidate.reward_program,
             legacy_target_decisions=decision_budget,
             legacy_stage_seconds=seconds,
@@ -457,6 +619,9 @@ def train_candidate(
             "stored_source_checkpoint": resume_state.source_checkpoint,
             "requested_source_checkpoint": str(base_checkpoint),
             "source_checkpoint_mismatch": resume_state.source_checkpoint_mismatch,
+            "stored_source_checkpoint_sha256": resume_state.source_checkpoint_sha256,
+            "requested_source_checkpoint_sha256": base_checkpoint_sha256,
+            "source_checkpoint_sha256_mismatch": resume_state.source_checkpoint_sha256_mismatch,
             "budget_progress_resumed": resume_budget_progress,
         }
         start_update = resume_state.next_update
@@ -634,6 +799,7 @@ def train_candidate(
             trainer.save_training_checkpoint(
                 output_dir / "latest_rl.pt",
                 source_checkpoint=str(base_checkpoint),
+                source_checkpoint_sha256=base_checkpoint_sha256,
                 reward_program=candidate.reward_program,
                 update=update,
                 metrics=metrics,
@@ -663,6 +829,7 @@ def train_candidate(
         "candidate_id": candidate.candidate_id,
         "base_name": base_name,
         "base_checkpoint": str(base_checkpoint),
+        "base_checkpoint_sha256": base_checkpoint_sha256,
         "reward_program": candidate.reward_program.to_dict(),
         "effective_reward_program": effective_reward_program.to_dict(),
         "reward_calibration": reward_calibration,
@@ -681,6 +848,7 @@ def train_candidate(
         "decisions_per_update": decisions_per_update,
         "rollout_envs": rollout_envs,
         "history": history,
+        "final_metrics": final_metrics,
         "diagnostic_events": diagnostic_events,
     }
     actor_critic.export_policy(
@@ -741,6 +909,16 @@ def _effective_scale_from_artifact(checkpoint: Path, fallback: float) -> float:
     value = json.loads(metrics_path.read_text(encoding="utf-8"))
     effective = value.get("effective_reward_program", {})
     return float(effective.get("reward_scale", fallback)) if isinstance(effective, dict) else fallback
+
+
+def _final_training_metrics(training: Mapping[str, object]) -> Mapping[str, object]:
+    final_metrics = training.get("final_metrics")
+    if isinstance(final_metrics, dict):
+        return final_metrics
+    history = training.get("history")
+    if isinstance(history, list) and history and isinstance(history[-1], dict):
+        return history[-1]
+    raise RuntimeError("Training result does not contain final PPO metrics")
 
 
 def candidate_result(
@@ -841,7 +1019,7 @@ def candidate_result(
             game for game in evaluation["games"] if game.get("anchor") == "first-place" and "outcome" in game
         ]
         teacher_score_rate = sum((float(game["outcome"]) + 1.0) * 0.5 for game in teacher_games) / len(teacher_games)
-        kl = float(training["history"][-1]["kl"])
+        kl = float(_final_training_metrics(training)["kl"])
         diagnostics_path = output_dir / "diagnostics.json.gz"
         with gzip.open(diagnostics_path, "wt", encoding="utf-8") as output:
             json.dump(
@@ -1015,11 +1193,22 @@ def run_worker(args: argparse.Namespace) -> None:
     if args.overwrite_run:
         raise ValueError("Distributed workers cannot overwrite the run directory")
     run_dir = Path(args.run_dir)
+    validated_manifests: set[str] = set()
+
+    def apply_manifest(value: Mapping[str, object]) -> None:
+        _apply_coordinator_manifest(args, value)
+        signature = hashlib.sha256(
+            json.dumps(value.get("checkpoint_descriptors", {}), sort_keys=True).encode()
+        ).hexdigest()
+        if signature not in validated_manifests:
+            _validate_checkpoint_descriptors(args, value)
+            validated_manifests.add(signature)
+
     if args.job_api_url is None and not (run_dir / "manifest.json").exists():
         raise ValueError("Worker run directory does not contain a coordinator manifest")
     if (run_dir / "manifest.json").exists():
         manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-        _apply_coordinator_manifest(args, manifest)
+        apply_manifest(manifest)
     device = resolve_device(args.device)
     store = EvolutionStore(run_dir)
     queue = None if args.job_api_url else FilesystemJobQueue(run_dir)
@@ -1070,7 +1259,7 @@ def run_worker(args: argparse.Namespace) -> None:
                 claimed = None
             else:
                 job, lease_id = _sync_api_claim(store, claim, api)
-                _apply_coordinator_manifest(args, claim["manifest"])
+                apply_manifest(claim["manifest"])
                 claimed = (job, lease_id)
         else:
             claimed = queue.claim(worker_id)
@@ -1316,32 +1505,55 @@ def _load_or_create_stage_selection(
     target_stage: str,
     source_stage: str,
     count: int,
+    allow_legacy_unverified: bool = False,
 ) -> list[EvolutionCandidate]:
     path = store.run_dir / "selections" / f"{name}.json"
+    eligible = {
+        result.candidate_id
+        for result in results
+        if result.stage == source_stage and result.status == "completed" and result.candidate_id in candidates
+    }
     if path.exists():
         value = json.loads(path.read_text(encoding="utf-8"))
         candidate_ids = [str(candidate_id) for candidate_id in value.get("candidate_ids", [])]
+        selection_was_verified = value.get("source_stage_verified") is True
     else:
         candidate_ids = _legacy_stage_selection(store.run_dir, target_stage, count)
         source = "legacy_jobs" if candidate_ids else source_stage
+        invalid_legacy = [candidate_id for candidate_id in candidate_ids if candidate_id not in eligible]
+        if invalid_legacy and not allow_legacy_unverified:
+            candidate_ids = []
+            source = source_stage
         if not candidate_ids:
             candidate_ids = _select_completed_stage(candidates, results, stage=source_stage, count=count)
+        unverified = [candidate_id for candidate_id in candidate_ids if candidate_id not in eligible]
         path.parent.mkdir(parents=True, exist_ok=True)
         EvolutionStore.write_json(
             path,
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "name": name,
                 "source": source,
                 "source_stage": source_stage,
                 "target_stage": target_stage,
                 "candidate_ids": candidate_ids,
+                "source_stage_verified": not unverified,
+                "unverified_candidate_ids": unverified,
                 "created_at": time.time(),
             },
         )
+        selection_was_verified = not unverified
     missing = [candidate_id for candidate_id in candidate_ids if candidate_id not in candidates]
     if missing:
         message = f"Selection {name!r} references missing candidates: {missing}"
+        raise ValueError(message)
+    unverified = (
+        []
+        if selection_was_verified
+        else [candidate_id for candidate_id in candidate_ids if candidate_id not in eligible]
+    )
+    if unverified and not allow_legacy_unverified:
+        message = f"Selection {name!r} contains candidates without completed {source_stage}: {unverified}"
         raise ValueError(message)
     return [candidates[candidate_id] for candidate_id in candidate_ids]
 
@@ -1393,14 +1605,135 @@ def _archive_stale_summary(run_dir: Path) -> None:
     summary.replace(_unused_history_path(history, "summary.json"))
 
 
-def main() -> None:
-    args = parse_args()
+def _run_integrity_report(
+    run_dir: Path,
+    manifest: Mapping[str, object],
+    candidates: Mapping[str, EvolutionCandidate],
+    results: list[CandidateResult],
+    medium: list[EvolutionCandidate],
+    finalists: list[EvolutionCandidate],
+) -> dict[str, object]:
+    manifest_schema = int(manifest.get("schema_version", 1))
+    issues = []
+    if manifest_schema < 2:
+        issues.append("legacy manifest has no immutable checkpoint/proposal provenance lock")
+        legacy_counts: dict[str, int] = {}
+        for candidate in candidates.values():
+            if candidate.mutation_kind == "initial" and not candidate.parent_ids:
+                source = "initial"
+            elif candidate.rationale.startswith("Deterministic island-"):
+                source = "deterministic_fallback"
+            else:
+                source = "codex_unverified"
+            legacy_counts[source] = legacy_counts.get(source, 0) + 1
+        provenance: dict[str, object] = {
+            "expected_mode": "legacy",
+            "counts": legacy_counts,
+            "errors": ["candidate provenance was not recorded"],
+            "valid": False,
+            "fully_codex_guided": False,
+        }
+    else:
+        provenance = _validate_candidate_provenance(run_dir, candidates, manifest)
+        issues.extend(str(error) for error in provenance["errors"])
+        if provenance["expected_mode"] == "codex" and not provenance["fully_codex_guided"]:
+            issues.append("Codex-mode run contains non-Codex candidate mutations")
+    completed_medium = {
+        result.candidate_id for result in results if result.stage == "medium-resattn8" and result.status == "completed"
+    }
+    final_without_medium = [
+        candidate.candidate_id for candidate in finalists if candidate.candidate_id not in completed_medium
+    ]
+    if final_without_medium:
+        issues.append(f"final candidates without completed medium stage: {final_without_medium}")
+    final_lineages: dict[str, str] = {}
+    for result in results:
+        if result.status != "completed" or not result.stage.startswith("final-"):
+            continue
+        training = result.metrics.get("training", {}) if isinstance(result.metrics, dict) else {}
+        resume = training.get("resume") if isinstance(training, dict) else None
+        lineage = resume.get("stored_source_checkpoint") if isinstance(resume, dict) else None
+        if lineage is None and isinstance(training, dict):
+            lineage = training.get("base_checkpoint")
+        if lineage is not None:
+            final_lineages[result.candidate_id] = str(lineage)
+    if len(set(final_lineages.values())) > 1:
+        issues.append(f"final candidates have mixed base-checkpoint lineages: {final_lineages}")
+    medium_without_short = [
+        candidate.candidate_id
+        for candidate in medium
+        if not any(
+            result.candidate_id == candidate.candidate_id
+            and result.stage == "short-resattn8"
+            and result.status == "completed"
+            for result in results
+        )
+    ]
+    if medium_without_short:
+        issues.append(f"medium candidates without completed short stage: {medium_without_short}")
+    descriptors = manifest.get("checkpoint_descriptors", {})
+    checkpoint_lock_valid = manifest_schema >= 2 and isinstance(descriptors, dict) and bool(descriptors)
+    if not checkpoint_lock_valid:
+        issues.append("checkpoint SHA-256 descriptors are unavailable")
+    elif isinstance(descriptors, dict):
+        for result in results:
+            if result.status != "completed" or not result.stage.startswith("final-"):
+                continue
+            base_name = result.stage.removeprefix("final-")
+            descriptor = descriptors.get(base_name)
+            training = result.metrics.get("training", {}) if isinstance(result.metrics, dict) else {}
+            actual_sha256 = training.get("base_checkpoint_sha256") if isinstance(training, dict) else None
+            expected_sha256 = descriptor.get("sha256") if isinstance(descriptor, dict) else None
+            if actual_sha256 != expected_sha256:
+                issues.append(
+                    f"{result.candidate_id} {result.stage} base SHA-256 mismatch: "
+                    f"expected={expected_sha256!r} actual={actual_sha256!r}"
+                )
+    return {
+        "valid_for_promotion": not issues,
+        "issues": issues,
+        "manifest_schema_version": manifest_schema,
+        "checkpoint_lock_valid": checkpoint_lock_valid,
+        "candidate_provenance": provenance,
+        "medium_without_short": medium_without_short,
+        "final_without_medium": final_without_medium,
+        "final_checkpoint_lineages": final_lineages,
+    }
+
+
+def _notify_run_event(
+    notifier: EvolutionNotifier,
+    run_dir: Path,
+    event_id: str,
+    title: str,
+    detail: str,
+    *,
+    priority: int = 3,
+    tags: tuple[str, ...] = (),
+) -> None:
+    notifier.notify_once(
+        event_id,
+        title=title,
+        message=f"{detail}\nhost: {socket.gethostname()}\nrun_dir: {run_dir}",
+        priority=priority,
+        tags=tags,
+    )
+
+
+def main(
+    args: argparse.Namespace | None = None,
+    notifier: EvolutionNotifier | None = None,
+) -> None:
+    args = parse_args() if args is None else args
+    run_dir = Path(args.run_dir)
+    notifier = notifier or EvolutionNotifier.from_environment(run_dir)
+    for warning in notifier.configuration_warnings:
+        print(json.dumps({"notification_configuration_warning": warning}, sort_keys=True), file=sys.stderr)
     if args.worker:
         run_worker(args)
         return
     if args.job_api_url:
         raise ValueError("--job-api-url is only valid with --worker")
-    run_dir = Path(args.run_dir)
     if args.overwrite_run and run_dir.exists():
         shutil.rmtree(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1411,6 +1744,7 @@ def main() -> None:
         else None
     )
     if existing_manifest is not None:
+        _validate_run_kind(existing_manifest, dry_run=args.dry_run)
         _apply_coordinator_manifest(args, existing_manifest)
     if args.islands < 1 or args.initial_per_island < 1 or args.generations < 0:
         raise ValueError("Population sizes must be positive")
@@ -1418,20 +1752,42 @@ def main() -> None:
         raise ValueError("Rollout environment and decision budgets must be positive")
     repository = Path(__file__).resolve().parents[1]
     device = resolve_device(args.device)
+    if not args.no_codex and not args.dry_run and shutil.which(args.codex_executable) is None:
+        message = f"Codex executable is unavailable: {args.codex_executable}"
+        raise FileNotFoundError(message)
     store = EvolutionStore(run_dir)
     if existing_manifest is None:
+        generation_mode = "dry_run" if args.dry_run else ("deterministic" if args.no_codex else "codex")
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "created_at": time.time(),
             "git_revision": git_revision(repository),
             "arguments": vars(args),
             "device": str(device),
             "codex_available": shutil.which(args.codex_executable) is not None,
             "bases": {name: getattr(args, f"{name}_checkpoint") for name in _active_base_names(args)},
+            "run_kind": "dry-run" if args.dry_run else "training",
+            "candidate_generation": {
+                "mode": generation_mode,
+                "allow_fallback": bool(args.allow_codex_fallback),
+                "model": args.codex_model,
+                "executable": args.codex_executable,
+            },
+            "checkpoint_descriptors": {} if args.dry_run else _checkpoint_descriptors(args),
         }
         store.save_manifest(manifest)
     else:
         manifest = existing_manifest
+    if not args.dry_run:
+        _notify_run_event(
+            notifier,
+            run_dir,
+            f"run-started:{manifest.get('created_at', 'legacy')}",
+            "Lux evolution coordinator active",
+            f"Coordinator started or resumed.\ndevice: {device}\ngeneration target: {args.generations}",
+            tags=("rocket",),
+        )
+    _validate_checkpoint_descriptors(args, manifest)
     generator = None
     if not args.no_codex and not args.dry_run:
         generator = CodexCandidateGenerator(
@@ -1440,9 +1796,15 @@ def main() -> None:
             executable=args.codex_executable,
             model=args.codex_model,
             timeout_seconds=args.codex_timeout,
+            validation_retries=args.codex_validation_retries,
         )
     candidates = {candidate.candidate_id: candidate for candidate in store.candidates()}
     results = store.results()
+    if int(manifest.get("schema_version", 1)) >= 2 and candidates:
+        provenance_report = _validate_candidate_provenance(run_dir, candidates, manifest)
+        if not provenance_report["valid"]:
+            message = f"Candidate provenance audit failed: {provenance_report['errors']}"
+            raise ValueError(message)
     queue = FilesystemJobQueue(run_dir) if args.distributed or args.job_api_listen else None
     job_api_server = None
     if args.job_api_listen and not args.dry_run:
@@ -1459,9 +1821,45 @@ def main() -> None:
         host, port = job_api_server.address
         print(json.dumps({"job_api": f"http://{host}:{port}"}, sort_keys=True))
 
-    def register(candidate: EvolutionCandidate) -> None:
+    def register(candidate: EvolutionCandidate, provenance: Mapping[str, object]) -> None:
         candidates[candidate.candidate_id] = candidate
         store.save_candidate(candidate)
+        _save_candidate_provenance(run_dir, candidate, provenance)
+
+    def candidate_provenance(
+        candidate: EvolutionCandidate,
+        source: str,
+        *,
+        generation: int,
+        island: int,
+        error: Exception | None = None,
+    ) -> dict[str, object]:
+        value: dict[str, object] = {
+            "schema_version": 1,
+            "candidate_id": candidate.candidate_id,
+            "generation": generation,
+            "island": island,
+            "parent_ids": list(candidate.parent_ids),
+            "source": source,
+            "created_at": time.time(),
+        }
+        if source == "codex":
+            metadata_path = generator.metadata_path(generation, island) if generator is not None else None
+            if metadata_path is None or not metadata_path.exists():
+                message = f"Accepted Codex proposal metadata is missing: {metadata_path}"
+                raise FileNotFoundError(message)
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            value.update(
+                {
+                    "proposal_metadata": metadata_path.name,
+                    "proposal_path": metadata["proposal_path"],
+                    "proposal_sha256": metadata["proposal_sha256"],
+                    "model": metadata.get("model"),
+                }
+            )
+        if error is not None:
+            value.update({"fallback_error_type": type(error).__name__, "fallback_error": str(error)})
+        return value
 
     def refresh_results() -> None:
         latest = {(result.candidate_id, result.stage): result for result in results}
@@ -1469,6 +1867,13 @@ def main() -> None:
             key = (stored.candidate_id, stored.stage)
             latest[key] = stored
         results[:] = list(latest.values())
+
+    def jobs_are_pending(jobs: list[EvolutionJob]) -> bool:
+        if args.dry_run or not jobs:
+            return False
+        refresh_results()
+        completed = {(result.candidate_id, result.stage) for result in results if result.status == "completed"}
+        return any((job.candidate_id, job.stage) not in completed for job in jobs)
 
     def evaluate_jobs(jobs: list[EvolutionJob]) -> None:
         if args.dry_run or not jobs:
@@ -1515,7 +1920,17 @@ def main() -> None:
                 detail = ", ".join(f"{result.candidate_id}--{result.stage}: {result.error}" for result in failed)
                 message = f"Evolution jobs failed; fix the cause and resume: {detail}"
                 raise RuntimeError(message)
-            queue.recover_stale(args.recover_stale_job_seconds)
+            recovered_jobs = queue.recover_stale(args.recover_stale_job_seconds)
+            if recovered_jobs:
+                _notify_run_event(
+                    notifier,
+                    run_dir,
+                    f"stale-jobs-recovered:{time.time_ns()}",
+                    "Lux evolution worker lease expired",
+                    f"Recovered and requeued jobs: {recovered_jobs}",
+                    priority=4,
+                    tags=("warning",),
+                )
             if time.monotonic() >= deadline:
                 missing = sorted(expected - completed)
                 message = f"Timed out waiting for distributed jobs: {missing}"
@@ -1562,9 +1977,10 @@ def main() -> None:
             base = existing_initial[0]
         else:
             base = initial_candidate(island=island, seed=args.seed)
-            register(base)
+            register(base, candidate_provenance(base, "initial", generation=0, island=island))
         island_parents[island] = base
         base_wave.append(short_job(base))
+    generation_zero_progress = jobs_are_pending(base_wave)
     evaluate_jobs(base_wave)
 
     for initial_index in range(1, args.initial_per_island):
@@ -1572,12 +1988,16 @@ def main() -> None:
         for island in range(args.islands):
             existing_initial = initial_by_island[island]
             parent = island_parents[island]
+            provenance = None
             if initial_index < len(existing_initial):
                 child = existing_initial[initial_index]
             elif generator is not None:
                 try:
                     child = generator.generate([parent], results, generation=0, island=island)
                 except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+                    if not args.allow_codex_fallback:
+                        message = f"Codex proposal failed for generation 0 island {island}; fallback is disabled"
+                        raise RuntimeError(message) from error
                     print(f"Codex fallback for island {island}: {error}")
                     child = mutate_candidate(
                         parent,
@@ -1585,6 +2005,15 @@ def main() -> None:
                         island=island,
                         seed=args.seed + island * 100 + initial_index,
                     )
+                    provenance = candidate_provenance(
+                        child,
+                        "codex_fallback",
+                        generation=0,
+                        island=island,
+                        error=error,
+                    )
+                else:
+                    provenance = candidate_provenance(child, "codex", generation=0, island=island)
             else:
                 child = mutate_candidate(
                     parent,
@@ -1592,10 +2021,24 @@ def main() -> None:
                     island=island,
                     seed=args.seed + island * 100 + initial_index,
                 )
-            register(child)
+                source = "dry_run" if args.dry_run else "deterministic"
+                provenance = candidate_provenance(child, source, generation=0, island=island)
+            if provenance is not None:
+                register(child, provenance)
             wave.append(short_job(child))
             island_parents[island] = child
+        generation_zero_progress = jobs_are_pending(wave) or generation_zero_progress
         evaluate_jobs(wave)
+
+    if generation_zero_progress:
+        _notify_run_event(
+            notifier,
+            run_dir,
+            "generation-00-completed",
+            "Lux evolution generation 0 completed",
+            f"Initial population completed.\ncandidates: {len(candidates)}",
+            tags=("white_check_mark",),
+        )
 
     for generation in range(1, args.generations + 1):
         global_elites = select_elites(candidates, results, count=max(4, args.islands * 2))
@@ -1646,6 +2089,12 @@ def main() -> None:
                     try:
                         child = generator.generate(parents, results, generation=generation, island=island)
                     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+                        if not args.allow_codex_fallback:
+                            message = (
+                                f"Codex proposal failed for generation {generation} island {island}; "
+                                "fallback is disabled"
+                            )
+                            raise RuntimeError(message) from error
                         print(f"Codex fallback for generation {generation} island {island}: {error}")
                         child = mutate_candidate(
                             parent,
@@ -1655,6 +2104,15 @@ def main() -> None:
                             secondary_parents=tuple(parents[1:]),
                             stagnated=stagnated,
                         )
+                        provenance = candidate_provenance(
+                            child,
+                            "codex_fallback",
+                            generation=generation,
+                            island=island,
+                            error=error,
+                        )
+                    else:
+                        provenance = candidate_provenance(child, "codex", generation=generation, island=island)
                 else:
                     child = mutate_candidate(
                         parent,
@@ -1664,26 +2122,47 @@ def main() -> None:
                         secondary_parents=tuple(parents[1:]),
                         stagnated=stagnated,
                     )
-                register(child)
+                    source = "dry_run" if args.dry_run else "deterministic"
+                    provenance = candidate_provenance(child, source, generation=generation, island=island)
+                register(child, provenance)
             wave.append(short_job(child))
+        generation_progress = jobs_are_pending(wave)
         evaluate_jobs(wave)
         if not args.resattn8_only and args.unet_probe_every > 0 and generation % args.unet_probe_every == 0:
             refreshed_elites = select_elites(candidates, results, count=1)
             if refreshed_elites:
                 probe = refreshed_elites[0]
-                evaluate_jobs(
-                    [
-                        EvolutionJob(
-                            probe.candidate_id,
-                            "probe-unet",
-                            "unet",
-                            args.short_seconds,
-                            args.screening_seeds,
-                            args.screening_seed_start + 50_000 + generation * 100,
-                            args.short_decisions,
-                        )
-                    ]
-                )
+                probe_jobs = [
+                    EvolutionJob(
+                        probe.candidate_id,
+                        "probe-unet",
+                        "unet",
+                        args.short_seconds,
+                        args.screening_seeds,
+                        args.screening_seed_start + 50_000 + generation * 100,
+                        args.short_decisions,
+                    )
+                ]
+                generation_progress = jobs_are_pending(probe_jobs) or generation_progress
+                evaluate_jobs(probe_jobs)
+        if generation_progress:
+            generation_results = [
+                result
+                for result in results
+                if result.status == "completed"
+                and candidates.get(result.candidate_id) is not None
+                and candidates[result.candidate_id].generation == generation
+                and result.stage == "short-resattn8"
+            ]
+            best_score = max((result.score_rate for result in generation_results), default=float("nan"))
+            _notify_run_event(
+                notifier,
+                run_dir,
+                f"generation-{generation:02d}-completed",
+                f"Lux evolution generation {generation} completed",
+                f"Short-stage candidates: {len(generation_results)}\nbest score rate: {best_score:.4f}",
+                tags=("white_check_mark",),
+            )
 
     if args.dry_run:
         print(json.dumps({"run_dir": str(run_dir), "candidates": len(candidates), "dry_run": True}))
@@ -1697,26 +2176,45 @@ def main() -> None:
         target_stage="medium-resattn8",
         source_stage="short-resattn8",
         count=args.medium_count,
+        allow_legacy_unverified=int(manifest.get("schema_version", 1)) < 2,
     )
     _archive_unselected_stage_jobs(
         run_dir,
         "medium-resattn8",
         {candidate.candidate_id for candidate in medium},
     )
-    evaluate_jobs(
-        [
-            EvolutionJob(
-                candidate.candidate_id,
-                "medium-resattn8",
-                "resattn8",
-                max(0, args.medium_seconds - args.short_seconds),
-                args.medium_seeds,
-                args.screening_seed_start + 10_000,
-                args.medium_decisions,
-            )
-            for candidate in medium
-        ]
-    )
+    medium_jobs = [
+        EvolutionJob(
+            candidate.candidate_id,
+            "medium-resattn8",
+            "resattn8",
+            max(0, args.medium_seconds - args.short_seconds),
+            args.medium_seeds,
+            args.screening_seed_start + 10_000,
+            args.medium_decisions,
+        )
+        for candidate in medium
+    ]
+    medium_progress = jobs_are_pending(medium_jobs)
+    if medium_progress:
+        _notify_run_event(
+            notifier,
+            run_dir,
+            "medium-stage-started",
+            "Lux evolution medium stage started",
+            f"Selected candidates: {', '.join(candidate.candidate_id for candidate in medium)}",
+            tags=("hourglass_flowing_sand",),
+        )
+    evaluate_jobs(medium_jobs)
+    if medium_progress:
+        _notify_run_event(
+            notifier,
+            run_dir,
+            "medium-stage-completed",
+            "Lux evolution medium stage completed",
+            f"Completed candidates: {', '.join(candidate.candidate_id for candidate in medium)}",
+            tags=("white_check_mark",),
+        )
 
     finalists = _load_or_create_stage_selection(
         store,
@@ -1726,6 +2224,7 @@ def main() -> None:
         target_stage="final-resattn8",
         source_stage="medium-resattn8",
         count=args.final_count,
+        allow_legacy_unverified=int(manifest.get("schema_version", 1)) < 2,
     )
     for base_name in _active_base_names(args):
         _archive_unselected_stage_jobs(
@@ -1746,6 +2245,17 @@ def main() -> None:
         for candidate in finalists
         for base_name in _active_base_names(args)
     ]
+    final_progress = jobs_are_pending(final_jobs)
+    if final_progress:
+        _notify_run_event(
+            notifier,
+            run_dir,
+            "final-stage-started",
+            "Lux evolution final stage started",
+            f"Finalists: {', '.join(candidate.candidate_id for candidate in finalists)}",
+            priority=4,
+            tags=("hourglass_flowing_sand",),
+        )
     evaluate_jobs(final_jobs)
     anchors = _evaluation_anchors(args)
     baseline_dir = run_dir / "baselines"
@@ -1755,8 +2265,23 @@ def main() -> None:
         ((name, Path(getattr(args, f"{name}_checkpoint"))) for name in _active_base_names(args)) if finalists else ()
     ):
         baseline_path = baseline_dir / f"final-{base_name}.json"
+        baseline_context = {
+            "schema_version": 1,
+            "base_name": base_name,
+            "checkpoint_sha256": _sha256_file(checkpoint),
+            "checkpoint_descriptors": manifest.get("checkpoint_descriptors", {}),
+            "seed_start": args.final_seed_start,
+            "seed_count": args.final_seeds,
+            "max_turns": args.max_turns,
+        }
         if baseline_path.exists():
             baseline_evaluations[base_name] = json.loads(baseline_path.read_text(encoding="utf-8"))
+            if (
+                int(manifest.get("schema_version", 1)) >= 2
+                and baseline_evaluations[base_name].get("_context") != baseline_context
+            ):
+                message = f"Baseline evaluation context does not match the run manifest: {baseline_path}"
+                raise ValueError(message)
         else:
             baseline_evaluations[base_name] = evaluate_against_league(
                 LeagueMember(f"{base_name}-baseline-eval", checkpoint),
@@ -1766,6 +2291,7 @@ def main() -> None:
                 device=str(device),
                 max_turns=args.max_turns,
             )
+            baseline_evaluations[base_name]["_context"] = baseline_context
             store.write_json(baseline_path, baseline_evaluations[base_name])
     final_keys = {(job.candidate_id, job.stage) for job in final_jobs}
     final_results = [result for result in results if (result.candidate_id, result.stage) in final_keys]
@@ -1799,15 +2325,34 @@ def main() -> None:
         key=lambda row: (row["mean_score_rate"], row["worst_score_rate"]),
         reverse=True,
     )
-    promoted = next((row["candidate_id"] for row in ranking if row["acceptance"]["promote"]), None)
+    integrity = _run_integrity_report(run_dir, manifest, candidates, results, medium, finalists)
+    promoted = (
+        next((row["candidate_id"] for row in ranking if row["acceptance"]["promote"]), None)
+        if integrity["valid_for_promotion"]
+        else None
+    )
     summary = {
         "status": "completed",
         "medium_selection": [candidate.candidate_id for candidate in medium],
         "final_selection": [candidate.candidate_id for candidate in finalists],
         "ranking": ranking,
+        "integrity": integrity,
         "promoted_candidate": promoted,
     }
     store.write_json(run_dir / "summary.json", summary)
+    _notify_run_event(
+        notifier,
+        run_dir,
+        "run-completed",
+        "Lux evolution completed",
+        (
+            f"Promoted candidate: {promoted or 'none'}\n"
+            f"Integrity valid: {integrity['valid_for_promotion']}\n"
+            f"Finalists: {', '.join(candidate.candidate_id for candidate in finalists)}"
+        ),
+        priority=4,
+        tags=("tada", "white_check_mark"),
+    )
     print(json.dumps(summary, sort_keys=True))
     if job_api_server is not None:
         job_api_server.close()
@@ -1815,4 +2360,31 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parsed_args = parse_args()
+    notification_run_dir = Path(parsed_args.run_dir)
+    evolution_notifier = EvolutionNotifier.from_environment(notification_run_dir)
+    try:
+        main(parsed_args, evolution_notifier)
+    except KeyboardInterrupt:
+        _notify_run_event(
+            evolution_notifier,
+            notification_run_dir,
+            f"run-interrupted:{time.time_ns()}",
+            "Lux evolution interrupted",
+            "The process received Ctrl+C or another keyboard interrupt.",
+            priority=3,
+            tags=("warning",),
+        )
+        raise
+    except Exception as error:
+        failure_traceback = traceback.format_exc()[-6000:]
+        _notify_run_event(
+            evolution_notifier,
+            notification_run_dir,
+            f"run-failed:{time.time_ns()}",
+            "Lux evolution failed",
+            f"{type(error).__name__}: {error}\n\n{failure_traceback}",
+            priority=5,
+            tags=("rotating_light", "x"),
+        )
+        raise
