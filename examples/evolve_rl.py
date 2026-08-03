@@ -370,6 +370,29 @@ def _validate_candidate_provenance(
                 errors.append(f"{candidate.candidate_id}: Codex metadata does not match candidate/proposal")
             if metadata.get("model") != generation.get("model"):
                 errors.append(f"{candidate.candidate_id}: Codex model does not match run manifest")
+            raw_name = metadata.get("raw_proposal_path")
+            prompt_name = metadata.get("prompt_path")
+            for artifact_name, hash_key in (
+                (raw_name, "raw_proposal_sha256"),
+                (prompt_name, None),
+            ):
+                if artifact_name is None:
+                    continue
+                if Path(str(artifact_name)).name != artifact_name:
+                    errors.append(f"{candidate.candidate_id}: unsafe Codex audit artifact path")
+                    continue
+                artifact_path = run_dir / str(artifact_name)
+                if not artifact_path.is_file():
+                    errors.append(f"{candidate.candidate_id}: Codex audit artifact is missing: {artifact_name}")
+                elif hash_key and _sha256_file(artifact_path) != metadata.get(hash_key):
+                    errors.append(f"{candidate.candidate_id}: Codex raw proposal SHA-256 changed")
+            if prompt_name is not None and (run_dir / str(prompt_name)).is_file():
+                prompt_bytes = gzip.decompress((run_dir / str(prompt_name)).read_bytes())
+                prompt_hash = hashlib.sha256(prompt_bytes).hexdigest()
+                if len(prompt_bytes) != metadata.get("prompt_bytes") or prompt_hash != metadata.get("prompt_sha256"):
+                    errors.append(f"{candidate.candidate_id}: Codex prompt audit does not match metadata")
+            if "canonical_proposal_sha256" in metadata and metadata["canonical_proposal_sha256"] != proposal_sha256:
+                errors.append(f"{candidate.candidate_id}: Codex canonical proposal SHA-256 changed")
             proposal = json.loads(proposal_path.read_text(encoding="utf-8"))
             reconstructed = EvolutionCandidate.from_proposal(
                 proposal,
@@ -1854,6 +1877,10 @@ def main(
                     "proposal_metadata": metadata_path.name,
                     "proposal_path": metadata["proposal_path"],
                     "proposal_sha256": metadata["proposal_sha256"],
+                    "raw_proposal_path": metadata.get("raw_proposal_path"),
+                    "raw_proposal_sha256": metadata.get("raw_proposal_sha256"),
+                    "prompt_path": metadata.get("prompt_path"),
+                    "prompt_sha256": metadata.get("prompt_sha256"),
                     "model": metadata.get("model"),
                 }
             )

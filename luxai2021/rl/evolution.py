@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: C901, EM102, PLR0912, PLR0913, PLR0915, PLR2004, S311, S603, TC003
 import copy
+import gzip
 import hashlib
 import json
 import math
@@ -536,7 +537,7 @@ def proposal_schema() -> dict[str, Any]:
             "inheritance_mode": {"type": "string", "enum": sorted(INHERITANCE_MODES)},
             "mutation_manifest": expression_object(
                 {
-                    "changed_paths": {"type": "array", "items": {"type": "string"}, "maxItems": 16},
+                    "changed_paths": {"type": "array", "items": {"type": "string"}, "maxItems": 256},
                     "summary": {"type": "string"},
                 }
             ),
@@ -567,7 +568,8 @@ def build_codex_prompt(
     generation: int,
 ) -> str:
     parent_payload = [parent.to_dict() for parent in parents]
-    result_payload = [_codex_result_feedback(result) for result in results[-12:]]
+    selected_results = select_codex_feedback_results(parents, results)
+    result_payload = [_codex_result_feedback(result) for result in selected_results]
     island_role = {
         0: "parameter: change only one or two numeric leaves; keep AST topology unchanged; inherit policy_value",
         1: "structural: make one local AST operator/subtree edit; inherit policy",
@@ -579,12 +581,12 @@ def build_codex_prompt(
         if island != 3
         else """- On island 3, coordinated edits across multiple components and subtrees are encouraged when supported
   by diagnostics. Use only structural, crossover, or restart; feature_generated is deprecated.
-- Island-3 structural proposals must change the reward AST with approximate distance 0.20 to 0.65 and inherit
-  policy only with a positive parameter constraint. They may additionally change either the PPO/parameter-constraint
-  family or opponent_mix, never both.
+- AST distance 0.20 to 0.65 is a diversity target, not a validity boundary. Safe smaller or larger edits are accepted
+  and the server reclassifies mutation_kind, inheritance, constraint, and changed_paths from the actual diff.
+- Island-3 structural proposals may additionally change either the PPO/parameter-constraint family or opponent_mix.
 - Island-3 crossover may recombine multiple reward components/derived metrics, must include a distinct contribution
   from a secondary parent, and must keep the primary parent's PPO, opponent mix, and parameter constraint.
-- Changes more radical than structural distance 0.65 must be declared restart with base inheritance."""
+- Declare restart only when intentionally starting from the distilled base without a parent checkpoint."""
     )
     return f"""You are evolving a safe reward program and PPO configuration for Lux AI Challenge 2021.
 Return exactly one proposal matching the supplied JSON schema.
@@ -613,11 +615,93 @@ Generation: {generation}
 Island: {island}
 Island role: {island_role}
 Parents:
-{json.dumps(parent_payload, indent=2, sort_keys=True)}
+{json.dumps(parent_payload, ensure_ascii=False, separators=(',', ':'), sort_keys=True)}
 
 Recent evaluation and reward-reflection feedback:
-{json.dumps(result_payload, indent=2, sort_keys=True)}
+{json.dumps(result_payload, ensure_ascii=False, separators=(',', ':'), sort_keys=True)}
 """
+
+
+def _stage_priority(stage: str) -> int:
+    if stage.startswith("final"):
+        return 3
+    if stage.startswith("medium"):
+        return 2
+    return 1
+
+
+def select_codex_feedback_results(
+    parents: list[EvolutionCandidate], results: list[CandidateResult]
+) -> list[CandidateResult]:
+    """Select parent evidence plus two distinct high-fitness non-parent candidates."""
+    selected: list[CandidateResult] = []
+    parent_ids = {parent.candidate_id for parent in parents}
+    for parent in parents:
+        parent_results = [result for result in results if result.candidate_id == parent.candidate_id]
+        completed = [result for result in parent_results if result.status == "completed"]
+        best_completed = max(
+            completed,
+            key=lambda result: (_stage_priority(result.stage), result.fitness),
+            default=None,
+        )
+        if best_completed is not None:
+            selected.append(best_completed)
+        failures = [result for result in parent_results if result.status == "failed"]
+        if failures:
+            highest_failure = max(failures, key=lambda result: _stage_priority(result.stage))
+            if best_completed is None or _stage_priority(highest_failure.stage) > _stage_priority(best_completed.stage):
+                selected.append(highest_failure)
+
+    best_non_parent: dict[str, CandidateResult] = {}
+    for result in results:
+        if result.candidate_id in parent_ids or result.status != "completed":
+            continue
+        current = best_non_parent.get(result.candidate_id)
+        if current is None or (_stage_priority(result.stage), result.fitness) > (
+            _stage_priority(current.stage),
+            current.fitness,
+        ):
+            best_non_parent[result.candidate_id] = result
+    selected.extend(sorted(best_non_parent.values(), key=lambda result: result.fitness, reverse=True)[:2])
+    deduplicated: list[CandidateResult] = []
+    seen: set[tuple[str, str, str]] = set()
+    for result in selected:
+        key = result.candidate_id, result.stage, result.status
+        if key not in seen:
+            seen.add(key)
+            deduplicated.append(result)
+    return deduplicated[:8]
+
+
+def compress_turn_ranges(turns: object) -> list[list[int]]:
+    normalized = sorted({int(turn) for turn in turns}) if isinstance(turns, (list, tuple, set)) else []
+    ranges: list[list[int]] = []
+    for turn in normalized:
+        if ranges and turn == ranges[-1][1] + 1:
+            ranges[-1][1] = turn
+        else:
+            ranges.append([turn, turn])
+    return ranges
+
+
+def _event_deficit(event: Mapping[str, Any]) -> float:
+    values = [
+        abs(float(value))
+        for key, value in event.items()
+        if "deficit" in str(key).lower() and isinstance(value, (int, float)) and math.isfinite(float(value))
+    ]
+    return max(values, default=0.0)
+
+
+def _representative_city_events(events: object) -> list[Mapping[str, Any]]:
+    values = [event for event in events if isinstance(event, Mapping)] if isinstance(events, (list, tuple)) else []
+    if len(values) <= 8:
+        return values
+    indexes = {0, len(values) - 1, max(range(len(values)), key=lambda index: _event_deficit(values[index]))}
+    remaining = 8 - len(indexes)
+    if remaining > 0:
+        indexes.update(round(index * (len(values) - 1) / (remaining + 1)) for index in range(1, remaining + 1))
+    return [values[index] for index in sorted(indexes)[:8]]
 
 
 def _codex_result_feedback(result: CandidateResult) -> dict[str, Any]:
@@ -625,6 +709,64 @@ def _codex_result_feedback(result: CandidateResult) -> dict[str, Any]:
     training = metrics.get("training", {}) if isinstance(metrics, Mapping) else {}
     history = training.get("history", ()) if isinstance(training, Mapping) else ()
     evaluation = metrics.get("evaluation", {}) if isinstance(metrics, Mapping) else {}
+    last_update = history[-1] if history and isinstance(history[-1], Mapping) else {}
+    training_keys = (
+        "loss",
+        "policy_loss",
+        "value_loss",
+        "bc_loss",
+        "kl",
+        "entropy",
+        "illegal_action_loss",
+        "illegal_action_mass_mean",
+        "illegal_action_mass_p95",
+        "illegal_action_mass_max",
+        "effective_reward_scale",
+        "reward_scale",
+        "parameter_constraint_coefficient",
+        "parameter_constraint_loss",
+        "decisions_per_second",
+        "throughput",
+    )
+    reflection = metrics.get("reflection", {}) if isinstance(metrics, Mapping) else {}
+    diagnostics = reflection.get("diagnostics", {}) if isinstance(reflection, Mapping) else {}
+    city_events = diagnostics.get("city_loss_events", ()) if isinstance(diagnostics, Mapping) else ()
+    illegal_events = diagnostics.get("illegal_action_events", ()) if isinstance(diagnostics, Mapping) else ()
+    illegal_classes = Counter(
+        str(event.get("action_class", event.get("action", "unknown")))
+        for event in illegal_events
+        if isinstance(event, Mapping)
+    )
+    parent_comparisons = []
+    for comparison in reflection.get("parent_comparisons", ()) if isinstance(reflection, Mapping) else ():
+        if not isinstance(comparison, Mapping):
+            continue
+        changes = comparison.get("changes", ())
+        parent_comparisons.append(
+            {
+                "parent_id": comparison.get("parent_id"),
+                "comparison_stage": comparison.get("comparison_stage"),
+                "changed_paths": [
+                    {
+                        "path": change.get("path"),
+                        "before": change.get("before"),
+                        "after": change.get("after"),
+                    }
+                    for change in changes
+                    if isinstance(change, Mapping)
+                ],
+                "improvement": comparison.get("improvement"),
+            }
+        )
+    stored_illegal_classes = diagnostics.get("illegal_action_class_counts", {})
+    if isinstance(stored_illegal_classes, Mapping):
+        illegal_classes = Counter({str(key): int(value) for key, value in stored_illegal_classes.items()})
+    failure_metric = metrics.get("failure", {}) if isinstance(metrics, Mapping) else {}
+    failure_error = result.error
+    failure_type = result.error.split(":", 1)[0] if result.error else None
+    if not failure_error and isinstance(failure_metric, Mapping):
+        failure_error = str(failure_metric.get("message", "")) or None
+        failure_type = str(failure_metric.get("type", "")) or None
     return {
         "candidate_id": result.candidate_id,
         "stage": result.stage,
@@ -633,10 +775,26 @@ def _codex_result_feedback(result: CandidateResult) -> dict[str, Any]:
         "teacher_score_rate": result.teacher_score_rate,
         "kl": result.kl,
         "duration_seconds": result.duration_seconds,
-        "last_training_update": history[-1] if history else None,
+        "training_final": {key: last_update[key] for key in training_keys if key in last_update},
         "league_totals": evaluation.get("totals") if isinstance(evaluation, Mapping) else None,
-        "reflection": metrics.get("reflection") if isinstance(metrics, Mapping) else None,
-        "error": result.error,
+        "diagnostics": {
+            "city_tile_loss_turn_ranges": compress_turn_ranges(diagnostics.get("city_tile_loss_turns", ())),
+            "night_fuel_shortage_turn_ranges": compress_turn_ranges(
+                diagnostics.get("night_fuel_shortage_turns", ())
+            ),
+            "city_event_count": diagnostics.get("city_event_count", len(city_events)),
+            "city_tiles_lost": diagnostics.get("city_tiles_lost", 0),
+            "max_fuel_deficit": diagnostics.get(
+                "max_fuel_deficit",
+                max((_event_deficit(event) for event in city_events if isinstance(event, Mapping)), default=0.0),
+            ),
+            "city_events": _representative_city_events(city_events),
+            "illegal_turn_ranges": compress_turn_ranges(diagnostics.get("illegal_action_turns", ())),
+            "illegal_action_count": diagnostics.get("illegal_action_count", len(illegal_events)),
+            "illegal_action_classes": dict(illegal_classes),
+        },
+        "parent_comparisons": parent_comparisons,
+        "failure": None if not failure_error else {"type": failure_type, "error": failure_error[:1000]},
     }
 
 
@@ -753,7 +911,7 @@ def approximate_ast_distance(left: EvolutionCandidate, right: EvolutionCandidate
     return 0.5 * multiset_jaccard(left_subtrees, right_subtrees) + 0.3 * cosine_distance + 0.2 * numeric_distance
 
 
-def validate_candidate_mutation(parents: list[EvolutionCandidate], candidate: EvolutionCandidate) -> None:
+def _validate_candidate_contract_legacy(parents: list[EvolutionCandidate], candidate: EvolutionCandidate) -> None:
     """Reject Codex proposals that do not obey the declared island operator."""
     if not parents:
         if candidate.mutation_kind not in {"initial", "restart"}:
@@ -921,6 +1079,234 @@ def validate_candidate_mutation(parents: list[EvolutionCandidate], candidate: Ev
         raise ValueError("Island-3 restart may change PPO settings or opponent mix, not both")
 
 
+def validate_candidate_safety(parents: list[EvolutionCandidate], candidate: EvolutionCandidate) -> None:
+    """Reject only candidates that cannot be executed safely or have broken lineage."""
+    parent_by_id = {parent.candidate_id: parent for parent in parents}
+    if len(parent_by_id) != len(parents):
+        raise ValueError("Duplicate parent ids are not allowed")
+    if candidate.mutation_kind == "initial":
+        if parents or candidate.primary_parent_id is not None or candidate.secondary_parent_ids:
+            raise ValueError("Initial candidates cannot reference parents")
+        return
+    if candidate.mutation_kind == "restart" and candidate.primary_parent_id is None:
+        if candidate.secondary_parent_ids:
+            raise ValueError("A base restart cannot reference secondary parents")
+        return
+    if not parents or candidate.primary_parent_id not in parent_by_id:
+        raise ValueError("A non-restart candidate requires an existing primary parent")
+    if len(set(candidate.secondary_parent_ids)) != len(candidate.secondary_parent_ids):
+        raise ValueError("secondary_parent_ids must be unique")
+    if any(parent_id not in parent_by_id for parent_id in candidate.secondary_parent_ids):
+        raise ValueError("secondary_parent_ids contains an unknown parent")
+
+
+def _serialized_counter(items: object) -> Counter[str]:
+    return Counter(json.dumps(asdict(item), sort_keys=True, separators=(",", ":")) for item in items)
+
+
+def _is_parameter_mutation(primary: EvolutionCandidate, candidate: EvolutionCandidate) -> bool:
+    changes = candidate_setting_changes(primary, candidate)
+    parent_subtrees, parent_tokens, _, _ = candidate_ast_descriptor(primary)
+    child_subtrees, child_tokens, _, _ = candidate_ast_descriptor(candidate)
+    return (
+        1 <= len(changes) <= 2
+        and parent_subtrees == child_subtrees
+        and parent_tokens == child_tokens
+        and all(
+            isinstance(change["before"], (int, float))
+            and not isinstance(change["before"], bool)
+            and isinstance(change["after"], (int, float))
+            and not isinstance(change["after"], bool)
+            for change in changes
+        )
+    )
+
+
+def _is_feature_mutation(primary: EvolutionCandidate, candidate: EvolutionCandidate) -> bool:
+    parent_components = _serialized_counter(primary.reward_program.components)
+    child_components = _serialized_counter(candidate.reward_program.components)
+    added = list((child_components - parent_components).elements())
+    removed = list((parent_components - child_components).elements())
+    direct_addition = not added or json.loads(added[0]).get("expression", {}).get("op") == "metric"
+    return (
+        len(added) + len(removed) == 1
+        and direct_addition
+        and primary.reward_program.derived_metrics == candidate.reward_program.derived_metrics
+        and primary.reward_program.reward_scale == candidate.reward_program.reward_scale
+        and primary.reward_program.gamma == candidate.reward_program.gamma
+        and primary.ppo_config == candidate.ppo_config
+        and primary.opponent_mix == candidate.opponent_mix
+        and primary.parameter_constraint_coefficient == candidate.parameter_constraint_coefficient
+    )
+
+
+def _is_local_structural_mutation(primary: EvolutionCandidate, candidate: EvolutionCandidate) -> bool:
+    if len(primary.reward_program.components) != len(candidate.reward_program.components):
+        return False
+    changed_components = [
+        (before, after)
+        for before, after in zip(primary.reward_program.components, candidate.reward_program.components)
+        if before != after
+    ]
+    _, _, _, parent_nodes = candidate_ast_descriptor(primary)
+    _, _, _, child_nodes = candidate_ast_descriptor(candidate)
+    return (
+        len(changed_components) == 1
+        and abs(child_nodes - parent_nodes) <= 8
+        and all(before.name == after.name and before.weight == after.weight for before, after in changed_components)
+        and primary.reward_program.derived_metrics == candidate.reward_program.derived_metrics
+        and primary.reward_program.reward_scale == candidate.reward_program.reward_scale
+        and primary.reward_program.gamma == candidate.reward_program.gamma
+        and primary.ppo_config == candidate.ppo_config
+        and primary.opponent_mix == candidate.opponent_mix
+        and primary.parameter_constraint_coefficient == candidate.parameter_constraint_coefficient
+    )
+
+
+def _is_pure_crossover(
+    primary: EvolutionCandidate,
+    secondary: list[EvolutionCandidate],
+    candidate: EvolutionCandidate,
+) -> bool:
+    if not secondary:
+        return False
+    primary_components = set(_serialized_counter(primary.reward_program.components))
+    primary_derived = set(_serialized_counter(primary.reward_program.derived_metrics))
+    secondary_components = {
+        item for parent in secondary for item in _serialized_counter(parent.reward_program.components)
+    }
+    secondary_derived = {
+        item for parent in secondary for item in _serialized_counter(parent.reward_program.derived_metrics)
+    }
+    candidate_components = set(_serialized_counter(candidate.reward_program.components))
+    candidate_derived = set(_serialized_counter(candidate.reward_program.derived_metrics))
+    secondary_contribution = bool(
+        candidate_components & (secondary_components - primary_components)
+        or candidate_derived & (secondary_derived - primary_derived)
+    )
+    return (
+        secondary_contribution
+        and candidate_components <= primary_components | secondary_components
+        and candidate_derived <= primary_derived | secondary_derived
+        and primary.reward_program != candidate.reward_program
+        and primary.reward_program.reward_scale == candidate.reward_program.reward_scale
+        and primary.reward_program.gamma == candidate.reward_program.gamma
+        and primary.ppo_config == candidate.ppo_config
+        and primary.opponent_mix == candidate.opponent_mix
+        and primary.parameter_constraint_coefficient == candidate.parameter_constraint_coefficient
+    )
+
+
+def canonicalize_candidate_proposal(
+    proposal: Mapping[str, Any],
+    parents: list[EvolutionCandidate],
+    *,
+    generation: int,
+    island: int,
+) -> tuple[dict[str, Any], EvolutionCandidate, dict[str, Any]]:
+    """Normalize safe Codex output from its actual diff, retaining island lineage."""
+    parent_ids = tuple(parent.candidate_id for parent in parents)
+    raw = EvolutionCandidate.from_proposal(
+        proposal,
+        generation=generation,
+        island=island,
+        parent_ids=parent_ids,
+    )
+    validate_candidate_safety(parents, raw)
+    parent_by_id = {parent.candidate_id: parent for parent in parents}
+    primary = parent_by_id.get(raw.primary_parent_id)
+    secondary = [parent_by_id[parent_id] for parent_id in raw.secondary_parent_ids if parent_id in parent_by_id]
+    explicit_restart = raw.mutation_kind == "restart" and raw.primary_parent_id is None
+    ast_distance = None if primary is None else approximate_ast_distance(primary, raw)
+    if explicit_restart:
+        effective_kind, scale = "restart", "restart"
+    elif primary is not None and _is_pure_crossover(primary, secondary, raw):
+        effective_kind, scale = "crossover", "recombined"
+    elif primary is not None and _is_parameter_mutation(primary, raw):
+        effective_kind, scale = "parameter", "numeric"
+    elif primary is not None and _is_feature_mutation(primary, raw):
+        effective_kind, scale = "feature_existing", "feature"
+    elif primary is not None and _is_local_structural_mutation(primary, raw):
+        effective_kind, scale = "structural", "local"
+    else:
+        effective_kind, scale = "structural", "large"
+
+    canonical = copy.deepcopy(dict(proposal))
+    canonical["mutation_kind"] = effective_kind
+    if effective_kind == "restart":
+        canonical.update(
+            primary_parent_id=None,
+            secondary_parent_ids=[],
+            inheritance_mode="base",
+            parameter_constraint_coefficient=0.0,
+        )
+    else:
+        if primary is None:
+            raise ValueError("A non-restart candidate requires an existing primary parent")
+        canonical["primary_parent_id"] = primary.candidate_id
+        canonical["inheritance_mode"] = "policy_value" if effective_kind == "parameter" else "policy"
+        if effective_kind != "crossover":
+            canonical["secondary_parent_ids"] = []
+        coefficient = float(canonical.get("parameter_constraint_coefficient", 0.0))
+        if coefficient == 0.0:
+            coefficient = primary.parameter_constraint_coefficient or 0.05
+        canonical["parameter_constraint_coefficient"] = coefficient
+
+    manifest = dict(canonical.get("mutation_manifest", {}))
+    manifest["changed_paths"] = []
+    canonical["mutation_manifest"] = manifest
+    provisional = EvolutionCandidate.from_proposal(
+        canonical,
+        generation=generation,
+        island=island,
+        parent_ids=parent_ids,
+    )
+    actual_changes = [] if effective_kind == "restart" else candidate_setting_changes(primary, provisional)
+    manifest["changed_paths"] = [str(change["path"]) for change in actual_changes]
+    canonical["mutation_manifest"] = manifest
+    candidate = EvolutionCandidate.from_proposal(
+        canonical,
+        generation=generation,
+        island=island,
+        parent_ids=parent_ids,
+    )
+    validate_candidate_safety(parents, candidate)
+
+    corrected_fields = [
+        field
+        for field in (
+            "mutation_kind",
+            "primary_parent_id",
+            "secondary_parent_ids",
+            "inheritance_mode",
+            "parameter_constraint_coefficient",
+            "mutation_manifest",
+        )
+        if proposal.get(field) != canonical.get(field)
+    ]
+    deviations = []
+    if raw.mutation_kind != effective_kind:
+        deviations.append(f"declared {raw.mutation_kind} reclassified as {effective_kind}")
+    if ast_distance is not None and not _I03_STRUCTURAL_DISTANCE_MIN <= ast_distance <= _I03_STRUCTURAL_DISTANCE_MAX:
+        deviations.append(f"AST distance {ast_distance:.6f} is outside the advisory [0.20, 0.65]")
+    deviations.extend(f"server corrected field: {field}" for field in corrected_fields)
+    report = {
+        "declared_mutation_kind": raw.mutation_kind,
+        "effective_mutation_kind": effective_kind,
+        "mutation_scale": scale,
+        "ast_distance": ast_distance,
+        "contract_deviations": deviations,
+        "corrected_fields": corrected_fields,
+        "changed_paths": manifest["changed_paths"],
+    }
+    return canonical, candidate, report
+
+
+def validate_candidate_mutation(parents: list[EvolutionCandidate], candidate: EvolutionCandidate) -> None:
+    """Backward-compatible public validator; semantic island contracts are advisory."""
+    validate_candidate_safety(parents, candidate)
+
+
 def summarize_diagnostic_events(metrics: Mapping[str, Any]) -> dict[str, object]:
     events: list[Mapping[str, Any]] = []
     training = metrics.get("training", {})
@@ -933,14 +1319,20 @@ def summarize_diagnostic_events(metrics: Mapping[str, Any]) -> dict[str, object]
                 events.extend(event for event in game.get("diagnostic_events", ()) if isinstance(event, Mapping))
     city_events = [dict(event) for event in events if event.get("event") == "city_destroyed_night_fuel"]
     illegal_events = [dict(event) for event in events if event.get("event") == "illegal_action"]
+    illegal_classes = Counter(
+        str(event.get("action_class", event.get("action", "unknown"))) for event in illegal_events
+    )
     return {
         "city_tile_loss_turns": sorted({int(event["turn"]) for event in city_events}),
         "night_fuel_shortage_turns": sorted({int(event["turn"]) for event in city_events}),
         "city_tiles_lost": sum(int(event.get("city_tiles_lost", 0)) for event in city_events),
-        "city_loss_events": city_events[:32],
+        "city_event_count": len(city_events),
+        "max_fuel_deficit": max((_event_deficit(event) for event in city_events), default=0.0),
+        "city_loss_events": _representative_city_events(city_events),
         "illegal_action_turns": sorted({int(event["turn"]) for event in illegal_events}),
         "illegal_action_count": len(illegal_events),
-        "illegal_action_events": illegal_events[:32],
+        "illegal_action_class_counts": dict(illegal_classes),
+        "illegal_action_events": illegal_events[:8],
     }
 
 
@@ -1057,6 +1449,12 @@ class CodexCandidateGenerator:
     def output_path(self, generation: int, island: int) -> Path:
         return self.run_dir / f"codex-g{generation:02d}-i{island:02d}.json"
 
+    def raw_output_path(self, generation: int, island: int) -> Path:
+        return self.run_dir / f"codex-g{generation:02d}-i{island:02d}.raw.json"
+
+    def prompt_path(self, generation: int, island: int, attempt: int) -> Path:
+        return self.run_dir / f"codex-g{generation:02d}-i{island:02d}.attempt-{attempt:02d}.prompt.txt.gz"
+
     def metadata_path(self, generation: int, island: int) -> Path:
         return self.run_dir / f"codex-g{generation:02d}-i{island:02d}.meta.json"
 
@@ -1078,7 +1476,7 @@ class CodexCandidateGenerator:
         archive_dir = self.run_dir / "codex-rejections"
         archive_dir.mkdir(parents=True, exist_ok=True)
         stamp = int(time.time() * 1000)
-        paths = [error_path, self.output_path(generation, island)]
+        paths = [error_path, self.output_path(generation, island), self.raw_output_path(generation, island)]
         paths.extend(self.run_dir.glob(f"codex-g{generation:02d}-i{island:02d}.attempt-*"))
         for path in paths:
             if path.exists():
@@ -1090,9 +1488,9 @@ class CodexCandidateGenerator:
             f"{base_prompt}\n\n"
             "VALIDATOR REPAIR REQUIRED. The previous proposal passed the JSON schema but was rejected by the "
             "deterministic server-side mutation validator. The validator is authoritative. Return a corrected full "
-            "proposal JSON, not a patch. Do not merely change mutation_manifest.summary. If an island-3 structural "
-            "distance is above 0.65, simplify the actual reward AST or use a valid restart proposal; if below 0.20, "
-            "make a larger real AST change.\n"
+            "proposal JSON, not a patch. Do not merely change mutation_manifest.summary. AST-distance and island "
+            "contract deviations are accepted and normalized; this repair request means the proposal is malformed, "
+            "unsafe, or has invalid parent provenance.\n"
             f"Validator error: {type(error).__name__}: {error}\n"
             f"Rejected proposal:\n{proposal}"
         )
@@ -1136,12 +1534,16 @@ class CodexCandidateGenerator:
         base_prompt = build_codex_prompt(parents, results, island=island, generation=generation)
         prompt = base_prompt
         output_path = self.output_path(generation, island)
+        raw_output_path = self.raw_output_path(generation, island)
         self._archive_prior_failure(generation, island)
         rejected_attempts = []
         first_started_at = time.time()
         for attempt_index in range(self.validation_retries + 1):
             attempt = attempt_index + 1
-            output_path.unlink(missing_ok=True)
+            raw_output_path.unlink(missing_ok=True)
+            prompt_bytes = prompt.encode("utf-8")
+            prompt_path = self.prompt_path(generation, island, attempt)
+            prompt_path.write_bytes(gzip.compress(prompt_bytes, mtime=0))
             command = [
                 self.executable,
                 "exec",
@@ -1151,11 +1553,11 @@ class CodexCandidateGenerator:
                 "--output-schema",
                 str(self.schema_path),
                 "-o",
-                str(output_path),
+                str(raw_output_path),
             ]
             if self.model:
                 command.extend(("--model", self.model))
-            command.append(prompt)
+            command.append("-")
             completed: subprocess.CompletedProcess[str] | None = None
             started_at = time.time()
             try:
@@ -1164,19 +1566,21 @@ class CodexCandidateGenerator:
                     cwd=self.repository,
                     check=False,
                     capture_output=True,
+                    input=prompt,
                     text=True,
                     timeout=self.timeout_seconds,
                 )
                 self._validate_completed_process(completed)
-                proposal_text = output_path.read_text(encoding="utf-8")
+                proposal_text = raw_output_path.read_text(encoding="utf-8")
                 proposal = json.loads(proposal_text)
-                candidate = EvolutionCandidate.from_proposal(
+                canonical_proposal, candidate, normalization = canonicalize_candidate_proposal(
                     proposal,
+                    parents,
                     generation=generation,
                     island=island,
-                    parent_ids=tuple(parent.candidate_id for parent in parents),
                 )
                 validate_candidate_mutation(parents, candidate)
+                EvolutionStore.write_json(output_path, canonical_proposal)
             except Exception as error:
                 payload = self._failure_payload(
                     parents=parents,
@@ -1190,14 +1594,14 @@ class CodexCandidateGenerator:
                 repairable = (
                     completed is not None
                     and completed.returncode == 0
-                    and output_path.exists()
+                    and raw_output_path.exists()
                     and isinstance(error, (KeyError, TypeError, ValueError))
                 )
                 if repairable:
                     rejected_path = self.run_dir / (
                         f"codex-g{generation:02d}-i{island:02d}.attempt-{attempt:02d}.rejected.json"
                     )
-                    rejected_path.write_bytes(output_path.read_bytes())
+                    rejected_path.write_bytes(raw_output_path.read_bytes())
                     attempt_error_path = self.run_dir / (
                         f"codex-g{generation:02d}-i{island:02d}.attempt-{attempt:02d}.error.json"
                     )
@@ -1206,12 +1610,19 @@ class CodexCandidateGenerator:
                         {"attempt": attempt, "proposal_path": rejected_path.name, "error_path": attempt_error_path.name}
                     )
                     if attempt_index < self.validation_retries:
-                        prompt = self._repair_prompt(base_prompt, output_path.read_text(encoding="utf-8"), error)
+                        prompt = self._repair_prompt(base_prompt, raw_output_path.read_text(encoding="utf-8"), error)
                         continue
                 EvolutionStore.write_json(self.error_path(generation, island), payload)
                 raise
             break
-        proposal_sha256 = hashlib.sha256(output_path.read_bytes()).hexdigest()
+        canonical_bytes = output_path.read_bytes()
+        raw_bytes = raw_output_path.read_bytes()
+        proposal_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+        raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        selected_result_ids = [
+            f"{result.candidate_id}--{result.stage}--{result.status}"
+            for result in select_codex_feedback_results(parents, results)
+        ]
         EvolutionStore.write_json(
             self.metadata_path(generation, island),
             {
@@ -1228,6 +1639,14 @@ class CodexCandidateGenerator:
                 "rejected_attempts": rejected_attempts,
                 "proposal_path": output_path.name,
                 "proposal_sha256": proposal_sha256,
+                "raw_proposal_path": raw_output_path.name,
+                "raw_proposal_sha256": raw_sha256,
+                "canonical_proposal_sha256": proposal_sha256,
+                "normalization": normalization,
+                "prompt_path": prompt_path.name,
+                "prompt_bytes": len(prompt_bytes),
+                "prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
+                "selected_result_ids": selected_result_ids,
             },
         )
         return candidate

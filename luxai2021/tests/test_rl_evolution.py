@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import gzip
 import json
 import threading
 from collections import Counter
@@ -54,9 +55,12 @@ from luxai2021.rl.evolution import (
     add_candidate_reflection,
     approximate_ast_distance,
     build_codex_prompt,
+    canonicalize_candidate_proposal,
+    compress_turn_ranges,
     initial_candidate,
     mutate_candidate,
     proposal_schema,
+    select_codex_feedback_results,
     validate_candidate_mutation,
 )
 from luxai2021.rl.job_api import JobApiClient, JobApiServer
@@ -434,8 +438,7 @@ def test_feature_generated_remains_loadable_but_is_not_proposable():
     assert restored == candidate
     assert restored.candidate_id == candidate.candidate_id
     assert "feature_generated" not in mutation_enum
-    with pytest.raises(ValueError, match="does not allow"):
-        validate_candidate_mutation([parent], candidate)
+    validate_candidate_mutation([parent], candidate)
 
 
 @pytest.mark.parametrize(
@@ -474,7 +477,7 @@ def test_island3_without_secondary_parent_reassigns_crossover_to_structural():
     assert counts["restart"] / 500 == pytest.approx(0.20, abs=0.05)
 
 
-def test_island3_structural_accepts_one_training_setting_family_only():
+def test_island3_structural_soft_accepts_compound_training_setting_changes():
     parent = initial_candidate(island=3, seed=1)
     structural = next(
         child
@@ -501,14 +504,16 @@ def test_island3_structural_accepts_one_training_setting_family_only():
 
     zero_constraint = copy.deepcopy(proposal)
     zero_constraint["parameter_constraint_coefficient"] = 0.0
-    zero_constraint_child = EvolutionCandidate.from_proposal(
+    zero_canonical, zero_constraint_child, zero_report = canonicalize_candidate_proposal(
         zero_constraint,
+        [parent],
         generation=1,
         island=3,
-        parent_ids=(parent.candidate_id,),
     )
-    with pytest.raises(ValueError, match="positive parent parameter constraint"):
-        validate_candidate_mutation([parent], zero_constraint_child)
+    assert zero_constraint_child.inheritance_mode == "policy"
+    assert zero_constraint_child.parameter_constraint_coefficient == 0.05
+    assert "parameter_constraint_coefficient" in zero_report["corrected_fields"]
+    assert zero_canonical["mutation_manifest"]["changed_paths"]
 
     opponent_proposal = _candidate_proposal(
         parent,
@@ -531,28 +536,30 @@ def test_island3_structural_accepts_one_training_setting_family_only():
     both["opponent_mix"]["self_base"] -= 0.05
     both["opponent_mix"]["other_base"] += 0.05
     both["mutation_manifest"]["changed_paths"].append("opponent_mix")
-    both_child = EvolutionCandidate.from_proposal(
+    _, both_child, both_report = canonicalize_candidate_proposal(
         both,
+        [parent],
         generation=1,
         island=3,
-        parent_ids=(parent.candidate_id,),
     )
-    with pytest.raises(ValueError, match="not both"):
-        validate_candidate_mutation([parent], both_child)
+    assert both_child.mutation_kind == "structural"
+    assert both_report["mutation_scale"] == "large"
+    validate_candidate_mutation([parent], both_child)
 
 
-def test_island3_structural_rejects_too_small_and_too_large_ast_changes():
+def test_island3_structural_soft_accepts_small_and_large_ast_changes():
     parent = initial_candidate(island=3, seed=1)
     too_small_reward = parent.reward_program.to_dict()
     too_small_reward["components"][0]["weight"] *= 1.01
-    too_small = EvolutionCandidate.from_proposal(
+    _, too_small, small_report = canonicalize_candidate_proposal(
         _candidate_proposal(parent, mutation_kind="structural", reward_program=too_small_reward),
+        [parent],
         generation=1,
         island=3,
-        parent_ids=(parent.candidate_id,),
     )
-    with pytest.raises(ValueError, match="AST distance"):
-        validate_candidate_mutation([parent], too_small)
+    assert too_small.mutation_kind == "parameter"
+    assert too_small.inheritance_mode == "policy_value"
+    assert small_report["ast_distance"] < 0.20
 
     large_reward = {
         "version": 2,
@@ -568,18 +575,65 @@ def test_island3_structural_rejects_too_small_and_too_large_ast_changes():
         "reward_scale": 0.4,
         "gamma": 0.91,
     }
-    too_large = EvolutionCandidate.from_proposal(
+    _, too_large, large_report = canonicalize_candidate_proposal(
         _candidate_proposal(parent, mutation_kind="structural", reward_program=large_reward),
+        [parent],
         generation=1,
         island=3,
-        parent_ids=(parent.candidate_id,),
     )
     assert approximate_ast_distance(parent, too_large) > 0.65
-    with pytest.raises(ValueError, match="AST distance"):
-        validate_candidate_mutation([parent], too_large)
+    assert too_large.mutation_kind == "structural"
+    assert too_large.inheritance_mode == "policy"
+    assert large_report["mutation_scale"] == "large"
+    validate_candidate_mutation([parent], too_large)
 
 
-def test_island3_crossover_requires_secondary_contribution_and_fixed_training_settings():
+@pytest.mark.parametrize("distance", [0.05, 0.19, 0.20, 0.65, 0.90])
+def test_ast_distance_boundaries_are_advisory(distance, monkeypatch):
+    parent = initial_candidate(island=3, seed=1)
+    reward = parent.reward_program.to_dict()
+    reward["components"][0]["expression"] = {
+        "op": "tanh",
+        "value": reward["components"][0]["expression"],
+    }
+    proposal = _candidate_proposal(parent, mutation_kind="structural", reward_program=reward)
+    monkeypatch.setattr("luxai2021.rl.evolution.approximate_ast_distance", lambda *_: distance)
+
+    _, candidate, report = canonicalize_candidate_proposal(proposal, [parent], generation=1, island=3)
+
+    assert report["ast_distance"] == distance
+    assert candidate.mutation_kind == "structural"
+    validate_candidate_mutation([parent], candidate)
+
+
+def test_canonicalization_classifies_feature_and_pure_crossover():
+    parent = initial_candidate(island=3, seed=3)
+    donor = initial_candidate(island=0, seed=99)
+    feature = _candidate_proposal(parent, mutation_kind="structural")
+    feature["reward_program"]["components"].append(
+        {"name": "added_units", "expression": {"op": "metric", "name": "units"}, "weight": 0.1}
+    )
+    _, feature_candidate, feature_report = canonicalize_candidate_proposal(
+        feature, [parent], generation=1, island=3
+    )
+    assert feature_candidate.mutation_kind == "feature_existing"
+    assert feature_report["mutation_scale"] == "feature"
+
+    crossover = _candidate_proposal(
+        parent,
+        mutation_kind="crossover",
+        secondary_parent_ids=(donor.candidate_id,),
+    )
+    crossover["reward_program"]["components"][0] = copy.deepcopy(donor.reward_program.to_dict()["components"][0])
+    _, crossover_candidate, crossover_report = canonicalize_candidate_proposal(
+        crossover, [parent, donor], generation=1, island=3
+    )
+    assert crossover_candidate.mutation_kind == "crossover"
+    assert crossover_candidate.secondary_parent_ids == (donor.candidate_id,)
+    assert crossover_report["mutation_scale"] == "recombined"
+
+
+def test_island3_crossover_is_reclassified_from_actual_parent_contribution():
     parent = initial_candidate(island=3, seed=1)
     donor = initial_candidate(island=0, seed=99)
     crossover = next(
@@ -604,14 +658,14 @@ def test_island3_crossover_requires_secondary_contribution_and_fixed_training_se
         mutation_kind="crossover",
         secondary_parent_ids=(donor.candidate_id,),
     )
-    unchanged_child = EvolutionCandidate.from_proposal(
+    _, unchanged_child, unchanged_report = canonicalize_candidate_proposal(
         unchanged,
+        [parent, donor],
         generation=1,
         island=3,
-        parent_ids=(parent.candidate_id, donor.candidate_id),
     )
-    with pytest.raises(ValueError, match="secondary parent"):
-        validate_candidate_mutation([parent, donor], unchanged_child)
+    assert unchanged_child.mutation_kind == "structural"
+    assert unchanged_report["mutation_scale"] == "large"
 
     changed_ppo = _candidate_proposal(
         parent,
@@ -621,17 +675,17 @@ def test_island3_crossover_requires_secondary_contribution_and_fixed_training_se
     )
     changed_ppo["ppo_config"]["learning_rate"] *= 1.1
     changed_ppo["mutation_manifest"]["changed_paths"].append("ppo_config.learning_rate")
-    changed_ppo_child = EvolutionCandidate.from_proposal(
+    _, changed_ppo_child, changed_report = canonicalize_candidate_proposal(
         changed_ppo,
+        [parent, donor],
         generation=1,
         island=3,
-        parent_ids=(parent.candidate_id, donor.candidate_id),
     )
-    with pytest.raises(ValueError, match="only recombine"):
-        validate_candidate_mutation([parent, donor], changed_ppo_child)
+    assert changed_ppo_child.mutation_kind == "parameter"
+    assert changed_report["mutation_scale"] == "numeric"
 
 
-def test_island3_restart_accepts_arbitrary_safe_reward_and_one_training_family():
+def test_island3_restart_accepts_arbitrary_safe_reward_and_compound_settings():
     parent = initial_candidate(island=3, seed=1)
     reward = default_reward_program().to_dict()
     reward["version"] = 2
@@ -662,14 +716,16 @@ def test_island3_restart_accepts_arbitrary_safe_reward_and_one_training_family()
     both["opponent_mix"]["self_base"] -= 0.05
     both["opponent_mix"]["other_base"] += 0.05
     both["mutation_manifest"]["changed_paths"].append("opponent_mix")
-    both_candidate = EvolutionCandidate.from_proposal(
+    _, both_candidate, report = canonicalize_candidate_proposal(
         both,
+        [parent],
         generation=1,
         island=3,
-        parent_ids=(parent.candidate_id,),
     )
-    with pytest.raises(ValueError, match="not both"):
-        validate_candidate_mutation([parent], both_candidate)
+    assert both_candidate.mutation_kind == "restart"
+    assert both_candidate.inheritance_mode == "base"
+    assert both_candidate.parameter_constraint_coefficient == 0.0
+    assert report["mutation_scale"] == "restart"
 
 
 def test_codex_proposal_schema_uses_supported_structured_output_constructs():
@@ -740,6 +796,11 @@ def test_codex_generator_records_accepted_proposal_hash(tmp_path, monkeypatch):
     assert metadata["status"] == "accepted"
     assert metadata["candidate_id"] == candidate.candidate_id
     assert metadata["proposal_sha256"]
+    assert metadata["raw_proposal_sha256"]
+    assert metadata["canonical_proposal_sha256"] == metadata["proposal_sha256"]
+    assert gzip.decompress((tmp_path / metadata["prompt_path"]).read_bytes()).decode() == build_codex_prompt(
+        [parent], [], island=0, generation=1
+    )
     assert not (tmp_path / "codex-g01-i00.error.json").exists()
     _save_candidate_provenance(
         tmp_path,
@@ -761,7 +822,7 @@ def test_codex_generator_records_accepted_proposal_hash(tmp_path, monkeypatch):
     assert audit["fully_codex_guided"] is True
 
 
-def test_codex_generator_repairs_semantically_invalid_proposal(tmp_path, monkeypatch):
+def test_codex_generator_soft_accepts_and_reclassifies_semantic_deviation(tmp_path, monkeypatch):
     generator = CodexCandidateGenerator(
         repository=tmp_path,
         run_dir=tmp_path,
@@ -780,14 +841,13 @@ def test_codex_generator_repairs_semantically_invalid_proposal(tmp_path, monkeyp
         "summary": "too small structural mutation",
     }
     invalid["parameter_constraint_coefficient"] = 0.05
-    repaired = _candidate_proposal(parent, mutation_kind="restart")
-    proposals = [invalid, repaired]
     prompts = []
 
-    def fake_run(command, **_):
-        prompts.append(command[-1])
+    def fake_run(command, **kwargs):
+        prompts.append(kwargs["input"])
+        assert command[-1] == "-"
         output_path = Path(command[command.index("-o") + 1])
-        output_path.write_text(json.dumps(proposals[len(prompts) - 1]))
+        output_path.write_text(json.dumps(invalid))
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("luxai2021.rl.evolution.subprocess.run", fake_run)
@@ -795,15 +855,99 @@ def test_codex_generator_repairs_semantically_invalid_proposal(tmp_path, monkeyp
     candidate = generator.generate([parent], [], generation=1, island=3)
     metadata = json.loads(generator.metadata_path(1, 3).read_text())
 
-    assert candidate.mutation_kind == "restart"
+    assert candidate.mutation_kind == "parameter"
+    assert candidate.inheritance_mode == "policy_value"
+    assert len(prompts) == 1
+    assert metadata["attempts"] == 1
+    assert metadata["rejected_attempts"] == []
+    assert metadata["normalization"]["declared_mutation_kind"] == "structural"
+    assert metadata["normalization"]["effective_mutation_kind"] == "parameter"
+    assert not generator.error_path(1, 3).exists()
+
+
+def test_codex_generator_streams_large_prompt_through_stdin(tmp_path, monkeypatch):
+    generator = CodexCandidateGenerator(repository=tmp_path, run_dir=tmp_path, executable="codex", model="test")
+    parent = initial_candidate(island=0, seed=1)
+    proposal = _candidate_proposal(parent, mutation_kind="parameter")
+    proposal["inheritance_mode"] = "policy_value"
+    proposal["reward_program"]["components"][0]["weight"] += 0.1
+    large_prompt = "P" * (200 * 1024 + 17)
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured.update(command=command, prompt=kwargs["input"])
+        Path(command[command.index("-o") + 1]).write_text(json.dumps(proposal))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("luxai2021.rl.evolution.build_codex_prompt", lambda *_, **__: large_prompt)
+    monkeypatch.setattr("luxai2021.rl.evolution.subprocess.run", fake_run)
+
+    generator.generate([parent], [], generation=1, island=0)
+    metadata = json.loads(generator.metadata_path(1, 0).read_text())
+
+    assert captured["command"][-1] == "-"
+    assert large_prompt not in captured["command"]
+    assert captured["prompt"] == large_prompt
+    assert metadata["prompt_bytes"] == len(large_prompt.encode())
+    assert gzip.decompress((tmp_path / metadata["prompt_path"]).read_bytes()) == large_prompt.encode()
+
+
+def test_codex_generator_retries_only_hard_invalid_proposal(tmp_path, monkeypatch):
+    generator = CodexCandidateGenerator(
+        repository=tmp_path, run_dir=tmp_path, executable="codex", model="test", validation_retries=1
+    )
+    parent = initial_candidate(island=0, seed=1)
+    unsafe = _candidate_proposal(parent, mutation_kind="parameter")
+    unsafe["reward_program"]["components"][0]["expression"] = {"op": "metric", "name": "not_a_metric"}
+    repaired = _candidate_proposal(parent, mutation_kind="parameter")
+    repaired["reward_program"]["components"][0]["weight"] += 0.1
+    repaired["inheritance_mode"] = "policy_value"
+    proposals = [unsafe, repaired]
+    prompts = []
+
+    def fake_run(command, **kwargs):
+        prompts.append(kwargs["input"])
+        Path(command[command.index("-o") + 1]).write_text(json.dumps(proposals[len(prompts) - 1]))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("luxai2021.rl.evolution.subprocess.run", fake_run)
+
+    candidate = generator.generate([parent], [], generation=1, island=0)
+
+    assert candidate.mutation_kind == "parameter"
     assert len(prompts) == 2
     assert "VALIDATOR REPAIR REQUIRED" in prompts[1]
-    assert "actual=" in prompts[1]
-    assert metadata["attempts"] == 2
-    assert len(metadata["rejected_attempts"]) == 1
-    assert (tmp_path / "codex-g01-i03.attempt-01.rejected.json").exists()
-    assert (tmp_path / "codex-g01-i03.attempt-01.error.json").exists()
-    assert not generator.error_path(1, 3).exists()
+
+
+def test_turn_ranges_are_lossless_and_feedback_selection_is_bounded():
+    turns = [30, 31, 32, 39, 40, 90]
+    ranges = compress_turn_ranges(turns)
+    expanded = [turn for start, end in ranges for turn in range(start, end + 1)]
+    assert expanded == turns
+
+    parents = [initial_candidate(island=island, seed=1) for island in range(3)]
+    results = []
+    for index, parent in enumerate(parents):
+        results.extend(
+            (
+                CandidateResult(parent.candidate_id, "short-resattn8", "completed", 0.1 + index, 0.1, 0.0, 1.0, {}),
+                CandidateResult(parent.candidate_id, "medium-resattn8", "failed", 0.0, 0.0, 0.0, 1.0, {}, "boom"),
+            )
+        )
+    for island in range(3, 7):
+        candidate = initial_candidate(island=island, seed=2)
+        results.append(CandidateResult(candidate.candidate_id, "final-resattn8", "completed", island, 0.1, 0, 1, {}))
+
+    selected = select_codex_feedback_results(parents, results)
+
+    assert len(selected) == 8
+    non_parent_ids = {
+        result.candidate_id for result in selected if result.candidate_id not in {p.candidate_id for p in parents}
+    }
+    assert non_parent_ids == {
+        results[-1].candidate_id,
+        results[-2].candidate_id,
+    }
 
 
 def test_candidate_provenance_rejects_silent_codex_fallback(tmp_path):
@@ -1268,9 +1412,9 @@ def test_reflection_contains_parent_changes_improvement_and_diagnostic_turns():
     assert comparison["improvement"]["score_rate_delta"] == pytest.approx(0.2)
     assert reflected.fitness[0] == 0.0
     prompt = build_codex_prompt([child], [reflected], island=0, generation=2)
-    assert '"city_tile_loss_turns": [' in prompt
+    assert '"city_tile_loss_turn_ranges":[[31,31]]' in prompt
     assert "31" in prompt
-    assert '"score_rate_delta": 0.199' in prompt
+    assert '"score_rate_delta":0.199' in prompt
 
 
 def test_filesystem_job_queue_claim_and_complete(tmp_path):

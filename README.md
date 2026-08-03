@@ -643,10 +643,12 @@ Value-head resets run a critic-only warm-up before PPO, and inherited tensors us
 cosine decay. The illegal-action auxiliary loss acts on unmasked logits while sampling still uses the hard mask.
 Reward expressions remain bounded structured data rather than arbitrary Python code.
 
-On `i03`, Codex may coordinate changes across multiple reward components and subtrees. A structural candidate may
-also change either the PPO/parameter-constraint family or the opponent mixture, but never both. Structural policy
-inheritance requires approximate AST distance 0.20 to 0.65; a more radical proposal must use `restart`. Without
-Codex, the normal fallback mix is 50% structural, 30% crossover, and 20% restart. After two stagnant generations it
+On `i03`, Codex may coordinate changes across multiple reward components and subtrees. The server derives the effective
+mutation class from the actual parent/child diff instead of trusting the declared island contract. Approximate AST
+distance 0.20 to 0.65 is an advisory diversity target: smaller safe edits are reclassified as parameter, feature, or
+local structural changes, while larger safe edits remain policy-inheriting large structural candidates and face the
+normal short-stage screen. Only unsafe Reward IR, invalid lineage, non-finite values, resource-limit violations, and
+mask relaxation are rejected. Without Codex, the normal fallback mix is 50% structural, 30% crossover, and 20% restart. After two stagnant generations it
 becomes 40%, 20%, and 40%, respectively; unavailable crossover probability is reassigned to structural exploration.
 
 The Metric DSL also exposes phase-aware and local survival signals: normalized turns until night/night turns
@@ -686,9 +688,12 @@ the distilled ResAttn8 base plus the original first-place policy, no replay outp
 inference-latency guard. Re-running the same command resumes completed candidates and stage checkpoints. Use
 `--no-codex` for deterministic numeric mutations, or `--overwrite-run` to intentionally start that run directory
 again. A dry-run directory cannot be reused for training because its candidates were generated without Codex. The
-Codex CLI must already be installed and authenticated when proposal generation is enabled. A schema-valid proposal
-rejected by the deterministic mutation validator is returned to Codex with the exact validator error and retried twice
-by default (`--codex-validation-retries`). Rejected proposals and errors are retained beside the accepted proposal for
+Codex CLI must already be installed and authenticated when proposal generation is enabled. Prompts are supplied via
+stdin (`codex exec ... -`) instead of argv and stored as gzip audit artifacts. Feedback is limited to the parents'
+highest completed stages, any higher-stage parent failures, and two distinct top candidates; diagnostic turns are
+stored as lossless ranges. Semantic contract deviations are normalized without a retry. Only malformed, unsafe, or
+lineage-invalid proposals are returned to Codex with the exact validator error and retried twice by default
+(`--codex-validation-retries`). Rejected proposals and errors are retained beside the accepted proposal for
 audit. After repair retries are exhausted, proposal errors stop the coordinator before registering or training that
 candidate; deterministic fallback is available only with the explicit `--allow-codex-fallback` option.
 
@@ -733,8 +738,9 @@ consumed budget is conservatively estimated from its recorded elapsed-time fract
 
 The first coordinator invocation owns the schema-v2 run manifest: later invocations reuse its checkpoint paths,
 SHA-256 descriptors, Codex/deterministic generation mode, model, and training budgets instead of overwriting them with
-new CLI defaults. Every candidate has a separate immutable record under `provenance/`; accepted Codex outputs also have
-`codex-gXX-iXX.meta.json` with their proposal hash. Medium and final candidate IDs are frozen under `selections/` when
+new CLI defaults. Every candidate has a separate immutable record under `provenance/`; accepted Codex outputs retain
+the raw `*.raw.json`, canonical `codex-gXX-iXX.json`, compressed prompt, and `*.meta.json` hashes plus the normalization
+report. Medium and final candidate IDs are frozen under `selections/` when
 each stage starts, and final selection is rejected unless every candidate has a completed medium result. Failed result
 markers are archived and retried, while completed results remain immutable. Same-candidate resume may tolerate a
 different textual base-model path only when available SHA-256 lineage remains identical. CUDA RNG is restored only for
