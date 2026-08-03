@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-from luxai2021.rl.notifications import EvolutionNotifier, GmailTransport, NtfyTransport
+from luxai2021.rl.notifications import EvolutionNotifier, NtfyTransport
 
 
 class _RecordingTransport:
@@ -37,36 +37,6 @@ def test_notifier_deduplicates_success_and_does_not_persist_secrets(tmp_path):
     state = json.loads(state_text)
     assert state["events"]["generation-01"]["transports"] == ["recording"]
     assert "password" not in state_text.lower()
-
-
-def test_gmail_transport_uses_app_password_without_spaces(monkeypatch):
-    calls = {}
-
-    class FakeSmtp:
-        def __init__(self, host, port, *, timeout):
-            calls["connection"] = (host, port, timeout)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            return None
-
-        def login(self, username, password):
-            calls["login"] = (username, password)
-
-        def send_message(self, message):
-            calls["message"] = message
-
-    monkeypatch.setattr("luxai2021.rl.notifications.smtplib.SMTP_SSL", FakeSmtp)
-    transport = GmailTransport("sender@gmail.com", "abcd efgh ijkl mnop", ("phone@gmail.com",))
-
-    transport.send(title="Lux failed", message="traceback", priority=5, tags=("x",))
-
-    assert calls["connection"][:2] == ("smtp.gmail.com", 465)
-    assert calls["login"] == ("sender@gmail.com", "abcdefghijklmnop")
-    assert calls["message"]["To"] == "phone@gmail.com"
-    assert calls["message"].get_content().strip() == "traceback"
 
 
 def test_ntfy_transport_posts_json_with_bearer_token(monkeypatch):
@@ -106,12 +76,9 @@ def test_ntfy_transport_posts_json_with_bearer_token(monkeypatch):
 
 
 def test_notifier_environment_configuration(monkeypatch, tmp_path):
-    monkeypatch.setenv("LUX_EVOLUTION_GMAIL_USER", "sender@gmail.com")
-    monkeypatch.setenv("LUX_EVOLUTION_GMAIL_APP_PASSWORD", "app-password")
-    monkeypatch.setenv("LUX_EVOLUTION_NOTIFY_EMAIL_TO", "one@example.com,two@example.com")
     monkeypatch.setenv("LUX_EVOLUTION_NTFY_TOPIC", "phone-topic")
 
     notifier = EvolutionNotifier.from_environment(tmp_path)
 
-    assert [transport.name for transport in notifier.transports] == ["gmail", "ntfy"]
+    assert [transport.name for transport in notifier.transports] == ["ntfy"]
     assert notifier.configuration_warnings == ()

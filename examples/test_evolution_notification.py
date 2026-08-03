@@ -18,17 +18,23 @@ def main() -> None:
         raise ValueError("; ".join(notifier.configuration_warnings))
     if not notifier.enabled:
         raise RuntimeError("No notification transport is configured")
-    event_id = f"manual-test:{time.time_ns()}"
-    delivered = notifier.notify_once(
-        event_id,
-        title="Lux evolution notification test",
-        message=f"Notification delivery works.\nhost: {socket.gethostname()}\nrun_dir: {args.run_dir}",
-        priority=3,
-        tags=("white_check_mark", "test_tube"),
-    )
-    if not delivered:
-        raise RuntimeError("Every configured notification transport failed")
-    print("notification sent")
+    failures = []
+    for transport in notifier.transports:
+        transport_notifier = EvolutionNotifier(Path(args.run_dir), (transport,))
+        delivered = transport_notifier.notify_once(
+            f"manual-test:{transport.name}:{time.time_ns()}",
+            title="Lux evolution notification test",
+            message=f"Notification delivery works.\nhost: {socket.gethostname()}\nrun_dir: {args.run_dir}",
+            priority=3,
+            tags=("white_check_mark", "test_tube"),
+        )
+        status = "sent" if delivered else "failed"
+        print(f"{transport.name}: {status}")
+        if not delivered:
+            failures.append(transport.name)
+    if failures:
+        message = f"Notification transports failed: {', '.join(failures)}"
+        raise RuntimeError(message)
 
 
 if __name__ == "__main__":

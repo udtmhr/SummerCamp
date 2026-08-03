@@ -696,21 +696,9 @@ candidate; deterministic fallback is available only with the explicit `--allow-c
 
 The coordinator can notify run start, each completed generation, medium/final stage transitions, expired worker leases,
 final completion, failures, and Ctrl+C. Delivery is best-effort and never changes a job result. Delivered event IDs are
-stored in `<run-dir>/notifications/sent.json`, so resuming a run does not resend old progress events. Credentials are
-read only from environment variables and are never written to the run manifest or notification state.
-
-For Gmail, enable Google Account 2-Step Verification, create a dedicated App Password, and configure PC1 only:
-
-```bash
-export LUX_EVOLUTION_GMAIL_USER='your-address@gmail.com'
-export LUX_EVOLUTION_GMAIL_APP_PASSWORD='xxxx xxxx xxxx xxxx'
-export LUX_EVOLUTION_NOTIFY_EMAIL_TO='your-phone-address@gmail.com'
-
-uv run --locked python examples/test_evolution_notification.py \
-  --run-dir /home/ueda/workspace/LuxPythonEnvGym/shared/lux-evolution-v3
-```
-
-For faster native phone push, install the ntfy phone app, subscribe to a private random topic, and configure:
+stored in `<run-dir>/notifications/sent.json`, so resuming a run does not resend old progress events. Configuration is
+read only from environment variables and is never written to the run manifest or notification state. Install the ntfy
+phone app, subscribe to a private random topic, and configure PC1 only:
 
 ```bash
 export LUX_EVOLUTION_NTFY_TOPIC='replace-with-a-long-random-topic'
@@ -723,8 +711,8 @@ uv run --locked python examples/test_evolution_notification.py \
 ```
 
 The public `ntfy.sh` service has open topics by default, so use an unguessable topic and do not include sensitive run
-data, or use an authenticated self-hosted server. Gmail and ntfy may be enabled together. Workers on ws3 need no
-notification credentials because the PC1 coordinator sends run-level notifications.
+data, or use an authenticated self-hosted server. Workers on ws3 need no notification configuration because the PC1
+coordinator sends run-level notifications.
 
 Run a short end-to-end check before committing a long GPU allocation:
 

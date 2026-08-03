@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import json
 import os
-import smtplib
 import sys
 import threading
 import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from email.message import EmailMessage
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
@@ -20,26 +18,6 @@ class NotificationTransport(Protocol):
     name: str
 
     def send(self, *, title: str, message: str, priority: int, tags: tuple[str, ...]) -> None: ...
-
-
-@dataclass(frozen=True)
-class GmailTransport:
-    username: str
-    app_password: str
-    recipients: tuple[str, ...]
-    timeout_seconds: float = 15.0
-    name: str = "gmail"
-
-    def send(self, *, title: str, message: str, priority: int, tags: tuple[str, ...]) -> None:
-        del priority, tags
-        email = EmailMessage()
-        email["Subject"] = title
-        email["From"] = self.username
-        email["To"] = ", ".join(self.recipients)
-        email.set_content(message)
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=self.timeout_seconds) as smtp:
-            smtp.login(self.username, self.app_password.replace(" ", ""))
-            smtp.send_message(email)
 
 
 @dataclass(frozen=True)
@@ -95,20 +73,6 @@ class EvolutionNotifier:
     @classmethod
     def from_environment(cls, run_dir: Path) -> EvolutionNotifier:
         transports: list[NotificationTransport] = []
-        warnings = []
-        gmail_user = os.environ.get("LUX_EVOLUTION_GMAIL_USER", "").strip()
-        gmail_password = os.environ.get("LUX_EVOLUTION_GMAIL_APP_PASSWORD", "").strip()
-        gmail_to = os.environ.get("LUX_EVOLUTION_NOTIFY_EMAIL_TO", "").strip()
-        gmail_configured = any((gmail_user, gmail_password, gmail_to))
-        if gmail_configured and gmail_user and gmail_password:
-            recipients = tuple(item.strip() for item in (gmail_to or gmail_user).split(",") if item.strip())
-            if recipients:
-                transports.append(GmailTransport(gmail_user, gmail_password, recipients))
-            else:
-                warnings.append("Gmail notification has no recipient")
-        elif gmail_configured:
-            warnings.append("Gmail notification requires LUX_EVOLUTION_GMAIL_USER and APP_PASSWORD")
-
         ntfy_topic = os.environ.get("LUX_EVOLUTION_NTFY_TOPIC", "").strip()
         ntfy_server = os.environ.get("LUX_EVOLUTION_NTFY_SERVER", "https://ntfy.sh").strip()
         if ntfy_topic:
@@ -119,7 +83,7 @@ class EvolutionNotifier:
                     token=os.environ.get("LUX_EVOLUTION_NTFY_TOKEN") or None,
                 )
             )
-        return cls(run_dir, tuple(transports), configuration_warnings=tuple(warnings))
+        return cls(run_dir, tuple(transports))
 
     @property
     def enabled(self) -> bool:
