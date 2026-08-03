@@ -22,7 +22,11 @@ from examples.evolve_rl import (
     _evaluation_anchors,
     _final_training_metrics,
     _is_fatal_cuda_error,
+    _is_retryable_infrastructure_failure,
+    _job_retry_count,
     _load_or_create_stage_selection,
+    _record_job_retry,
+    _record_skipped_job,
     _save_candidate_provenance,
     _sync_api_claim,
     _validate_candidate_provenance,
@@ -1876,3 +1880,39 @@ def test_fatal_cuda_context_errors_are_distinguished_from_oom():
     assert _is_fatal_cuda_error(RuntimeError("CUDA error: unspecified launch failure"))
     assert _is_fatal_cuda_error(RuntimeError("CUDA error: an illegal memory access was encountered"))
     assert not _is_fatal_cuda_error(RuntimeError("CUDA out of memory"))
+
+
+def test_infrastructure_failures_are_retryable_but_candidate_errors_are_not(tmp_path):
+    job = EvolutionJob("candidate", "short-resattn8", "resattn8", 0, 1, 1)
+    missing_replay = CandidateResult(
+        "candidate",
+        "short-resattn8",
+        "failed",
+        0.0,
+        0.0,
+        float("inf"),
+        1.0,
+        {},
+        "FileNotFoundError: /app/replay_datasets/missing.json",
+    )
+    invalid_reward = CandidateResult(
+        "candidate",
+        "short-resattn8",
+        "failed",
+        0.0,
+        0.0,
+        float("inf"),
+        1.0,
+        {},
+        "ValueError: derived reward metric is invalid",
+    )
+
+    assert _is_retryable_infrastructure_failure(missing_replay)
+    assert not _is_retryable_infrastructure_failure(invalid_reward)
+    assert _record_job_retry(tmp_path, job, missing_replay) == 1
+    assert _record_job_retry(tmp_path, job, missing_replay) == 2
+    assert _job_retry_count(tmp_path, job) == 2
+    _record_skipped_job(tmp_path, job, missing_replay)
+    skipped = json.loads((tmp_path / "jobs" / "skipped" / f"{job.job_id}.json").read_text())
+    assert skipped["status"] == "skipped_after_infrastructure_retries"
+    assert skipped["retry_count"] == 2

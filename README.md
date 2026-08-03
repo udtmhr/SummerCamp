@@ -754,6 +754,11 @@ Independent candidates can use another GPU machine without a shared filesystem. 
 queue and artifacts locally and exposes a loopback-only Job API. Start it on PC1; omitting `--coordinator-only` lets PC1
 also train candidates while serving ws3:
 
+Worker-local dependency failures such as a missing BC-anchor replay or a reset CUDA context are requeued up to two
+times. If the same infrastructure failure persists, that candidate/stage is recorded under `jobs/skipped/`; the wave
+continues when another candidate completed successfully, but stops when every candidate failed because no fair ranking
+is possible. Reward/DSL errors are not treated as infrastructure failures.
+
 ```bash
 export LUX_EVOLUTION_JOB_TOKEN='<same-random-token-on-both-machines>'
 uv run --locked python examples/evolve_rl.py \

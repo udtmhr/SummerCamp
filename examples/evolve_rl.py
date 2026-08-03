@@ -77,6 +77,18 @@ _FATAL_CUDA_ERROR_MARKERS = (
     "device is lost",
     "driver shutting down",
 )
+_AUTOMATIC_INFRASTRUCTURE_RETRIES = 2
+_RETRYABLE_INFRASTRUCTURE_ERROR_MARKERS = (
+    "filenotfounderror",
+    "no such file or directory",
+    "connectionerror",
+    "connection reset",
+    "connection refused",
+    "timed out",
+    "cuda error",
+    "cuda failure",
+    "device is lost",
+)
 
 _RUN_MANIFEST_ARGUMENTS = (
     "unet_checkpoint",
@@ -124,6 +136,13 @@ _RUN_MANIFEST_ARGUMENTS = (
 def _is_fatal_cuda_error(error: BaseException) -> bool:
     message = str(error).lower()
     return "cuda" in message and any(marker in message for marker in _FATAL_CUDA_ERROR_MARKERS)
+
+
+def _is_retryable_infrastructure_failure(result: CandidateResult) -> bool:
+    if result.status == "completed" or not result.error:
+        return False
+    message = result.error.lower()
+    return any(marker in message for marker in _RETRYABLE_INFRASTRUCTURE_ERROR_MARKERS)
 
 
 def _synchronize_cuda(device: torch.device, phase: str) -> None:
@@ -1609,6 +1628,51 @@ def _archive_failed_results(store: EvolutionStore, jobs: list[EvolutionJob]) -> 
         path.replace(destination)
 
 
+def _job_retry_state_path(run_dir: Path, job: EvolutionJob) -> Path:
+    return run_dir / "jobs" / "retries" / f"{job.job_id}.json"
+
+
+def _job_retry_count(run_dir: Path, job: EvolutionJob) -> int:
+    path = _job_retry_state_path(run_dir, job)
+    if not path.exists():
+        return 0
+    value = json.loads(path.read_text(encoding="utf-8"))
+    return int(value.get("retry_count", 0))
+
+
+def _record_job_retry(run_dir: Path, job: EvolutionJob, result: CandidateResult) -> int:
+    path = _job_retry_state_path(run_dir, job)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    retry_count = _job_retry_count(run_dir, job) + 1
+    EvolutionStore.write_json(
+        path,
+        {
+            "candidate_id": job.candidate_id,
+            "stage": job.stage,
+            "retry_count": retry_count,
+            "last_error": result.error,
+            "updated_at": time.time(),
+        },
+    )
+    return retry_count
+
+
+def _record_skipped_job(run_dir: Path, job: EvolutionJob, result: CandidateResult) -> None:
+    path = run_dir / "jobs" / "skipped" / f"{job.job_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    EvolutionStore.write_json(
+        path,
+        {
+            "candidate_id": job.candidate_id,
+            "stage": job.stage,
+            "status": "skipped_after_infrastructure_retries",
+            "retry_count": _job_retry_count(run_dir, job),
+            "error": result.error,
+            "skipped_at": time.time(),
+        },
+    )
+
+
 def _unused_history_path(directory: Path, filename: str) -> Path:
     timestamp = int(time.time())
     destination = directory / f"{timestamp}-{filename}"
@@ -1931,6 +1995,8 @@ def main(
             queue.enqueue(job)
             print(json.dumps({"job_id": job.job_id, "status": "enqueued"}, sort_keys=True))
         expected = {(job.candidate_id, job.stage) for job in jobs}
+        original_expected = set(expected)
+        job_by_key = {(job.candidate_id, job.stage): job for job in jobs}
         deadline = time.monotonic() + args.job_timeout_seconds
         worker_id = f"coordinator-{socket.gethostname()}-{os.getpid()}"
         while True:
@@ -1944,6 +2010,66 @@ def main(
                 if (result.candidate_id, result.stage) in expected and result.status != "completed"
             ]
             if failed:
+                retried = []
+                exhausted = []
+                terminal = []
+                for result in failed:
+                    key = result.candidate_id, result.stage
+                    job = job_by_key[key]
+                    if not _is_retryable_infrastructure_failure(result):
+                        terminal.append(result)
+                        continue
+                    retry_count = _job_retry_count(run_dir, job)
+                    if retry_count < _AUTOMATIC_INFRASTRUCTURE_RETRIES:
+                        retry_count = _record_job_retry(run_dir, job, result)
+                        _archive_failed_results(store, [job])
+                        results[:] = [
+                            item
+                            for item in results
+                            if (item.candidate_id, item.stage) != key or item.status == "completed"
+                        ]
+                        queue.enqueue(job)
+                        retried.append((job, result, retry_count))
+                    else:
+                        _record_skipped_job(run_dir, job, result)
+                        expected.discard(key)
+                        exhausted.append((job, result))
+                for job, result, retry_count in retried:
+                    print(
+                        json.dumps(
+                            {
+                                "job_id": job.job_id,
+                                "status": "infrastructure_retry",
+                                "retry": retry_count,
+                                "max_retries": _AUTOMATIC_INFRASTRUCTURE_RETRIES,
+                                "error": result.error,
+                            },
+                            sort_keys=True,
+                        )
+                    )
+                if retried:
+                    continue
+                if exhausted:
+                    skipped_ids = [job.job_id for job, _ in exhausted]
+                    _notify_run_event(
+                        notifier,
+                        run_dir,
+                        f"infrastructure-jobs-skipped:{time.time_ns()}",
+                        "Lux evolution jobs skipped after retries",
+                        f"Skipped jobs after {_AUTOMATIC_INFRASTRUCTURE_RETRIES} retries: {skipped_ids}",
+                        priority=4,
+                        tags=("warning",),
+                    )
+                    print(json.dumps({"job_ids": skipped_ids, "status": "infrastructure_skipped"}, sort_keys=True))
+                    if expected:
+                        continue
+                    if original_expected & completed:
+                        return
+                    detail = ", ".join(f"{job.job_id}: {result.error}" for job, result in exhausted)
+                    message = f"All evolution jobs failed from infrastructure errors after retries: {detail}"
+                    raise RuntimeError(message)
+                if terminal:
+                    failed = terminal
                 detail = ", ".join(f"{result.candidate_id}--{result.stage}: {result.error}" for result in failed)
                 message = f"Evolution jobs failed; fix the cause and resume: {detail}"
                 raise RuntimeError(message)
