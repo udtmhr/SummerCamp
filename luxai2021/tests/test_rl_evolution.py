@@ -14,11 +14,13 @@ import pytest
 import torch
 
 from examples.evolve_rl import (
+    PhaseBalancedBatchSampler,
     _active_base_names,
     _apply_coordinator_manifest,
     _archive_unselected_stage_jobs,
     _checkpoint_descriptors,
     _checkpoint_pair,
+    _curriculum_start_decisions,
     _evaluation_anchors,
     _final_training_metrics,
     _is_fatal_cuda_error,
@@ -28,6 +30,7 @@ from examples.evolve_rl import (
     _record_job_retry,
     _record_skipped_job,
     _save_candidate_provenance,
+    _select_teacher_milestone,
     _sync_api_claim,
     _validate_candidate_provenance,
     _validate_checkpoint_descriptors,
@@ -37,6 +40,7 @@ from examples.evolve_rl import (
 from luxai2021.env.agent import Agent
 from luxai2021.game.actions import MoveAction
 from luxai2021.game.game import Game
+from luxai2021.game.game_constants import GAME_CONSTANTS
 from luxai2021.game.match_controller import MatchController
 from luxai2021.game.position import Position
 from luxai2021.imitation.masking import monotonically_tighten_legal_mask
@@ -62,9 +66,11 @@ from luxai2021.rl.evolution import (
     canonicalize_candidate_proposal,
     compress_turn_ranges,
     initial_candidate,
+    lux_s1_rules_context,
     mutate_candidate,
     proposal_schema,
     select_codex_feedback_results,
+    training_curriculum,
     validate_candidate_mutation,
 )
 from luxai2021.rl.job_api import JobApiClient, JobApiServer
@@ -756,6 +762,110 @@ def test_codex_proposal_schema_uses_supported_structured_output_constructs():
     assert "coordinated edits across multiple components" in island3_prompt
     assert "Use only structural, crossover, or restart" in island3_prompt
     assert "prefer the single targeted change" not in island3_prompt
+    assert "https://www.lux-ai.org/specs-2021#Background" in island3_prompt
+    assert "360 turns" in island3_prompt
+    assert "Teacher non-regression is a hard objective" in island3_prompt
+
+
+def test_rules_context_is_versioned_and_complete():
+    context = lux_s1_rules_context()
+
+    assert len(context["summary_sha256"]) == 64
+    assert "30 day turns followed by 10 night turns" in context["summary"]
+    assert "23 - 5 * adjacent_friendly_city_tiles" in context["summary"]
+    assert "Wood, Coal, and Uranium are worth 1, 10, and 40" in context["summary"]
+    parameters = GAME_CONSTANTS["PARAMETERS"]
+    assert parameters["MAX_DAYS"] == 360
+    assert (parameters["DAY_LENGTH"], parameters["NIGHT_LENGTH"]) == (30, 10)
+    assert parameters["RESEARCH_REQUIREMENTS"] == {"COAL": 50, "URANIUM": 200}
+    assert parameters["RESOURCE_TO_FUEL_RATE"] == {"WOOD": 1, "COAL": 10, "URANIUM": 40}
+
+
+def test_teacher_guarded_curriculum_anneals_reward_and_increases_teacher():
+    curriculum = training_curriculum("teacher_guarded_near_sparse")
+    proposed = OpponentMix()
+
+    assert curriculum.shaping_multiplier(0.0) == pytest.approx(1.0)
+    assert curriculum.shaping_multiplier(0.6) == pytest.approx(0.5)
+    assert curriculum.shaping_multiplier(1.0) == pytest.approx(0.05)
+    mixes = [curriculum.opponent_mix(proposed, progress) for progress in (0.0, 0.3, 0.65, 1.0)]
+    assert [mix.teacher for mix in mixes] == pytest.approx([0.25, 0.30, 0.40, 0.50])
+    assert all(sum(vars(mix).values()) == pytest.approx(1.0) for mix in mixes)
+    assert all(mix.snapshot >= 0.1 for mix in mixes)
+
+
+def test_curriculum_stage_offsets_keep_final_phase_after_cross_stage_resume():
+    args = SimpleNamespace(short_decisions=100, medium_decisions=300)
+
+    assert _curriculum_start_decisions("short-resattn8", args) == 0
+    assert _curriculum_start_decisions("probe-unet", args) == 0
+    assert _curriculum_start_decisions("medium-resattn8", args) == 100
+    assert _curriculum_start_decisions("final-resattn8", args) == 400
+    assert _curriculum_start_decisions("final-unet", args) == 400
+
+
+def test_teacher_milestone_selection_prefers_teacher_score_then_latest(tmp_path, monkeypatch):
+    milestone_dir = tmp_path / "milestones"
+    milestone_dir.mkdir()
+    for name in ("p060.pt", "p080.pt", "p100.pt"):
+        (milestone_dir / name).touch()
+    scores = {"p060": 0.4, "p080": 0.5, "p100": 0.5}
+
+    def fake_evaluate(candidate, anchors, **kwargs):
+        assert anchors[0].model_type == "first-place"
+        assert kwargs["seed_count"] == 12
+        return {"totals": {"score_rate": scores[candidate.checkpoint.stem]}}
+
+    monkeypatch.setattr("examples.evolve_rl.evaluate_against_league", fake_evaluate)
+    selected, report = _select_teacher_milestone(
+        tmp_path,
+        candidate_id="candidate",
+        teacher_checkpoint=tmp_path / "teacher.pt",
+        seed_start=123,
+        seed_count=12,
+        device="cpu",
+        max_turns=360,
+    )
+
+    assert selected == milestone_dir / "p100.pt"
+    assert report["selection_policy"] == "highest_teacher_score_rate_then_latest"
+    assert json.loads((tmp_path / "milestone_selection.json").read_text())["selected_checkpoint"] == str(selected)
+
+
+def test_legacy_manifest_preserves_pre_curriculum_anchor_behavior():
+    args = SimpleNamespace(
+        curriculum_profile="teacher_guarded_near_sparse",
+        bc_anchor_max_turns=0,
+        bc_anchor_sampling="phase-balanced",
+    )
+
+    _apply_coordinator_manifest(args, {"schema_version": 2, "arguments": {}})
+
+    assert args.curriculum_profile == "legacy"
+    assert args.bc_anchor_max_turns == 64
+    assert args.bc_anchor_sampling == "replay"
+
+
+def test_phase_balanced_sampler_covers_all_turn_strata():
+    class Dataset:
+        def __init__(self) -> None:
+            self.samples = [
+                (Path("r.json"), turn, 0)
+                for turn in (0, 30, 90, 110, 180, 190, 280, 310)
+            ]
+
+        def __len__(self) -> int:
+            return len(self.samples)
+
+    dataset = Dataset()
+    sampler = PhaseBalancedBatchSampler(dataset, 8, seed=7)
+    batch = next(iter(sampler))
+    strata = {
+        min(dataset.samples[index][1] // 90, 3) * 2 + int(dataset.samples[index][1] % 40 >= 30)
+        for index in batch
+    }
+
+    assert strata == set(range(8))
 
 
 def test_codex_generator_records_all_failure_types(tmp_path, monkeypatch):
@@ -802,6 +912,8 @@ def test_codex_generator_records_accepted_proposal_hash(tmp_path, monkeypatch):
     assert metadata["proposal_sha256"]
     assert metadata["raw_proposal_sha256"]
     assert metadata["canonical_proposal_sha256"] == metadata["proposal_sha256"]
+    assert metadata["rules_source_url"] == "https://www.lux-ai.org/specs-2021#Background"
+    assert metadata["rules_summary_sha256"] == lux_s1_rules_context()["summary_sha256"]
     assert gzip.decompress((tmp_path / metadata["prompt_path"]).read_bytes()).decode() == build_codex_prompt(
         [parent], [], island=0, generation=1
     )
@@ -1329,6 +1441,45 @@ def test_paired_acceptance_requires_positive_both_architectures():
     assert report["promote"] is True
 
 
+def test_teacher_guard_rejects_base_gain_that_regresses_teacher():
+    def evaluation(base_outcomes, teacher_outcomes):
+        games = []
+        survival = {
+            "final_city_zero": False,
+            "last_night_survival": True,
+            "min_night_fuel_margin": 0.1,
+            "normalized_city_tile_loss": 0.2,
+        }
+        for anchor, outcomes in (("resattn8-base", base_outcomes), ("first-place", teacher_outcomes)):
+            for seed, outcome in enumerate(outcomes, start=10):
+                games.append(
+                    {
+                        "anchor": anchor,
+                        "seed": seed,
+                        "orientation": 0,
+                        "outcome": outcome,
+                        "survival": survival,
+                    }
+                )
+        return {"games": games, "candidate_inference_p95_seconds": 0.1}
+
+    baseline = evaluation([-1.0, -1.0, -1.0, -1.0], [-1.0, -1.0, 1.0, 1.0])
+    teacher_regression = evaluation([1.0, 1.0, 1.0, 1.0], [-1.0, -1.0, -1.0, 1.0])
+    report = acceptance_report(
+        {"resattn8": teacher_regression},
+        {"resattn8": baseline},
+        enforce_teacher_guard=True,
+        require_survival=True,
+        seed=4,
+    )
+
+    architecture = report["architectures"]["resattn8"]
+    assert architecture["base_score_rate_delta"] > 0
+    assert architecture["teacher_score_rate_delta"] < 0
+    assert architecture["teacher_guard_passes"] is False
+    assert report["promote"] is False
+
+
 def test_legal_mask_tightening_never_reenables_existing_illegal_actions():
     existing = np.array([True, False, True, False])
     additional = np.array([True, True, False, False])
@@ -1360,6 +1511,13 @@ def test_engine_records_night_city_loss_and_invalid_action_turns():
     city = game.cities[tile.city_id]
     city.fuel = 0.0
     game.state["turn"] = 30
+
+    game.record_night_fuel_diagnostics()
+    fuel_event = game.diagnostic_events[-2]
+    assert fuel_event["event"] == "night_fuel_snapshot"
+    assert fuel_event["team"] == 0
+    assert fuel_event["city_tiles"] >= 1
+    assert fuel_event["fuel_margin"] < 0
 
     game.handle_night()
 

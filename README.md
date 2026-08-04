@@ -630,6 +630,19 @@ only; proposals are validated before training and cannot execute arbitrary rewar
 action sampling, a training-only value head, reference-policy KL, and the prepared teacher cache as a distillation
 anchor. Exported `best.pt` files remain compatible with `BehaviorCloningAgent`.
 
+New runs embed the official Lux AI Season 1 rules URL and the SHA-256 of the packaged rule summary in the schema-v3
+manifest and every Codex prompt. The search treats the original first-place Teacher as the strongest anchor: Teacher
+score is ranked before aggregate score, and final promotion requires paired Teacher non-regression as well as a
+non-negative distilled-base delta. The default `teacher_guarded_near_sparse` curriculum raises the Teacher opponent
+floor from 25% to 50%, keeps at least 10% snapshot play, and anneals potential-based shaping from 100% to 5% while
+leaving the terminal win/loss reward unchanged. Use `--curriculum-profile terminal_only_ablation` for an explicit
+terminal-only ablation or `legacy` only when reproducing an old run.
+
+The default BC anchor uses 128 deterministically selected replays, all available turns, and phase-balanced batches
+over four 90-turn phases crossed with day/night. Final stages export curriculum milestones and screen them against the
+Teacher before the selected checkpoint enters the full league evaluation. League reports include city extinction,
+last-night survival, normalized city loss, and per-city night fuel margin; these are promotion gates for new runs.
+
 Each Codex feedback record includes the exact turns where city tiles disappeared from night fuel shortage, fuel and
 upkeep at destruction, illegal actions rejected by the engine, the candidate's setting changes from its parent, and
 the resulting score/teacher-score/KL deltas. Dynamic action restrictions are applied only by intersecting them with
@@ -683,7 +696,7 @@ ResAttn8 candidates for 550,000 sampled decisions, continue the best eight for a
 four Lux environments concurrently; candidate and opponent inference requests are collected into GPU batches while
 action decoding remains environment-local. PPO also evaluates all decisions of each entity type as tensors instead of
 one Python operation per unit. Tune `--rollout-envs` for each GPU and `--decisions-per-update` for the rollout/update
-balance. In ResAttn8-only mode, final evaluation uses 50 fixed seeds, both player orientations,
+balance. In ResAttn8-only mode, screening/medium/final evaluation uses 12/24/100 fixed seeds, both player orientations,
 the distilled ResAttn8 base plus the original first-place policy, no replay output, paired bootstrap reporting, and an
 inference-latency guard. Re-running the same command resumes completed candidates and stage checkpoints. Use
 `--no-codex` for deterministic numeric mutations, or `--overwrite-run` to intentionally start that run directory
@@ -736,7 +749,7 @@ stores cumulative decisions, turns, episodes, optimizer/RNG state, constraint pr
 Re-running a stage resumes its remaining decision budget. Schema-v1/v2 checkpoints remain loadable; a v1 checkpoint's
 consumed budget is conservatively estimated from its recorded elapsed-time fraction.
 
-The first coordinator invocation owns the schema-v2 run manifest: later invocations reuse its checkpoint paths,
+The first coordinator invocation owns the schema-v3 run manifest: later invocations reuse its checkpoint paths,
 SHA-256 descriptors, Codex/deterministic generation mode, model, and training budgets instead of overwriting them with
 new CLI defaults. Every candidate has a separate immutable record under `provenance/`; accepted Codex outputs retain
 the raw `*.raw.json`, canonical `codex-gXX-iXX.json`, compressed prompt, and `*.meta.json` hashes plus the normalization

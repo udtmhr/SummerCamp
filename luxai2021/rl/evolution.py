@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# ruff: noqa: C901, EM102, PLR0912, PLR0913, PLR0915, PLR2004, S311, S603, TC003
+# ruff: noqa: C901, EM102, PLR0912, PLR0913, PLR0915, PLR2004, S311, S603
 import copy
 import gzip
 import hashlib
@@ -29,6 +29,8 @@ from luxai2021.rl.reward import (
 EVOLUTION_SCHEMA_VERSION = 2
 LEGACY_EVOLUTION_SCHEMA_VERSION = 1
 OPPONENT_KEYS = ("self_base", "other_base", "teacher", "snapshot")
+LUX_S1_RULES_SOURCE_URL = "https://www.lux-ai.org/specs-2021#Background"
+LUX_S1_RULES_PATH = Path(__file__).with_name("lux_s1_rules.md")
 MUTATION_KINDS = frozenset(
     {"initial", "legacy", "parameter", "structural", "feature_existing", "feature_generated", "crossover", "restart"}
 )
@@ -39,6 +41,15 @@ _STRUCTURAL_BINARY_OPS = frozenset({"add", "sub", "mul", "safe_div", "min", "max
 _I03_STRUCTURAL_DISTANCE_MIN = 0.20
 _I03_STRUCTURAL_DISTANCE_MAX = 0.65
 _I03_STRUCTURAL_ATTEMPTS = 16
+
+
+def lux_s1_rules_context() -> dict[str, str]:
+    summary = LUX_S1_RULES_PATH.read_text(encoding="utf-8").strip()
+    return {
+        "source_url": LUX_S1_RULES_SOURCE_URL,
+        "summary": summary,
+        "summary_sha256": hashlib.sha256(summary.encode()).hexdigest(),
+    }
 
 
 @dataclass(frozen=True)
@@ -63,6 +74,76 @@ class OpponentMix:
             if draw <= cumulative:
                 return name
         return "snapshot"
+
+
+def _piecewise_linear(points: tuple[tuple[float, float], ...], progress: float) -> float:
+    value = min(max(float(progress), 0.0), 1.0)
+    for (left_x, left_y), (right_x, right_y) in zip(points, points[1:]):
+        if value <= right_x:
+            fraction = (value - left_x) / max(right_x - left_x, 1e-9)
+            return left_y + fraction * (right_y - left_y)
+    return points[-1][1]
+
+
+@dataclass(frozen=True)
+class TrainingCurriculum:
+    name: str
+    teacher_floor_points: tuple[tuple[float, float], ...]
+    shaping_multiplier_points: tuple[tuple[float, float], ...]
+    snapshot_floor: float = 0.10
+    parameter_constraint_end_fraction: float = 0.20
+
+    def shaping_multiplier(self, progress: float) -> float:
+        return _piecewise_linear(self.shaping_multiplier_points, progress)
+
+    def opponent_mix(self, proposed: OpponentMix, progress: float) -> OpponentMix:
+        if self.name == "legacy":
+            return proposed
+        teacher = min(
+            max(proposed.teacher, _piecewise_linear(self.teacher_floor_points, progress)),
+            1.0 - self.snapshot_floor,
+        )
+        snapshot = max(proposed.snapshot, self.snapshot_floor)
+        if teacher + snapshot >= 1.0:
+            snapshot = self.snapshot_floor
+            teacher = 1.0 - snapshot
+        remaining = max(0.0, 1.0 - teacher - snapshot)
+        base_total = proposed.self_base + proposed.other_base
+        self_fraction = proposed.self_base / base_total if base_total > 0 else 0.5
+        return OpponentMix(
+            self_base=remaining * self_fraction,
+            other_base=remaining * (1.0 - self_fraction),
+            teacher=teacher,
+            snapshot=snapshot,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "teacher_floor_points": [list(point) for point in self.teacher_floor_points],
+            "shaping_multiplier_points": [list(point) for point in self.shaping_multiplier_points],
+            "snapshot_floor": self.snapshot_floor,
+            "parameter_constraint_end_fraction": self.parameter_constraint_end_fraction,
+        }
+
+
+def training_curriculum(name: str) -> TrainingCurriculum:
+    teacher_points = ((0.0, 0.25), (0.30, 0.30), (0.65, 0.40), (0.85, 0.50), (1.0, 0.50))
+    if name == "legacy":
+        return TrainingCurriculum("legacy", ((0.0, 0.0), (1.0, 0.0)), ((0.0, 1.0), (1.0, 1.0)), 0.0, 0.0)
+    if name == "teacher_guarded_near_sparse":
+        return TrainingCurriculum(
+            name,
+            teacher_points,
+            ((0.0, 1.0), (0.30, 1.0), (0.60, 0.50), (0.80, 0.20), (1.0, 0.05)),
+        )
+    if name == "terminal_only_ablation":
+        return TrainingCurriculum(
+            name,
+            teacher_points,
+            ((0.0, 1.0), (0.30, 1.0), (0.60, 0.50), (0.80, 0.0), (1.0, 0.0)),
+        )
+    raise ValueError(f"Unknown curriculum profile: {name}")
 
 
 @dataclass(frozen=True)
@@ -211,12 +292,12 @@ class CandidateResult:
     error: str | None = None
 
     @property
-    def fitness(self) -> tuple[float, float, float]:
+    def fitness(self) -> tuple[float, float, float, float]:
         reflection = self.metrics.get("reflection", {}) if isinstance(self.metrics, Mapping) else {}
         diagnostics = reflection.get("diagnostics", {}) if isinstance(reflection, Mapping) else {}
         illegal_count = int(diagnostics.get("illegal_action_count", 0)) if isinstance(diagnostics, Mapping) else 0
         valid = 1.0 if self.status == "completed" and illegal_count == 0 else 0.0
-        return valid, self.score_rate, self.teacher_score_rate - min(self.kl, 1.0) * 0.01
+        return valid, self.teacher_score_rate, self.score_rate, -min(self.kl, 1.0)
 
 
 class EvolutionStore:
@@ -566,14 +647,18 @@ def build_codex_prompt(
     *,
     island: int,
     generation: int,
+    rules_context: Mapping[str, str] | None = None,
 ) -> str:
     parent_payload = [parent.to_dict() for parent in parents]
     selected_results = select_codex_feedback_results(parents, results)
     result_payload = [_codex_result_feedback(result) for result in selected_results]
     island_role = {
         0: "parameter: change only one or two numeric leaves; keep AST topology unchanged; inherit policy_value",
-        1: "structural: make one local AST operator/subtree edit; inherit policy",
-        2: "feature: add or delete exactly one direct normalized metric component; inherit policy",
+        1: "structural: make one phase-aware local AST edit using turn/night gates; inherit policy",
+        2: (
+            "feature: add or delete exactly one direct normalized fuel-delivery, City-risk, cargo, or resource-access "
+            "metric component; inherit policy"
+        ),
         3: "diversity: freely redesign the bounded reward structure, recombine parents, or restart",
     }.get(island, "parameter")
     edit_guidance = (
@@ -588,6 +673,34 @@ def build_codex_prompt(
   from a secondary parent, and must keep the primary parent's PPO, opponent mix, and parameter constraint.
 - Declare restart only when intentionally starting from the distilled base without a parent checkpoint."""
     )
+    context = {
+        "context_schema_version": 1,
+        "rules": dict(rules_context or lux_s1_rules_context()),
+        "anchor_hierarchy": {
+            "strongest_anchor": "teacher",
+            "teacher_identity": "Lux AI 2021 official first-place agent",
+            "selection_policy": (
+                "Teacher performance is a non-regression guard. A gain against self_base must not compensate for "
+                "a regression against teacher."
+            ),
+        },
+        "metric_semantics": {
+            "terminal_outcome": "authoritative win=1, draw=0, loss=-1 objective",
+            "city_tiles": "relative proxy for the primary end-game tiebreak; expansion also adds fuel liability",
+            "city_survival": "aggregate relative City fuel safety",
+            "min_city_survival": "minimum individual-City survival; use for local collapse",
+            "night_fuel_deficit": "relative signal oriented so larger is better",
+            "own_night_fuel_deficit": "absolute own-team deficit; lower is better",
+            "fuel_delivery_coverage": "relative ability to deliver carried fuel to at-risk Cities",
+            "own_fuel_delivery_coverage": "absolute own-team delivery coverage; larger is better",
+            "turn_phase_metrics": "turn/night/cycle values are gates, not standalone objectives",
+        },
+        "generation": generation,
+        "island": island,
+        "island_role": island_role,
+        "parents": parent_payload,
+        "recent_results": result_payload,
+    }
     return f"""You are evolving a safe reward program and PPO configuration for Lux AI Challenge 2021.
 Return exactly one proposal matching the supplied JSON schema.
 
@@ -595,6 +708,8 @@ Hard constraints:
 - Keep the observation schema, first_place_flat_v1 actions, UNet, and ResAttn8 architectures unchanged.
 - Reward expressions may use only schema operations and normalized metrics.
 - Preserve terminal win/loss reward; design bounded potential shaping for city survival and match strength.
+- The official first-place Teacher is stronger than the distilled bases. Teacher non-regression is a hard objective;
+  a self_base gain cannot compensate for a Teacher regression.
 - PPO must remain close to the distilled reference policy and train on one GPU.
 - Opponent weights must sum to exactly 1.0.
 {edit_guidance}
@@ -611,14 +726,8 @@ Hard constraints:
 - A restart sets primary_parent_id to null, inheritance_mode to base, and parameter_constraint_coefficient to 0.
 - mutation_kind, parent provenance, inheritance_mode, and changed_paths must truthfully describe the proposal.
 
-Generation: {generation}
-Island: {island}
-Island role: {island_role}
-Parents:
-{json.dumps(parent_payload, ensure_ascii=False, separators=(',', ':'), sort_keys=True)}
-
-Recent evaluation and reward-reflection feedback:
-{json.dumps(result_payload, ensure_ascii=False, separators=(',', ':'), sort_keys=True)}
+Evolution context JSON (authoritative rules, metric semantics, parents, and feedback):
+{json.dumps(context, ensure_ascii=False, separators=(',', ':'), sort_keys=True)}
 """
 
 
@@ -1318,6 +1427,7 @@ def summarize_diagnostic_events(metrics: Mapping[str, Any]) -> dict[str, object]
             if isinstance(game, Mapping):
                 events.extend(event for event in game.get("diagnostic_events", ()) if isinstance(event, Mapping))
     city_events = [dict(event) for event in events if event.get("event") == "city_destroyed_night_fuel"]
+    fuel_snapshots = [dict(event) for event in events if event.get("event") == "night_fuel_snapshot"]
     illegal_events = [dict(event) for event in events if event.get("event") == "illegal_action"]
     illegal_classes = Counter(
         str(event.get("action_class", event.get("action", "unknown"))) for event in illegal_events
@@ -1328,6 +1438,14 @@ def summarize_diagnostic_events(metrics: Mapping[str, Any]) -> dict[str, object]
         "city_tiles_lost": sum(int(event.get("city_tiles_lost", 0)) for event in city_events),
         "city_event_count": len(city_events),
         "max_fuel_deficit": max((_event_deficit(event) for event in city_events), default=0.0),
+        "min_night_fuel_margin": min(
+            (float(event.get("min_city_fuel_margin", -1.0)) for event in fuel_snapshots),
+            default=None,
+        ),
+        "last_night_city_zero_count": sum(
+            int(event.get("turn", -1)) >= 350 and int(event.get("city_tiles", 0)) == 0
+            for event in fuel_snapshots
+        ),
         "city_loss_events": _representative_city_events(city_events),
         "illegal_action_turns": sorted({int(event["turn"]) for event in illegal_events}),
         "illegal_action_count": len(illegal_events),
@@ -1367,11 +1485,16 @@ def compact_candidate_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
             events = [event for event in compact_game.pop("diagnostic_events", ()) if isinstance(event, Mapping)]
             if events:
                 city_events = [event for event in events if event.get("event") == "city_destroyed_night_fuel"]
+                fuel_snapshots = [event for event in events if event.get("event") == "night_fuel_snapshot"]
                 illegal_events = [event for event in events if event.get("event") == "illegal_action"]
                 compact_game["diagnostics"] = {
                     "city_tile_loss_turns": sorted({int(event["turn"]) for event in city_events}),
                     "city_tiles_lost": sum(int(event.get("city_tiles_lost", 0)) for event in city_events),
                     "city_loss_event_count": len(city_events),
+                    "min_night_fuel_margin": min(
+                        (float(event.get("min_city_fuel_margin", -1.0)) for event in fuel_snapshots),
+                        default=None,
+                    ),
                     "illegal_action_turns": sorted({int(event["turn"]) for event in illegal_events}),
                     "illegal_action_count": len(illegal_events),
                 }
@@ -1443,6 +1566,7 @@ class CodexCandidateGenerator:
         self.model = model
         self.timeout_seconds = timeout_seconds
         self.validation_retries = max(0, int(validation_retries))
+        self.rules_context = lux_s1_rules_context()
         self.schema_path = run_dir / "codex-proposal-schema.json"
         self.schema_path.write_text(json.dumps(proposal_schema(), indent=2, sort_keys=True), encoding="utf-8")
 
@@ -1531,7 +1655,13 @@ class CodexCandidateGenerator:
         generation: int,
         island: int,
     ) -> EvolutionCandidate:
-        base_prompt = build_codex_prompt(parents, results, island=island, generation=generation)
+        base_prompt = build_codex_prompt(
+            parents,
+            results,
+            island=island,
+            generation=generation,
+            rules_context=self.rules_context,
+        )
         prompt = base_prompt
         output_path = self.output_path(generation, island)
         raw_output_path = self.raw_output_path(generation, island)
@@ -1647,6 +1777,9 @@ class CodexCandidateGenerator:
                 "prompt_bytes": len(prompt_bytes),
                 "prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
                 "selected_result_ids": selected_result_ids,
+                "context_schema_version": 1,
+                "rules_source_url": self.rules_context["source_url"],
+                "rules_summary_sha256": self.rules_context["summary_sha256"],
             },
         )
         return candidate
@@ -1669,7 +1802,7 @@ def initial_candidate(*, island: int, seed: int) -> EvolutionCandidate:
         "secondary_parent_ids": [],
         "inheritance_mode": "base",
         "mutation_manifest": {"changed_paths": [], "summary": "Seeded bounded initialization"},
-        "parameter_constraint_coefficient": 0.0,
+        "parameter_constraint_coefficient": 0.05,
         "rationale": "Bounded human initialization for the first island population.",
     }
     return EvolutionCandidate.from_proposal(proposal, generation=0, island=island, parent_ids=())

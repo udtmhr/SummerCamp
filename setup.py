@@ -20,7 +20,12 @@ setup(
         "tqdm>=4.66,<5",
         "gymnasium==1.0.0"
     ],
-    package_data={'luxai2021': ['game/game_constants.json', 'env/rng/rng.js', 'env/rng/seedrandom.js']},
+    package_data={'luxai2021': [
+        'game/game_constants.json',
+        'env/rng/rng.js',
+        'env/rng/seedrandom.js',
+        'rl/lux_s1_rules.md',
+    ]},
     test_suite='nose2.collector.collector',
     tests_require=['nose2'],
 )

@@ -89,6 +89,7 @@ class Game:
         # logging so training/evaluation can inspect failures without writing
         # replay files.
         self.diagnostic_events = []
+        self.diagnostic_peak_city_tiles = {Constants.TEAM.A: 0, Constants.TEAM.B: 0}
         self.cities = {}  # string -> City
         self.cells_with_roads = set() # Set, maintained to speed up agent designs that want to build road maps
         self.stats = {
@@ -497,7 +498,12 @@ class Game:
             for unit in self.state["teamStates"][team]["units"].values():
                 self.handle_resource_deposit(unit)
 
+        for team in teams:
+            city_tiles = sum(len(city.city_cells) for city in self.cities.values() if city.team == team)
+            self.diagnostic_peak_city_tiles[team] = max(self.diagnostic_peak_city_tiles[team], city_tiles)
+
         if self.is_night():
+            self.record_night_fuel_diagnostics()
             self.handle_night()
 
         # remove resources that are depleted from map
@@ -539,6 +545,33 @@ class Game:
 
         # self.log('Beginning turn %s' % self.state["turn"])
         return False
+
+    def record_night_fuel_diagnostics(self):
+        remaining_turns = 40 - int(self.state["turn"]) % 40
+        for team in [Constants.TEAM.A, Constants.TEAM.B]:
+            cities = [city for city in self.cities.values() if city.team == team]
+            city_tiles = sum(len(city.city_cells) for city in cities)
+            fuel = sum(max(float(city.fuel), 0.0) for city in cities)
+            required = sum(max(float(city.get_light_upkeep()), 0.0) * remaining_turns for city in cities)
+            margins = [
+                (float(city.fuel) - float(city.get_light_upkeep()) * remaining_turns)
+                / max(float(city.get_light_upkeep()) * remaining_turns, 1.0)
+                for city in cities
+            ]
+            self.diagnostic_events.append(
+                {
+                    "event": "night_fuel_snapshot",
+                    "turn": int(self.state["turn"]),
+                    "team": int(team),
+                    "city_count": len(cities),
+                    "city_tiles": city_tiles,
+                    "peak_city_tiles": int(self.diagnostic_peak_city_tiles[team]),
+                    "fuel": fuel,
+                    "required_fuel": required,
+                    "fuel_margin": max(-1.0, min(1.0, (fuel - required) / max(required, 1.0))),
+                    "min_city_fuel_margin": max(-1.0, min(1.0, min(margins, default=-1.0))),
+                }
+            )
 
     def handle_night(self):
         """

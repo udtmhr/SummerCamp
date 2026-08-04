@@ -36,6 +36,7 @@ luxai2021 = [
     "game/game_constants.json",
     "env/rng/rng.js",
     "env/rng/seedrandom.js",
+    "rl/lux_s1_rules.md",
 ]
 
 [[tool.uv.index]]

@@ -16,16 +16,21 @@ import sys
 import threading
 import time
 import traceback
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 
 from luxai2021.imitation.agent import BehaviorCloningAgent, FirstPlaceAgent
 from luxai2021.imitation.data import ReplayBatchSampler
-from luxai2021.imitation.distillation import LuxDistillationDataset, compact_distillation_collate
+from luxai2021.imitation.distillation import (
+    LuxDistillationDataset,
+    compact_distillation_collate,
+    prepared_distillation_cache_path,
+)
 from luxai2021.imitation.model import load_bc_checkpoint
 from luxai2021.rl.batched_rollout import (
     ActorCriticBatcher,
@@ -33,7 +38,12 @@ from luxai2021.rl.batched_rollout import (
     BehaviorCloningBatcher,
     FirstPlaceBatcher,
 )
-from luxai2021.rl.evaluation import LeagueMember, acceptance_report, evaluate_against_league
+from luxai2021.rl.evaluation import (
+    LeagueMember,
+    acceptance_report,
+    evaluate_against_league,
+    paired_seed_deltas,
+)
 from luxai2021.rl.evolution import (
     CandidateResult,
     CodexCandidateGenerator,
@@ -44,8 +54,10 @@ from luxai2021.rl.evolution import (
     add_candidate_reflection,
     approximate_ast_distance,
     initial_candidate,
+    lux_s1_rules_context,
     mutate_candidate,
     select_elites,
+    training_curriculum,
 )
 from luxai2021.rl.job_api import JOB_API_VERSION, JobApiClient, JobApiServer, extract_artifact_directory
 from luxai2021.rl.notifications import EvolutionNotifier
@@ -60,7 +72,7 @@ from luxai2021.rl.ppo import (
 from luxai2021.rl.reward import RewardProgram, calibrate_reward_scale
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping
+    from collections.abc import Callable, Iterator
 
     from luxai2021.env.agent import Agent
 
@@ -119,6 +131,10 @@ _RUN_MANIFEST_ARGUMENTS = (
     "final_seed_start",
     "bc_batch_size",
     "bc_replays",
+    "bc_anchor_max_turns",
+    "bc_anchor_sampling",
+    "curriculum_profile",
+    "teacher_noninferiority_margin",
     "no_bc_anchor",
     "recover_stale_job_seconds",
     "critic_warmup_episodes",
@@ -180,13 +196,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final-count", type=int, default=2)
     parser.add_argument("--episodes-per-update", type=int, default=2)
     parser.add_argument("--max-turns", type=int, default=360)
-    parser.add_argument("--screening-seeds", type=int, default=4)
-    parser.add_argument("--medium-seeds", type=int, default=8)
-    parser.add_argument("--final-seeds", type=int, default=50)
+    parser.add_argument("--screening-seeds", type=int, default=12)
+    parser.add_argument("--medium-seeds", type=int, default=24)
+    parser.add_argument("--final-seeds", type=int, default=100)
     parser.add_argument("--screening-seed-start", type=int, default=100_000)
     parser.add_argument("--final-seed-start", type=int, default=200_000)
     parser.add_argument("--bc-batch-size", type=int, default=8)
-    parser.add_argument("--bc-replays", type=int, default=32)
+    parser.add_argument("--bc-replays", type=int, default=128)
+    parser.add_argument("--bc-anchor-max-turns", type=int, default=0)
+    parser.add_argument(
+        "--bc-anchor-sampling",
+        choices=("phase-balanced", "replay"),
+        default="phase-balanced",
+    )
+    parser.add_argument(
+        "--curriculum-profile",
+        choices=("teacher_guarded_near_sparse", "terminal_only_ablation", "legacy"),
+        default="teacher_guarded_near_sparse",
+    )
+    parser.add_argument("--teacher-noninferiority-margin", type=float, default=0.02)
     parser.add_argument("--codex-executable", default="codex")
     parser.add_argument("--codex-model")
     parser.add_argument("--codex-timeout", type=int, default=900)
@@ -439,6 +467,48 @@ def _validate_run_kind(manifest: Mapping[str, object], *, dry_run: bool) -> None
         raise ValueError(message)
 
 
+class PhaseBalancedBatchSampler(Sampler[list[int]]):
+    """Sample early/late and day/night turns evenly from prepared replay data."""
+
+    def __init__(self, dataset: LuxDistillationDataset, batch_size: int, *, seed: int) -> None:
+        if batch_size < 1:
+            raise ValueError("BC anchor batch size must be positive")
+        self.batch_size = batch_size
+        self.seed = seed
+        self.epoch = 0
+        self.strata: list[list[int]] = [[] for _ in range(8)]
+        for index, (_, turn, _) in enumerate(dataset.samples):
+            phase = min(max(int(turn), 0) // 90, 3)
+            night = int(turn) % 40 >= 30
+            self.strata[phase * 2 + int(night)].append(index)
+        if any(not values for values in self.strata):
+            missing = [index for index, values in enumerate(self.strata) if not values]
+            message = f"BC anchor dataset is missing phase/day-night strata: {missing}"
+            raise ValueError(message)
+        self.batch_count = (len(dataset) + batch_size - 1) // batch_size
+
+    def __iter__(self) -> Iterator[list[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+        pools = [values.copy() for values in self.strata]
+        for values in pools:
+            rng.shuffle(values)
+        offsets = [0] * len(pools)
+        for batch_index in range(self.batch_count):
+            batch = []
+            for local_index in range(self.batch_size):
+                stratum = (batch_index * self.batch_size + local_index) % len(pools)
+                if offsets[stratum] >= len(pools[stratum]):
+                    rng.shuffle(pools[stratum])
+                    offsets[stratum] = 0
+                batch.append(pools[stratum][offsets[stratum]])
+                offsets[stratum] += 1
+            yield batch
+
+    def __len__(self) -> int:
+        return self.batch_count
+
+
 def build_anchor_provider(
     base_checkpoint: Path,
     *,
@@ -447,20 +517,52 @@ def build_anchor_provider(
     batch_size: int,
     replay_count: int,
     seed: int,
+    max_turns: int = 0,
+    sampling: str = "phase-balanced",
 ) -> Callable[[], Mapping[str, torch.Tensor]]:
     _, checkpoint = load_bc_checkpoint(str(base_checkpoint), "cpu")
-    replay_paths = [Path(path) for path in checkpoint["split"]["train"][:replay_count]]
+    train_paths = [Path(path) for path in checkpoint["split"]["train"]]
+    rng = random.Random(seed)
+    rng.shuffle(train_paths)
+    replay_paths = train_paths[:replay_count]
+    missing_replays = [path for path in replay_paths if not path.exists()]
+    if missing_replays:
+        preview = ", ".join(str(path) for path in missing_replays[:8])
+        message = f"BC anchor replay files are missing ({len(missing_replays)}): {preview}"
+        raise FileNotFoundError(message)
+    missing_cache = [
+        path
+        for path in replay_paths
+        if not prepared_distillation_cache_path(path, prepared_cache_dir).exists()
+    ]
+    if missing_cache:
+        preview = ", ".join(str(path) for path in missing_cache[:8])
+        replay_root = Path(os.path.commonpath([str(path.parent) for path in replay_paths]))
+        message = (
+            f"Prepared BC anchor caches are missing for {len(missing_cache)} replay(s): {preview}. "
+            "Run: uv run --locked python examples/precompute_distillation_dataset.py "
+            f"--replay-dir {replay_root} --teacher-cache-dir {teacher_cache_dir} "
+            f"--output-dir {prepared_cache_dir}"
+        )
+        raise FileNotFoundError(message)
     dataset = LuxDistillationDataset(
         replay_paths,
         teacher_cache_dir,
         winner_weight=1.0,
         seed=seed,
-        max_turns=64,
+        max_turns=max_turns,
         prepared_cache_dir=prepared_cache_dir,
     )
+    if sampling == "phase-balanced":
+        batch_sampler: Sampler[list[int]] = PhaseBalancedBatchSampler(dataset, batch_size, seed=seed)
+    elif sampling == "replay":
+        batch_sampler = ReplayBatchSampler(dataset, batch_size, shuffle=True, seed=seed)
+    else:
+        message = f"Unknown BC anchor sampling mode: {sampling}"
+        raise ValueError(message)
     loader = DataLoader(
         dataset,
-        batch_sampler=ReplayBatchSampler(dataset, batch_size, shuffle=True, seed=seed),
+        batch_sampler=batch_sampler,
         collate_fn=compact_distillation_collate,
         num_workers=0,
         pin_memory=True,
@@ -567,10 +669,16 @@ def train_candidate(
     episodes_per_update: int,
     bc_batch_size: int,
     bc_replays: int,
+    bc_anchor_max_turns: int,
+    bc_anchor_sampling: str,
+    bc_anchor_seed: int | None,
     use_bc_anchor: bool,
     device: torch.device,
     seed: int,
     max_turns: int,
+    curriculum_profile: str = "legacy",
+    curriculum_total_decisions: int | None = None,
+    curriculum_start_decisions: int = 0,
     inherit_from: Path | None = None,
     parent_reward_program: RewardProgram | None = None,
     parent_effective_scale: float | None = None,
@@ -582,6 +690,7 @@ def train_candidate(
 ) -> tuple[Path, dict[str, object]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     base_checkpoint_sha256 = _sha256_file(base_checkpoint)
+    _, base_source = load_bc_checkpoint(str(base_checkpoint), "cpu")
     actor_critic = FullTurnActorCritic.from_checkpoint(base_checkpoint, device)
     inherited_modules: list[str] = []
     inherited_hash = None
@@ -613,8 +722,12 @@ def train_candidate(
             prepared_cache_dir=prepared_cache_dir,
             batch_size=bc_batch_size,
             replay_count=bc_replays,
-            seed=seed,
+            seed=seed if bc_anchor_seed is None else bc_anchor_seed,
+            max_turns=bc_anchor_max_turns,
+            sampling=bc_anchor_sampling,
         )
+    curriculum = training_curriculum(curriculum_profile)
+    curriculum_total = max(1, int(curriculum_total_decisions or decision_budget or decisions_per_update))
     actor_critic.eval()
     start_update = 0
     cumulative_decisions = 0
@@ -623,7 +736,7 @@ def train_candidate(
     previous_elapsed_seconds = 0.0
     resumed_metrics: dict[str, object] | None = None
     rng = random.Random(seed)
-    constraint_progress = 0
+    constraint_progress = max(0, int(curriculum_start_decisions))
     joint_update = 0
     resume_metadata: dict[str, object] | None = None
 
@@ -634,15 +747,14 @@ def train_candidate(
             candidate.ppo_config,
             device,
             bc_batch_provider=bc_provider,
-            parameter_constraint_coefficient=(
-                candidate.parameter_constraint_coefficient if inherit_from is not None else 0.0
-            ),
+            parameter_constraint_coefficient=candidate.parameter_constraint_coefficient,
             parameter_constraint_decay_decisions=max(
                 1,
                 constraint_decay_decisions or (decision_budget or decisions_per_update) // 2,
             ),
             constrain_value_head=candidate.inheritance_mode == "policy_value",
             value_parameter_reference=parent_value_reference,
+            parameter_constraint_end_fraction=curriculum.parameter_constraint_end_fraction,
         )
 
     trainer = make_trainer()
@@ -668,7 +780,7 @@ def train_candidate(
         }
         start_update = resume_state.next_update
         resumed_metrics = resume_state.metrics
-        constraint_progress = resume_state.constraint_progress
+        constraint_progress = max(resume_state.constraint_progress, int(curriculum_start_decisions))
         joint_update = resume_state.joint_update
         if resume_budget_progress:
             cumulative_decisions = resume_state.cumulative_decisions
@@ -702,7 +814,12 @@ def train_candidate(
     critic_warmup: dict[str, float] | None = None
     critic_calibration: dict[str, float | bool] | None = None
     if resume_from is not None and isinstance(resumed_metrics, dict):
-        resumed_scale = float(resumed_metrics.get("effective_reward_scale", candidate.reward_program.reward_scale))
+        resumed_scale = float(
+            resumed_metrics.get(
+                "calibrated_reward_scale",
+                resumed_metrics.get("effective_reward_scale", candidate.reward_program.reward_scale),
+            )
+        )
         effective_reward_program = RewardProgram(
             candidate.reward_program.components,
             candidate.reward_program.derived_metrics,
@@ -772,8 +889,15 @@ def train_candidate(
     deadline = time.monotonic() + max(0.0, seconds - previous_elapsed_seconds)
     history = []
     diagnostic_events: list[dict[str, object]] = []
+    milestone_dir = output_dir / "milestones"
+    milestone_dir.mkdir(exist_ok=True)
+    milestone_points = (0.30, 0.60, 0.80, 1.00)
+    saved_milestones = {
+        point for point in milestone_points if (milestone_dir / f"p{round(point * 100):03d}.pt").exists()
+    }
     update = start_update
     started_at = time.monotonic()
+    opponent_episode_counts = dict.fromkeys(("self_base", "other_base", "teacher", "snapshot"), 0)
     try:
         while (
             cumulative_decisions < decision_budget
@@ -792,16 +916,27 @@ def train_candidate(
                 if target_update_decisions is None:
                     wave_size = min(wave_size, episodes_per_update - len(episodes))
                 specs = []
-                opponent_key = candidate.opponent_mix.choose(rng)
+                curriculum_progress = min(max(constraint_progress / curriculum_total, 0.0), 1.0)
+                active_opponent_mix = curriculum.opponent_mix(candidate.opponent_mix, curriculum_progress)
+                shaping_multiplier = curriculum.shaping_multiplier(curriculum_progress)
+                scheduled_reward_program = RewardProgram(
+                    effective_reward_program.components,
+                    effective_reward_program.derived_metrics,
+                    reward_scale=effective_reward_program.reward_scale * shaping_multiplier,
+                    gamma=effective_reward_program.gamma,
+                    version=effective_reward_program.version,
+                )
+                opponent_key = active_opponent_mix.choose(rng)
                 opponent_name, factory = pool[opponent_key]
                 for _ in range(wave_size):
                     episode_seed = seed + episode_index
                     episode_index += 1
                     specs.append((factory, episode_seed, opponent_name))
+                    opponent_episode_counts[opponent_key] += 1
                 wave = collect_episodes_batched(
                     actor_critic,
                     specs,
-                    effective_reward_program,
+                    scheduled_reward_program,
                     device=device,
                     inference_backend=candidate_batcher.submit,
                     max_turns=max_turns,
@@ -819,6 +954,13 @@ def train_candidate(
             joint_update += 1
             cumulative_turns += int(metrics["turns"])
             diagnostic_events.extend(event for episode in episodes for event in episode.diagnostic_events)
+            reward_values = [record.reward for episode in episodes for record in episode.records]
+            terminal_values = [episode.outcome for episode in episodes]
+            shaping_values = []
+            for episode in episodes:
+                for record_index, record in enumerate(episode.records):
+                    terminal = episode.outcome if record_index + 1 == len(episode.records) else 0.0
+                    shaping_values.append(record.reward - terminal)
             metrics.update(
                 {
                     "update": update,
@@ -831,7 +973,17 @@ def train_candidate(
                     "candidate_inference": candidate_batcher.metrics(),
                     "opponent_inference": opponent_resources.metrics(),
                     "rollout_envs": rollout_envs,
-                    "effective_reward_scale": effective_reward_program.reward_scale,
+                    "calibrated_reward_scale": effective_reward_program.reward_scale,
+                    "effective_reward_scale": scheduled_reward_program.reward_scale,
+                    "reward_shaping_multiplier": shaping_multiplier,
+                    "reward_total_abs_mean": sum(abs(value) for value in reward_values) / max(len(reward_values), 1),
+                    "reward_terminal_abs_mean": sum(abs(value) for value in terminal_values)
+                    / max(len(terminal_values), 1),
+                    "reward_shaping_abs_mean": sum(abs(value) for value in shaping_values)
+                    / max(len(shaping_values), 1),
+                    "curriculum_progress": curriculum_progress,
+                    "effective_opponent_mix": asdict(active_opponent_mix),
+                    "opponent_episode_counts": dict(opponent_episode_counts),
                     "constraint_progress": constraint_progress,
                     "joint_update": joint_update,
                     "actor_lr_multiplier": trainer.actor_lr_multiplier,
@@ -855,6 +1007,22 @@ def train_candidate(
                     "joint_update": joint_update,
                 },
             )
+            completed_progress = min(max(constraint_progress / curriculum_total, 0.0), 1.0)
+            for milestone in milestone_points:
+                if milestone not in saved_milestones and completed_progress >= milestone:
+                    actor_critic.export_policy(
+                        milestone_dir / f"p{round(milestone * 100):03d}.pt",
+                        epoch=update,
+                        metrics={"validation": metrics, "ppo": metrics},
+                        split=base_source["split"],
+                        metadata={
+                            "candidate_id": candidate.candidate_id,
+                            "curriculum_progress": completed_progress,
+                            "curriculum_profile": curriculum.name,
+                            "source_checkpoint": str(base_checkpoint),
+                        },
+                    )
+                    saved_milestones.add(milestone)
             if checkpoint_callback is not None:
                 checkpoint_callback(output_dir, metrics)
             update += 1
@@ -866,7 +1034,6 @@ def train_candidate(
     final_metrics = history[-1] if history else resumed_metrics
     if final_metrics is None:
         raise RuntimeError("Training completed without a checkpoint or a PPO update")
-    _, source = load_bc_checkpoint(str(base_checkpoint), "cpu")
     summary = {
         "candidate_id": candidate.candidate_id,
         "base_name": base_name,
@@ -886,6 +1053,16 @@ def train_candidate(
         "resume": resume_metadata,
         "ppo_config": asdict(candidate.ppo_config),
         "opponent_mix": asdict(candidate.opponent_mix),
+        "training_curriculum": curriculum.to_dict(),
+        "curriculum_total_decisions": curriculum_total,
+        "curriculum_start_decisions": max(0, int(curriculum_start_decisions)),
+        "curriculum_milestones": [f"p{round(point * 100):03d}.pt" for point in sorted(saved_milestones)],
+        "bc_anchor": {
+            "replays": bc_replays,
+            "max_turns": bc_anchor_max_turns,
+            "sampling": bc_anchor_sampling,
+            "seed": seed if bc_anchor_seed is None else bc_anchor_seed,
+        },
         "decision_budget": decision_budget,
         "decisions_per_update": decisions_per_update,
         "rollout_envs": rollout_envs,
@@ -897,7 +1074,7 @@ def train_candidate(
         output_dir / "best.pt",
         epoch=max(0, update - 1),
         metrics={"validation": final_metrics, "ppo": final_metrics},
-        split=source["split"],
+        split=base_source["split"],
         metadata=summary,
     )
     (output_dir / "metrics.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -949,6 +1126,9 @@ def _effective_scale_from_artifact(checkpoint: Path, fallback: float) -> float:
     if not metrics_path.exists():
         return fallback
     value = json.loads(metrics_path.read_text(encoding="utf-8"))
+    final_metrics = value.get("final_metrics", {})
+    if isinstance(final_metrics, dict) and "calibrated_reward_scale" in final_metrics:
+        return float(final_metrics["calibrated_reward_scale"])
     effective = value.get("effective_reward_program", {})
     return float(effective.get("reward_scale", fallback)) if isinstance(effective, dict) else fallback
 
@@ -961,6 +1141,61 @@ def _final_training_metrics(training: Mapping[str, object]) -> Mapping[str, obje
     if isinstance(history, list) and history and isinstance(history[-1], dict):
         return history[-1]
     raise RuntimeError("Training result does not contain final PPO metrics")
+
+
+def _curriculum_start_decisions(stage: str, args: argparse.Namespace) -> int:
+    if stage.startswith("medium-"):
+        return int(args.short_decisions)
+    if stage.startswith("final-"):
+        return int(args.short_decisions) + int(args.medium_decisions)
+    return 0
+
+
+def _select_teacher_milestone(
+    output_dir: Path,
+    *,
+    candidate_id: str,
+    teacher_checkpoint: Path,
+    seed_start: int,
+    seed_count: int,
+    device: str,
+    max_turns: int,
+) -> tuple[Path, dict[str, object]]:
+    checkpoints = sorted((output_dir / "milestones").glob("p*.pt"))
+    if not checkpoints:
+        return output_dir / "best.pt", {"enabled": True, "reason": "no_milestones"}
+    teacher = LeagueMember("first-place", teacher_checkpoint, model_type="first-place")
+    evaluations = []
+    for index, checkpoint in enumerate(checkpoints):
+        evaluation = evaluate_against_league(
+            LeagueMember(f"{candidate_id}-{checkpoint.stem}", checkpoint),
+            [teacher],
+            seed_start=seed_start,
+            seed_count=seed_count,
+            device=device,
+            max_turns=max_turns,
+        )
+        evaluations.append(
+            {
+                "checkpoint": str(checkpoint),
+                "teacher_score_rate": float(evaluation["totals"]["score_rate"]),
+                "order": index,
+            }
+        )
+    selected = max(evaluations, key=lambda value: (value["teacher_score_rate"], value["order"]))
+    report = {
+        "enabled": True,
+        "seed_start": seed_start,
+        "seed_count": seed_count,
+        "selection_policy": "highest_teacher_score_rate_then_latest",
+        "selected_checkpoint": selected["checkpoint"],
+        "evaluations": evaluations,
+    }
+    (output_dir / "milestone_selection.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return Path(str(selected["checkpoint"])), report
 
 
 def candidate_result(
@@ -1017,6 +1252,7 @@ def candidate_result(
         if inherit_from is not None and parent is not None
         else None
     )
+    curriculum_total_decisions = args.short_decisions + args.medium_decisions + args.final_decisions
     try:
         checkpoint, training = train_candidate(
             candidate,
@@ -1034,19 +1270,36 @@ def candidate_result(
             episodes_per_update=args.episodes_per_update,
             bc_batch_size=args.bc_batch_size,
             bc_replays=args.bc_replays,
+            bc_anchor_max_turns=args.bc_anchor_max_turns,
+            bc_anchor_sampling=args.bc_anchor_sampling,
+            bc_anchor_seed=args.seed,
             use_bc_anchor=not args.no_bc_anchor,
             device=device,
             seed=args.seed + candidate.generation * 10_000 + candidate.island * 100,
             max_turns=args.max_turns,
+            curriculum_profile=args.curriculum_profile,
+            curriculum_total_decisions=curriculum_total_decisions,
+            curriculum_start_decisions=_curriculum_start_decisions(stage, args),
             inherit_from=inherit_from,
             parent_reward_program=parent.reward_program if parent is not None else None,
             parent_effective_scale=parent_effective_scale,
             critic_warmup_episodes=args.critic_warmup_episodes,
-            constraint_decay_decisions=max(1, args.short_decisions // 2),
+            constraint_decay_decisions=max(1, curriculum_total_decisions),
             resume_from=resume_from,
             resume_budget_progress=resume_from == current_checkpoint,
             checkpoint_callback=checkpoint_callback,
         )
+        milestone_selection: dict[str, object] = {"enabled": False}
+        if args.curriculum_profile != "legacy" and stage.startswith("final-"):
+            checkpoint, milestone_selection = _select_teacher_milestone(
+                output_dir,
+                candidate_id=candidate.candidate_id,
+                teacher_checkpoint=Path(args.teacher_checkpoint),
+                seed_start=eval_seed_start,
+                seed_count=min(eval_seeds, args.screening_seeds),
+                device=str(device),
+                max_turns=args.max_turns,
+            )
         anchors = _evaluation_anchors(args)
         evaluation = evaluate_against_league(
             LeagueMember(f"{candidate.candidate_id}-{base_name}", checkpoint),
@@ -1087,6 +1340,7 @@ def candidate_result(
             "training": training,
             "evaluation": evaluation,
             "checkpoint": str(checkpoint),
+            "milestone_selection": milestone_selection,
             "diagnostics_artifact": diagnostics_path.name,
         }
         return CandidateResult(
@@ -1176,6 +1430,19 @@ def _apply_coordinator_manifest(args: argparse.Namespace, manifest: Mapping[str,
     for name in _RUN_MANIFEST_ARGUMENTS:
         if name in coordinator_args:
             setattr(args, name, coordinator_args[name])
+    if "curriculum_profile" not in coordinator_args and hasattr(args, "curriculum_profile"):
+        args.curriculum_profile = "legacy"
+        args.bc_anchor_max_turns = 64
+        args.bc_anchor_sampling = "replay"
+    expected_rules = manifest.get("lux_s1_rules")
+    if expected_rules is not None:
+        current_rules = lux_s1_rules_context()
+        rules_changed = (
+            not isinstance(expected_rules, dict)
+            or expected_rules.get("summary_sha256") != current_rules["summary_sha256"]
+        )
+        if rules_changed:
+            raise ValueError("Lux S1 rules summary changed; start a new run directory")
 
 
 def _sync_api_claim(
@@ -1525,14 +1792,31 @@ def _select_completed_stage(
     *,
     stage: str,
     count: int,
+    baseline: Mapping[str, object] | None = None,
 ) -> list[str]:
+    def ranking_key(result: CandidateResult) -> tuple[float, ...]:
+        if baseline is None or result.status != "completed":
+            return result.fitness
+        evaluation = result.metrics.get("evaluation", {}) if isinstance(result.metrics, Mapping) else {}
+        if not isinstance(evaluation, dict):
+            return result.fitness
+        seed_deltas, anchor_deltas = paired_seed_deltas(evaluation, dict(baseline))
+        teacher_delta = float(anchor_deltas.get("first-place", -1.0))
+        base_delta = max(
+            (float(value) for name, value in anchor_deltas.items() if name != "first-place"),
+            default=-1.0,
+        )
+        combined_delta = sum(seed_deltas.values()) / max(len(seed_deltas), 1)
+        valid = float(result.fitness[0] > 0.0)
+        return valid, float(teacher_delta >= 0.0), teacher_delta, combined_delta, base_delta, -result.kl
+
     ranked = sorted(
         (
             result
             for result in results
             if result.stage == stage and result.status == "completed" and result.candidate_id in candidates
         ),
-        key=lambda result: result.fitness,
+        key=ranking_key,
         reverse=True,
     )
     return [result.candidate_id for result in ranked[:count]]
@@ -1548,6 +1832,7 @@ def _load_or_create_stage_selection(
     source_stage: str,
     count: int,
     allow_legacy_unverified: bool = False,
+    baseline: Mapping[str, object] | None = None,
 ) -> list[EvolutionCandidate]:
     path = store.run_dir / "selections" / f"{name}.json"
     eligible = {
@@ -1567,7 +1852,13 @@ def _load_or_create_stage_selection(
             candidate_ids = []
             source = source_stage
         if not candidate_ids:
-            candidate_ids = _select_completed_stage(candidates, results, stage=source_stage, count=count)
+            candidate_ids = _select_completed_stage(
+                candidates,
+                results,
+                stage=source_stage,
+                count=count,
+                baseline=baseline,
+            )
         unverified = [candidate_id for candidate_id in candidate_ids if candidate_id not in eligible]
         path.parent.mkdir(parents=True, exist_ok=True)
         EvolutionStore.write_json(
@@ -1581,6 +1872,8 @@ def _load_or_create_stage_selection(
                 "candidate_ids": candidate_ids,
                 "source_stage_verified": not unverified,
                 "unverified_candidate_ids": unverified,
+                "selection_policy": "teacher_guarded_paired" if baseline is not None else "legacy_fitness",
+                "baseline_context": baseline.get("_context") if baseline is not None else None,
                 "created_at": time.time(),
             },
         )
@@ -1598,6 +1891,44 @@ def _load_or_create_stage_selection(
         message = f"Selection {name!r} contains candidates without completed {source_stage}: {unverified}"
         raise ValueError(message)
     return [candidates[candidate_id] for candidate_id in candidate_ids]
+
+
+def _load_or_create_stage_baseline(
+    store: EvolutionStore,
+    args: argparse.Namespace,
+    *,
+    name: str,
+    seed_start: int,
+    seed_count: int,
+    device: torch.device,
+) -> dict[str, object]:
+    path = store.run_dir / "baselines" / f"{name}.json"
+    context = {
+        "schema_version": 1,
+        "base_name": "resattn8",
+        "checkpoint_sha256": _sha256_file(Path(args.resattn8_checkpoint)),
+        "seed_start": seed_start,
+        "seed_count": seed_count,
+        "max_turns": args.max_turns,
+    }
+    if path.exists():
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if value.get("_context") != context:
+            message = f"Stage baseline context changed: {path}"
+            raise ValueError(message)
+        return value
+    path.parent.mkdir(exist_ok=True)
+    value = evaluate_against_league(
+        LeagueMember("resattn8-baseline-eval", Path(args.resattn8_checkpoint)),
+        _evaluation_anchors(args),
+        seed_start=seed_start,
+        seed_count=seed_count,
+        device=str(device),
+        max_turns=args.max_turns,
+    )
+    value["_context"] = context
+    store.write_json(path, value)
+    return value
 
 
 def _archive_unselected_stage_jobs(run_dir: Path, stage: str, selected_ids: set[str]) -> list[Path]:
@@ -1837,6 +2168,12 @@ def main(
         raise ValueError("Population sizes must be positive")
     if args.rollout_envs < 1 or args.decisions_per_update < 1:
         raise ValueError("Rollout environment and decision budgets must be positive")
+    if not args.no_bc_anchor and (args.bc_replays < 1 or args.bc_batch_size < 1):
+        raise ValueError("BC anchor replay and batch counts must be positive")
+    if args.bc_anchor_max_turns < 0:
+        raise ValueError("BC anchor max turns must be non-negative")
+    if not 0.0 <= args.teacher_noninferiority_margin <= 0.1:
+        raise ValueError("Teacher noninferiority margin must be in [0, 0.1]")
     repository = Path(__file__).resolve().parents[1]
     device = resolve_device(args.device)
     if not args.no_codex and not args.dry_run and shutil.which(args.codex_executable) is None:
@@ -1846,7 +2183,7 @@ def main(
     if existing_manifest is None:
         generation_mode = "dry_run" if args.dry_run else ("deterministic" if args.no_codex else "codex")
         manifest = {
-            "schema_version": 2,
+            "schema_version": 3,
             "created_at": time.time(),
             "git_revision": git_revision(repository),
             "arguments": vars(args),
@@ -1860,6 +2197,8 @@ def main(
                 "model": args.codex_model,
                 "executable": args.codex_executable,
             },
+            "lux_s1_rules": lux_s1_rules_context(),
+            "training_curriculum": training_curriculum(args.curriculum_profile).to_dict(),
             "checkpoint_descriptors": {} if args.dry_run else _checkpoint_descriptors(args),
         }
         store.save_manifest(manifest)
@@ -2321,6 +2660,18 @@ def main(
         print(json.dumps({"run_dir": str(run_dir), "candidates": len(candidates), "dry_run": True}))
         return
 
+    screening_baseline = (
+        _load_or_create_stage_baseline(
+            store,
+            args,
+            name="short-resattn8",
+            seed_start=args.screening_seed_start,
+            seed_count=args.screening_seeds,
+            device=device,
+        )
+        if args.curriculum_profile != "legacy"
+        else None
+    )
     medium = _load_or_create_stage_selection(
         store,
         candidates,
@@ -2330,6 +2681,7 @@ def main(
         source_stage="short-resattn8",
         count=args.medium_count,
         allow_legacy_unverified=int(manifest.get("schema_version", 1)) < 2,
+        baseline=screening_baseline,
     )
     _archive_unselected_stage_jobs(
         run_dir,
@@ -2369,6 +2721,18 @@ def main(
             tags=("white_check_mark",),
         )
 
+    medium_baseline = (
+        _load_or_create_stage_baseline(
+            store,
+            args,
+            name="medium-resattn8",
+            seed_start=args.screening_seed_start + 10_000,
+            seed_count=args.medium_seeds,
+            device=device,
+        )
+        if args.curriculum_profile != "legacy"
+        else None
+    )
     finalists = _load_or_create_stage_selection(
         store,
         candidates,
@@ -2378,6 +2742,7 @@ def main(
         source_stage="medium-resattn8",
         count=args.final_count,
         allow_legacy_unverified=int(manifest.get("schema_version", 1)) < 2,
+        baseline=medium_baseline,
     )
     for base_name in _active_base_names(args):
         _archive_unselected_stage_jobs(
@@ -2457,13 +2822,38 @@ def main(
         if not values or not all(result.status == "completed" for result in values):
             continue
         evaluations = {result.stage.removeprefix("final-"): result.metrics["evaluation"] for result in values}
-        acceptance = acceptance_report(evaluations, baseline_evaluations, seed=args.seed)
+        guarded = args.curriculum_profile != "legacy"
+        acceptance = acceptance_report(
+            evaluations,
+            baseline_evaluations,
+            seed=args.seed,
+            enforce_teacher_guard=guarded,
+            teacher_noninferiority_margin=args.teacher_noninferiority_margin,
+            require_survival=guarded,
+        )
         illegal_action_count = sum(
             int(result.metrics.get("reflection", {}).get("diagnostics", {}).get("illegal_action_count", 0))
             for result in values
         )
         acceptance["illegal_action_count"] = illegal_action_count
-        acceptance["promote"] = bool(acceptance["promote"] and illegal_action_count == 0)
+        kl_passes = all(result.kl <= 0.04 for result in values) if guarded else True
+        acceptance["kl_ceiling"] = 0.04 if guarded else None
+        acceptance["kl_passes"] = kl_passes
+        acceptance["promote"] = bool(
+            acceptance["promote"] and illegal_action_count == 0 and kl_passes
+        )
+        acceptance["failure_reasons"] = [
+            reason
+            for reason, failed in (
+                (
+                    "paired_score_or_latency",
+                    not all(report["passes"] for report in acceptance["architectures"].values()),
+                ),
+                ("illegal_action", illegal_action_count != 0),
+                ("kl_ceiling", not kl_passes),
+            )
+            if failed
+        ]
         ranking_rows.append(
             {
                 "candidate_id": candidate_id,

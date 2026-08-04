@@ -365,12 +365,15 @@ class PPOTrainer:
         bc_batch_provider: Callable[[], Mapping[str, Tensor]] | None = None,
         parameter_constraint_coefficient: float = 0.0,
         parameter_constraint_decay_decisions: int = 1,
+        parameter_constraint_end_fraction: float = 0.0,
         constrain_value_head: bool = False,
         value_parameter_reference: Mapping[str, Tensor] | None = None,
         illegal_action_coefficient: float = 0.01,
     ) -> None:
         if parameter_constraint_coefficient < 0:
             raise ValueError("parameter_constraint_coefficient must be non-negative")
+        if not 0.0 <= parameter_constraint_end_fraction <= 1.0:
+            raise ValueError("parameter_constraint_end_fraction must be in [0, 1]")
         self.actor_critic = actor_critic
         self.reference_policy = reference_policy.eval().requires_grad_(requires_grad=False)
         self.config = config
@@ -378,6 +381,7 @@ class PPOTrainer:
         self.bc_batch_provider = bc_batch_provider
         self.parameter_constraint_coefficient = float(parameter_constraint_coefficient)
         self.parameter_constraint_decay_decisions = max(1, int(parameter_constraint_decay_decisions))
+        self.parameter_constraint_end_fraction = float(parameter_constraint_end_fraction)
         self.parameter_constraint_progress = 0
         self.illegal_action_coefficient = float(illegal_action_coefficient)
         reference_named = {
@@ -577,7 +581,9 @@ class PPOTrainer:
 
     def current_parameter_constraint_coefficient(self) -> float:
         fraction = min(max(self.parameter_constraint_progress / self.parameter_constraint_decay_decisions, 0.0), 1.0)
-        return self.parameter_constraint_coefficient * 0.5 * (1.0 + cos(pi * fraction))
+        cosine = 0.5 * (1.0 + cos(pi * fraction))
+        multiplier = self.parameter_constraint_end_fraction + (1.0 - self.parameter_constraint_end_fraction) * cosine
+        return self.parameter_constraint_coefficient * multiplier
 
     def set_schedule_state(self, *, constraint_progress: int, joint_update: int) -> None:
         self.parameter_constraint_progress = max(0, int(constraint_progress))
@@ -610,6 +616,7 @@ class PPOTrainer:
                 "reference_policy": self.reference_policy.state_dict(),
                 "parameter_reference": {name: value.detach().cpu() for name, value in self.parameter_reference.items()},
                 "parameter_constraint_coefficient": self.parameter_constraint_coefficient,
+                "parameter_constraint_end_fraction": self.parameter_constraint_end_fraction,
                 "optimizer": self.optimizer.state_dict(),
                 "ppo_config": asdict(self.config),
                 "reward_program": reward_program.to_dict(),
