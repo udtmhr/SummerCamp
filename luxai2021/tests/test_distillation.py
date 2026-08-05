@@ -304,7 +304,7 @@ def test_flat_augmentation_rotates_labels_masks_and_teacher_logits():
 
 @pytest.mark.parametrize(
     "encoder_type",
-    ["unet", "resattn8", "transformer16", "axial32", "axial32_4m5"],
+    ["unet", "resnet17x32", "resnet17x48", "resattn8", "transformer16", "axial32", "axial32_4m5"],
 )
 def test_all_student_encoders_support_flat_policy_checkpoint(tmp_path, encoder_type):
     model = LuxBehaviorCloningModel(_small_flat_config(encoder_type))

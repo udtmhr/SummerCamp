@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: C901, INP001, PLR0912, PLR0913, PLR0915
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -33,16 +34,27 @@ from luxai2021.imitation.model import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterable, Mapping
 
 DEFAULT_STUDENTS = {
     "unet": "models/bc_v2/best.pt",
+    "resnet17x32": None,
+    "resnet17x48": None,
     "resattn8": None,
     "transformer16": "models/bc_encoder_compare/transformer16/best.pt",
     "axial32": "models/bc_encoder_compare/axial32/best.pt",
     "axial32_4m5": None,
 }
 DEFAULT_LEARNING_RATE = 1e-4
+
+
+def data_split_signature(split: Mapping[str, Iterable[str]]) -> str:
+    serialized = json.dumps(
+        {name: list(paths) for name, paths in sorted(split.items())},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(serialized).hexdigest()
 
 
 def parse_args() -> argparse.Namespace:
@@ -434,6 +446,8 @@ def main() -> None:
     }
     extra_metadata = {
         "teacher_sha256": FIRST_PLACE_TEACHER_SHA256,
+        "data_split_signature": data_split_signature(split),
+        "class_statistics_signature": None,
         "source_student_checkpoint": source_checkpoint,
         "inference_augmentation": "rot180",
         "distillation_config": {

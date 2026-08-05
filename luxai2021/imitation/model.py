@@ -28,7 +28,15 @@ if TYPE_CHECKING:
 CHECKPOINT_SCHEMA_VERSION = 1
 POLICY_SCHEMA_FACTORIZED = "factorized_v1"
 POLICY_SCHEMA_FIRST_PLACE_FLAT = "first_place_flat_v1"
-ENCODER_TYPES = ("unet", "resattn8", "transformer16", "axial32", "axial32_4m5")
+ENCODER_TYPES = (
+    "unet",
+    "resnet17x32",
+    "resnet17x48",
+    "resattn8",
+    "transformer16",
+    "axial32",
+    "axial32_4m5",
+)
 
 
 def _group_count(channels: int) -> int:
@@ -291,6 +299,76 @@ class ResAttnUNet8SpatialEncoder(LuxSpatialEncoder):
             for _ in range(config.resattn8_layers)
         )
         self.bottleneck = nn.ModuleList(blocks)
+
+
+class ResNet17SpatialEncoder(nn.Module):
+    """RLIAYN-inspired full-resolution ResNet with 17 residual blocks."""
+
+    BLOCK_COUNT = 17
+
+    def __init__(self, config: ModelConfig, channels: int) -> None:
+        super().__init__()
+        if config.input_channels != len(FEATURE_NAMES):
+            msg = f"Expected {len(FEATURE_NAMES)} input channels, got {config.input_channels}"
+            raise ValueError(msg)
+        self.cycle_embedding = nn.Embedding(CYCLE_LENGTH, config.cycle_embedding_dim)
+        self.phase_embedding = nn.Embedding(GAME_PHASE_COUNT, config.phase_embedding_dim)
+        self.board_size_embedding = nn.Embedding(len(BOARD_SIZES), config.board_size_embedding_dim)
+        categorical_channels = config.cycle_embedding_dim + config.phase_embedding_dim + config.board_size_embedding_dim
+        input_channels = len(SPATIAL_FEATURE_NAMES) + categorical_channels
+        self.stem = nn.Sequential(
+            nn.Conv2d(input_channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_group_count(channels), channels),
+            nn.SiLU(),
+        )
+        self.blocks = nn.ModuleList(ResidualBlock(channels) for _ in range(self.BLOCK_COUNT))
+        self.output_channels = channels
+        self.global_output_channels = channels * 2 + categorical_channels
+        self.register_buffer(
+            "spatial_indices",
+            torch.tensor([FEATURE_INDEX[name] for name in SPATIAL_FEATURE_NAMES]),
+            persistent=False,
+        )
+
+    @staticmethod
+    def _category_index(inputs: Tensor, name: str, category_count: int) -> Tensor:
+        values = inputs[:, FEATURE_INDEX[name]].amax(dim=(-2, -1))
+        return values.round().long().clamp_(0, category_count - 1)
+
+    def forward_features(self, inputs: Tensor) -> EncoderFeatures:
+        mask = inputs[:, FEATURE_INDEX["board_mask"] : FEATURE_INDEX["board_mask"] + 1]
+        spatial_inputs = inputs.index_select(1, self.spatial_indices)
+        categorical = torch.cat(
+            (
+                self.cycle_embedding(self._category_index(inputs, "day_night_cycle", CYCLE_LENGTH)),
+                self.phase_embedding(self._category_index(inputs, "game_phase", GAME_PHASE_COUNT)),
+                self.board_size_embedding(self._category_index(inputs, "board_size", len(BOARD_SIZES))),
+            ),
+            dim=1,
+        )
+        categorical_map = categorical[:, :, None, None].expand(-1, -1, inputs.shape[-2], inputs.shape[-1])
+        spatial = self.stem(torch.cat((spatial_inputs, categorical_map), dim=1) * mask) * mask
+        for block in self.blocks:
+            spatial = block(spatial, mask)
+
+        valid_count = mask.sum(dim=(-2, -1)).clamp_min(1)
+        pooled_average = (spatial * mask).sum(dim=(-2, -1)) / valid_count
+        pooled_maximum = spatial.masked_fill(mask <= 0, torch.finfo(spatial.dtype).min).amax(dim=(-2, -1))
+        global_features = torch.cat((pooled_average, pooled_maximum, categorical), dim=1)
+        return EncoderFeatures(spatial=spatial, global_features=global_features)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.forward_features(inputs).spatial
+
+
+class ResNet17x32SpatialEncoder(ResNet17SpatialEncoder):
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__(config, channels=32)
+
+
+class ResNet17x48SpatialEncoder(ResNet17SpatialEncoder):
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__(config, channels=48)
 
 
 class Transformer16SpatialEncoder(nn.Module):
@@ -561,6 +639,8 @@ class LuxBehaviorCloningModel(nn.Module):
         self.config = config or ModelConfig()
         encoder_types = {
             "unet": LuxSpatialEncoder,
+            "resnet17x32": ResNet17x32SpatialEncoder,
+            "resnet17x48": ResNet17x48SpatialEncoder,
             "resattn8": ResAttnUNet8SpatialEncoder,
             "transformer16": Transformer16SpatialEncoder,
             "axial32": Axial32SpatialEncoder,

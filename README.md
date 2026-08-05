@@ -355,10 +355,15 @@ flags, corrected cooldown normalization, and categorical embeddings for the 40-t
 board size. The encoder masks padding at every U-Net stage and exposes pooled global features for a future
 RL value head.
 
-Five encoders can be trained with the same observation, action heads, and viable-action
+Seven encoders can be trained with the same observation, action heads, and viable-action
 masks:
 
 - `unet` is the default 32x32 residual U-Net.
+- `resnet17x32` is an RLIAYN-inspired full-resolution ResNet with 17 residual blocks and 32 channels.
+  `resnet17x48` is its capacity-control variant with 48 channels. Both retain this project's observation,
+  action heads, legal-action masks, and pooled RL value features; they are not exact reproductions of the
+  unpublished RLIAYN implementation. Their flat distillation policies have 364,700 and 781,116 parameters,
+  respectively.
 - `resattn8` is the recommended compact hybrid: a 48/96/192-channel residual U-Net with two global SDPA
   blocks only at the 8x8 bottleneck. Its flat distillation policy has 4,409,500 parameters.
 - `transformer16` applies an eight-layer Transformer to 16x16 tokens and decodes through a 32x32 skip.
@@ -568,6 +573,30 @@ uv run --locked python examples/train_distilled_bc.py \
   --amp-dtype bfloat16 \
   --device cuda
 ```
+
+For an architecture-only comparison, train the two RLIAYN-inspired widths against the same prepared cache and
+training settings. Fresh `resnet17x32` and `resnet17x48` runs intentionally start directly from distillation:
+
+```bash
+for encoder in resnet17x32 resnet17x48; do
+  uv run --locked python examples/train_distilled_bc.py \
+    --encoder-type "$encoder" \
+    --replay-dir replay_datasets \
+    --teacher-cache-dir models/teachers/lux_2021_first_place/cache \
+    --prepared-cache-dir models/teachers/lux_2021_first_place/prepared \
+    --output-dir "models/distilled/$encoder" \
+    --batch-size 64 \
+    --num-workers 8 \
+    --prefetch-factor 2 \
+    --amp-dtype bfloat16 \
+    --seed 42 \
+    --device cuda
+done
+```
+
+Keep the replay split, seed, effective batch size, epoch count, teacher cache, and augmentation fixed when comparing
+these runs with `resattn8`. Parameter count, best validation metrics, throughput, and peak memory can be summarized
+with `examples/compare_bc_architectures.py`; strength still requires matched-seed games with swapped teams.
 
 `resattn8` starts directly from distillation unless `--student-checkpoint` supplies a matching pretrained
 checkpoint. The full Transformer encoders remain loadable for existing checkpoint compatibility but are no longer

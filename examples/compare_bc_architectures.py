@@ -18,6 +18,7 @@ _ACTIVE_ACCURACY_NAMES = (
     "city_active_accuracy",
 )
 _MINIMUM_RUN_COUNT = 2
+_ARCHITECTURE_VARIANT_FIELDS = frozenset(("encoder_type", "output_dir"))
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,18 +55,31 @@ def load_runs(values: Sequence[str]) -> dict[str, Mapping[str, object]]:
     return runs
 
 
+def _comparable_training_config(metrics: Mapping[str, object]) -> dict[str, object]:
+    config = metrics.get("training_config")
+    if not isinstance(config, dict):
+        return {}
+    return {name: value for name, value in config.items() if name not in _ARCHITECTURE_VARIANT_FIELDS}
+
+
 def validate_comparable_runs(runs: Mapping[str, Mapping[str, object]]) -> None:
     first_name, first = next(iter(runs.items()))
-    required = ("data_split_signature", "class_statistics_signature", "training_config")
+    required = ("data_split_signature", "class_statistics_signature")
     for field in required:
         if field not in first:
             message = f"Run {first_name} does not contain {field}"
             raise ValueError(message)
+    if not isinstance(first.get("training_config"), dict):
+        message = f"Run {first_name} does not contain training_config"
+        raise TypeError(message)
     for name, metrics in list(runs.items())[1:]:
         for field in required:
             if metrics.get(field) != first[field]:
                 message = f"Run {name} has a different {field}"
                 raise ValueError(message)
+        if _comparable_training_config(metrics) != _comparable_training_config(first):
+            message = f"Run {name} has a different training_config"
+            raise ValueError(message)
 
 
 def summarize_run(name: str, metrics: Mapping[str, object]) -> dict[str, object]:
@@ -108,7 +122,7 @@ def build_comparison(runs: Mapping[str, Mapping[str, object]]) -> dict[str, obje
         "winner": rows[0]["name"],
         "data_split_signature": first["data_split_signature"],
         "class_statistics_signature": first["class_statistics_signature"],
-        "training_config": first["training_config"],
+        "training_config": _comparable_training_config(first),
         "runs": rows,
     }
 

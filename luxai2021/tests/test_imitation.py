@@ -341,7 +341,7 @@ def test_encoder_masks_padding_and_returns_global_features():
 
 @pytest.mark.parametrize(
     "encoder_type",
-    ["unet", "resattn8", "transformer16", "axial32", "axial32_4m5"],
+    ["unet", "resnet17x32", "resnet17x48", "resattn8", "transformer16", "axial32", "axial32_4m5"],
 )
 @pytest.mark.parametrize("board_size", BOARD_SIZES)
 def test_all_encoders_mask_padding_and_return_finite_features(encoder_type, board_size):
@@ -374,7 +374,7 @@ def test_all_encoders_mask_padding_and_return_finite_features(encoder_type, boar
     features = output["features"]
     mask = observation[:, FEATURE_INDEX["board_mask"] : FEATURE_INDEX["board_mask"] + 1]
 
-    assert features.shape == (1, 16, 32, 32)
+    assert features.shape == (1, model.encoder.output_channels, 32, 32)
     assert torch.isfinite(features).all()
     assert torch.isfinite(output["global_features"]).all()
     assert not features.masked_select(mask == 0).any()
@@ -476,8 +476,22 @@ def test_resattn8_has_expected_flat_policy_parameter_count():
 
 
 @pytest.mark.parametrize(
+    ("encoder_type", "expected_parameter_count"),
+    [("resnet17x32", 364_700), ("resnet17x48", 781_116)],
+)
+def test_resnet17_has_expected_flat_policy_parameter_count(encoder_type, expected_parameter_count):
+    config = ModelConfig(
+        encoder_type=encoder_type,
+        policy_schema=POLICY_SCHEMA_FIRST_PLACE_FLAT,
+    )
+    parameter_count = sum(parameter.numel() for parameter in LuxBehaviorCloningModel(config).parameters())
+
+    assert parameter_count == expected_parameter_count
+
+
+@pytest.mark.parametrize(
     "encoder_type",
-    ["unet", "resattn8", "transformer16", "axial32", "axial32_4m5"],
+    ["unet", "resnet17x32", "resnet17x48", "resattn8", "transformer16", "axial32", "axial32_4m5"],
 )
 def test_encoder_checkpoint_round_trip(tmp_path, encoder_type):
     config = ModelConfig(
@@ -797,6 +811,17 @@ def test_architecture_comparison_ranks_loss_and_rejects_mismatched_split():
                 "second": _comparison_metrics(1.0, split_signature="different"),
             }
         )
+
+
+def test_architecture_comparison_allows_encoder_and_output_path_to_differ():
+    first = _comparison_metrics(1.0)
+    second = _comparison_metrics(1.1)
+    first["training_config"] = {"encoder_type": "resnet17x32", "output_dir": "first", "seed": 42}
+    second["training_config"] = {"encoder_type": "resnet17x48", "output_dir": "second", "seed": 42}
+
+    comparison = build_comparison({"first": first, "second": second})
+
+    assert comparison["training_config"] == {"seed": 42}
 
 
 def test_replay_uses_next_step_actions():
