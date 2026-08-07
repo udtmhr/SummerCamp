@@ -659,8 +659,9 @@ only; proposals are validated before training and cannot execute arbitrary rewar
 action sampling, a training-only value head, reference-policy KL, and the prepared teacher cache as a distillation
 anchor. Exported `best.pt` files remain compatible with `BehaviorCloningAgent`.
 
-New runs embed the official Lux AI Season 1 rules URL and the SHA-256 of the packaged rule summary in the schema-v3
-manifest and every Codex prompt. The search treats the original first-place Teacher as the strongest anchor: Teacher
+New runs embed the official Lux AI Season 1 rules URL and the SHA-256 of the packaged rule summary in the schema-v4
+manifest and every Codex prompt. The manifest fixes reward metric schema v2 so a run cannot mix candidates evaluated
+with different metric sets. The search treats the original first-place Teacher as the strongest anchor: Teacher
 score is ranked before aggregate score, and final promotion requires paired Teacher non-regression as well as a
 non-negative distilled-base delta. The default `teacher_guarded_near_sparse` curriculum raises the Teacher opponent
 floor from 25% to 50%, keeps at least 10% snapshot play, and anneals potential-based shaping from 100% to 5% while
@@ -670,19 +671,23 @@ terminal-only ablation or `legacy` only when reproducing an old run.
 The default BC anchor uses 128 deterministically selected replays, all available turns, and phase-balanced batches
 over four 90-turn phases crossed with day/night. Final stages export curriculum milestones and screen them against the
 Teacher before the selected checkpoint enters the full league evaluation. League reports include city extinction,
-last-night survival, normalized city loss, and per-city night fuel margin; these are promotion gates for new runs.
+last-night survival, normalized city loss, per-city night fuel margin, and the maximum stranded-fuel fraction observed
+at night starts. Guarded promotion allows at most a +0.02 paired mean regression in stranded fuel.
 
 Each Codex feedback record includes the exact turns where city tiles disappeared from night fuel shortage, fuel and
-upkeep at destruction, illegal actions rejected by the engine, the candidate's setting changes from its parent, and
-the resulting score/teacher-score/KL deltas. Dynamic action restrictions are applied only by intersecting them with
+upkeep at destruction, the worst night-start stranded-fuel fraction and turn, illegal actions rejected by the engine,
+the candidate's setting changes from its parent, and the resulting score/teacher-score deltas. Dynamic action
+restrictions are applied only by intersecting them with
 the existing legal-action mask, so an existing forbidden action can never be re-enabled by evolution.
 
 The four islands have fixed roles: `i00` makes one or two coefficient changes, `i01` makes one local AST edit,
 `i02` adds or removes one direct normalized metric, and `i03` performs a free bounded reward redesign, crossover,
 or restart. `feature_generated` remains readable in older candidate files but is never proposed for new candidates.
 Non-restart candidates inherit the primary parent's policy checkpoint; only `i00` also inherits its value head.
-Value-head resets run a critic-only warm-up before PPO, and inherited tensors use a relative L2-SP constraint with
-cosine decay. The illegal-action auxiliary loss acts on unmasked logits while sampling still uses the hard mask.
+Value-head resets run a critic-only warm-up before PPO. Parent-policy KL loss and L2-SP are disabled: PPO clipping,
+the first-place Teacher distillation anchor, actor learning-rate ramp, and staged evaluation provide stability without
+forcing candidates to remain near a weak distilled parent. The illegal-action auxiliary loss acts on unmasked logits
+while sampling still uses the hard mask.
 Reward expressions remain bounded structured data rather than arbitrary Python code.
 
 On `i03`, Codex may coordinate changes across multiple reward components and subtrees. The server derives the effective
@@ -695,8 +700,11 @@ becomes 40%, 20%, and 40%, respectively; unavailable crossover probability is re
 
 The Metric DSL also exposes phase-aware and local survival signals: normalized turns until night/night turns
 remaining, minimum per-city survival, at-risk city-tile fraction, next-night fuel deficit, nearby cargo coverage,
-cumulative night city loss, worker resource access/cargo fullness, unit-capacity utilization, and coal/uranium
-unlock state. Selectors include at-risk/safe city tiles, fuel-carrying/full/actionable workers, and resources the
+avoidable stranded fuel across disconnected Cities, cumulative night city loss, worker resource access/cargo
+fullness, unit-capacity utilization, and coal/uranium unlock state. `own_stranded_fuel` is normalized to `[0, 1]` and
+is nonzero only when one City has fuel surplus while another has a simultaneous deficit; it is available to reward
+search but is not added to the default reward. Selectors include at-risk/safe city tiles,
+fuel-carrying/full/actionable workers, and resources the
 team can currently harvest. Cumulative loss metrics are intentional: potential differencing avoids the large
 opposite-sign reward that a one-turn event pulse would produce when it resets to zero. Exact action-history signals
 such as oscillation are not exposed until they can distinguish deliberate cooldown waits from genuine repeated-action
@@ -778,9 +786,10 @@ stores cumulative decisions, turns, episodes, optimizer/RNG state, constraint pr
 Re-running a stage resumes its remaining decision budget. Schema-v1/v2 checkpoints remain loadable; a v1 checkpoint's
 consumed budget is conservatively estimated from its recorded elapsed-time fraction.
 
-The first coordinator invocation owns the schema-v3 run manifest: later invocations reuse its checkpoint paths,
+The first coordinator invocation owns the schema-v4 run manifest: later invocations reuse its checkpoint paths,
 SHA-256 descriptors, Codex/deterministic generation mode, model, and training budgets instead of overwriting them with
-new CLI defaults. Every candidate has a separate immutable record under `provenance/`; accepted Codex outputs retain
+new CLI defaults. Runs without metric schema v2 remain untouched but must use a new run directory after this metric
+change. Every candidate has a separate immutable record under `provenance/`; accepted Codex outputs retain
 the raw `*.raw.json`, canonical `codex-gXX-iXX.json`, compressed prompt, and `*.meta.json` hashes plus the normalization
 report. Medium and final candidate IDs are frozen under `selections/` when
 each stage starts, and final selection is rejected unless every candidate has a completed medium result. Failed result
@@ -885,3 +894,17 @@ uv run python main.py \
 Set either `--type-a` or `--type-b` to `first-place` for the upstream teacher checkpoint. Ordinary BC and distilled
 checkpoints use `bc`. The first-place model enables its original 180-degree ensemble when TTA is `auto`. The replay
 uses the same timestamp-and-winner filename convention as other one-on-one matches.
+
+Run repeated one-on-one games and report each model's win rate with `--games`. The first game uses `--seed` and later
+games use consecutive seeds; omit `--seed` or use `--seed random` to choose the first seed randomly. Replays are
+disabled by default:
+
+```bash
+uv run python main.py \
+  --model-a models/bc_v2/best.pt --type-a bc \
+  --model-b models/distilled/resattn8_v2/best.pt --type-b bc \
+  --games 20 --seed random --device auto
+```
+
+Add `--save-replays --replay-dir replays/comparison` to save every game's replay. Without `--save-replays`, no replay
+files are written.

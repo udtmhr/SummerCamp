@@ -90,6 +90,8 @@ _FATAL_CUDA_ERROR_MARKERS = (
     "driver shutting down",
 )
 _AUTOMATIC_INFRASTRUCTURE_RETRIES = 2
+_METRIC_SCHEMA_VERSION = 2
+_RUN_MANIFEST_SCHEMA_VERSION = 4
 _RETRYABLE_INFRASTRUCTURE_ERROR_MARKERS = (
     "filenotfounderror",
     "no such file or directory",
@@ -683,7 +685,6 @@ def train_candidate(
     parent_reward_program: RewardProgram | None = None,
     parent_effective_scale: float | None = None,
     critic_warmup_episodes: int = 8,
-    constraint_decay_decisions: int | None = None,
     resume_from: Path | None = None,
     resume_budget_progress: bool = True,
     checkpoint_callback: Callable[[Path, Mapping[str, object]], None] | None = None,
@@ -708,12 +709,6 @@ def train_candidate(
         inherited_hash = digest.hexdigest()
     if device.type == "cuda":
         actor_critic.policy.to(memory_format=torch.channels_last)
-    reference_policy = copy.deepcopy(actor_critic.policy).to(device)
-    parent_value_reference = (
-        {name: value.detach().clone() for name, value in actor_critic.value_head.named_parameters()}
-        if inherit_from is not None and candidate.inheritance_mode == "policy_value"
-        else None
-    )
     bc_provider = None
     if use_bc_anchor and candidate.ppo_config.bc_coefficient > 0:
         bc_provider = build_anchor_provider(
@@ -736,25 +731,16 @@ def train_candidate(
     previous_elapsed_seconds = 0.0
     resumed_metrics: dict[str, object] | None = None
     rng = random.Random(seed)
-    constraint_progress = max(0, int(curriculum_start_decisions))
+    curriculum_progress_decisions = max(0, int(curriculum_start_decisions))
     joint_update = 0
     resume_metadata: dict[str, object] | None = None
 
     def make_trainer() -> PPOTrainer:
         return PPOTrainer(
             actor_critic,
-            reference_policy,
             candidate.ppo_config,
             device,
             bc_batch_provider=bc_provider,
-            parameter_constraint_coefficient=candidate.parameter_constraint_coefficient,
-            parameter_constraint_decay_decisions=max(
-                1,
-                constraint_decay_decisions or (decision_budget or decisions_per_update) // 2,
-            ),
-            constrain_value_head=candidate.inheritance_mode == "policy_value",
-            value_parameter_reference=parent_value_reference,
-            parameter_constraint_end_fraction=curriculum.parameter_constraint_end_fraction,
         )
 
     trainer = make_trainer()
@@ -780,7 +766,10 @@ def train_candidate(
         }
         start_update = resume_state.next_update
         resumed_metrics = resume_state.metrics
-        constraint_progress = max(resume_state.constraint_progress, int(curriculum_start_decisions))
+        curriculum_progress_decisions = max(
+            resume_state.curriculum_progress_decisions,
+            int(curriculum_start_decisions),
+        )
         joint_update = resume_state.joint_update
         if resume_budget_progress:
             cumulative_decisions = resume_state.cumulative_decisions
@@ -916,7 +905,7 @@ def train_candidate(
                 if target_update_decisions is None:
                     wave_size = min(wave_size, episodes_per_update - len(episodes))
                 specs = []
-                curriculum_progress = min(max(constraint_progress / curriculum_total, 0.0), 1.0)
+                curriculum_progress = min(max(curriculum_progress_decisions / curriculum_total, 0.0), 1.0)
                 active_opponent_mix = curriculum.opponent_mix(candidate.opponent_mix, curriculum_progress)
                 shaping_multiplier = curriculum.shaping_multiplier(curriculum_progress)
                 scheduled_reward_program = RewardProgram(
@@ -945,12 +934,12 @@ def train_candidate(
                 update_decisions += sum(len(record.decisions) for episode in wave for record in episode.records)
             _synchronize_cuda(device, "rollout collection")
             actor_critic.train()
-            trainer.set_schedule_state(constraint_progress=constraint_progress, joint_update=joint_update)
+            trainer.set_schedule_state(joint_update=joint_update)
             metrics = trainer.update(episodes)
             _synchronize_cuda(device, "PPO update")
             actor_critic.eval()
             cumulative_decisions += int(metrics["decisions"])
-            constraint_progress += int(metrics["decisions"])
+            curriculum_progress_decisions += int(metrics["decisions"])
             joint_update += 1
             cumulative_turns += int(metrics["turns"])
             diagnostic_events.extend(event for episode in episodes for event in episode.diagnostic_events)
@@ -984,7 +973,7 @@ def train_candidate(
                     "curriculum_progress": curriculum_progress,
                     "effective_opponent_mix": asdict(active_opponent_mix),
                     "opponent_episode_counts": dict(opponent_episode_counts),
-                    "constraint_progress": constraint_progress,
+                    "curriculum_progress_decisions": curriculum_progress_decisions,
                     "joint_update": joint_update,
                     "actor_lr_multiplier": trainer.actor_lr_multiplier,
                 }
@@ -1003,11 +992,11 @@ def train_candidate(
                     "cumulative_episodes": episode_index,
                     "elapsed_seconds": metrics["elapsed_seconds"],
                     "python_random_state": rng.getstate(),
-                    "constraint_progress": constraint_progress,
+                    "curriculum_progress_decisions": curriculum_progress_decisions,
                     "joint_update": joint_update,
                 },
             )
-            completed_progress = min(max(constraint_progress / curriculum_total, 0.0), 1.0)
+            completed_progress = min(max(curriculum_progress_decisions / curriculum_total, 0.0), 1.0)
             for milestone in milestone_points:
                 if milestone not in saved_milestones and completed_progress >= milestone:
                     actor_critic.export_policy(
@@ -1284,7 +1273,6 @@ def candidate_result(
             parent_reward_program=parent.reward_program if parent is not None else None,
             parent_effective_scale=parent_effective_scale,
             critic_warmup_episodes=args.critic_warmup_episodes,
-            constraint_decay_decisions=max(1, curriculum_total_decisions),
             resume_from=resume_from,
             resume_budget_progress=resume_from == current_checkpoint,
             checkpoint_callback=checkpoint_callback,
@@ -1314,7 +1302,7 @@ def candidate_result(
             game for game in evaluation["games"] if game.get("anchor") == "first-place" and "outcome" in game
         ]
         teacher_score_rate = sum((float(game["outcome"]) + 1.0) * 0.5 for game in teacher_games) / len(teacher_games)
-        kl = float(_final_training_metrics(training)["kl"])
+        kl = 0.0
         diagnostics_path = output_dir / "diagnostics.json.gz"
         with gzip.open(diagnostics_path, "wt", encoding="utf-8") as output:
             json.dump(
@@ -1424,6 +1412,8 @@ def execute_evolution_job(
 
 
 def _apply_coordinator_manifest(args: argparse.Namespace, manifest: Mapping[str, object]) -> None:
+    if int(manifest.get("metric_schema_version", 1)) != _METRIC_SCHEMA_VERSION:
+        raise ValueError("Reward metric schema changed; preserve this run and start a new run directory")
     coordinator_args = manifest.get("arguments", {})
     if not isinstance(coordinator_args, dict):
         raise TypeError("Coordinator manifest arguments are invalid")
@@ -1808,7 +1798,7 @@ def _select_completed_stage(
         )
         combined_delta = sum(seed_deltas.values()) / max(len(seed_deltas), 1)
         valid = float(result.fitness[0] > 0.0)
-        return valid, float(teacher_delta >= 0.0), teacher_delta, combined_delta, base_delta, -result.kl
+        return valid, float(teacher_delta >= 0.0), teacher_delta, combined_delta, base_delta
 
     ranked = sorted(
         (
@@ -1904,7 +1894,8 @@ def _load_or_create_stage_baseline(
 ) -> dict[str, object]:
     path = store.run_dir / "baselines" / f"{name}.json"
     context = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "metric_schema_version": _METRIC_SCHEMA_VERSION,
         "base_name": "resattn8",
         "checkpoint_sha256": _sha256_file(Path(args.resattn8_checkpoint)),
         "seed_start": seed_start,
@@ -2183,7 +2174,8 @@ def main(
     if existing_manifest is None:
         generation_mode = "dry_run" if args.dry_run else ("deterministic" if args.no_codex else "codex")
         manifest = {
-            "schema_version": 3,
+            "schema_version": _RUN_MANIFEST_SCHEMA_VERSION,
+            "metric_schema_version": _METRIC_SCHEMA_VERSION,
             "created_at": time.time(),
             "git_revision": git_revision(repository),
             "arguments": vars(args),
@@ -2784,7 +2776,8 @@ def main(
     ):
         baseline_path = baseline_dir / f"final-{base_name}.json"
         baseline_context = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "metric_schema_version": _METRIC_SCHEMA_VERSION,
             "base_name": base_name,
             "checkpoint_sha256": _sha256_file(checkpoint),
             "checkpoint_descriptors": manifest.get("checkpoint_descriptors", {}),
@@ -2830,27 +2823,34 @@ def main(
             enforce_teacher_guard=guarded,
             teacher_noninferiority_margin=args.teacher_noninferiority_margin,
             require_survival=guarded,
+            require_stranded_fuel=guarded,
         )
         illegal_action_count = sum(
             int(result.metrics.get("reflection", {}).get("diagnostics", {}).get("illegal_action_count", 0))
             for result in values
         )
         acceptance["illegal_action_count"] = illegal_action_count
-        kl_passes = all(result.kl <= 0.04 for result in values) if guarded else True
-        acceptance["kl_ceiling"] = 0.04 if guarded else None
-        acceptance["kl_passes"] = kl_passes
-        acceptance["promote"] = bool(
-            acceptance["promote"] and illegal_action_count == 0 and kl_passes
-        )
+        acceptance["promote"] = bool(acceptance["promote"] and illegal_action_count == 0)
         acceptance["failure_reasons"] = [
             reason
             for reason, failed in (
                 (
                     "paired_score_or_latency",
-                    not all(report["passes"] for report in acceptance["architectures"].values()),
+                    not all(report["score_latency_passes"] for report in acceptance["architectures"].values()),
+                ),
+                (
+                    "teacher_guard",
+                    not all(report["teacher_guard_passes"] for report in acceptance["architectures"].values()),
+                ),
+                (
+                    "city_survival",
+                    not all(report["survival_passes"] for report in acceptance["architectures"].values()),
+                ),
+                (
+                    "stranded_fuel_regression",
+                    not all(report["stranded_fuel_passes"] for report in acceptance["architectures"].values()),
                 ),
                 ("illegal_action", illegal_action_count != 0),
-                ("kl_ceiling", not kl_passes),
             )
             if failed
         ]

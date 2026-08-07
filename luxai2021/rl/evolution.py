@@ -10,7 +10,7 @@ import random
 import subprocess
 import time
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -91,7 +91,6 @@ class TrainingCurriculum:
     teacher_floor_points: tuple[tuple[float, float], ...]
     shaping_multiplier_points: tuple[tuple[float, float], ...]
     snapshot_floor: float = 0.10
-    parameter_constraint_end_fraction: float = 0.20
 
     def shaping_multiplier(self, progress: float) -> float:
         return _piecewise_linear(self.shaping_multiplier_points, progress)
@@ -123,14 +122,13 @@ class TrainingCurriculum:
             "teacher_floor_points": [list(point) for point in self.teacher_floor_points],
             "shaping_multiplier_points": [list(point) for point in self.shaping_multiplier_points],
             "snapshot_floor": self.snapshot_floor,
-            "parameter_constraint_end_fraction": self.parameter_constraint_end_fraction,
         }
 
 
 def training_curriculum(name: str) -> TrainingCurriculum:
     teacher_points = ((0.0, 0.25), (0.30, 0.30), (0.65, 0.40), (0.85, 0.50), (1.0, 0.50))
     if name == "legacy":
-        return TrainingCurriculum("legacy", ((0.0, 0.0), (1.0, 0.0)), ((0.0, 1.0), (1.0, 1.0)), 0.0, 0.0)
+        return TrainingCurriculum("legacy", ((0.0, 0.0), (1.0, 0.0)), ((0.0, 1.0), (1.0, 1.0)), 0.0)
     if name == "teacher_guarded_near_sparse":
         return TrainingCurriculum(
             name,
@@ -161,7 +159,7 @@ class EvolutionCandidate:
     secondary_parent_ids: tuple[str, ...] = ()
     inheritance_mode: str = "base"
     mutation_manifest: Mapping[str, Any] = field(default_factory=dict)
-    parameter_constraint_coefficient: float = 0.05
+    parameter_constraint_coefficient: float = 0.0
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> EvolutionCandidate:
@@ -199,7 +197,7 @@ class EvolutionCandidate:
         secondary_parent_ids = tuple(str(item) for item in proposal.get("secondary_parent_ids", ()))
         inheritance_mode = str(proposal.get("inheritance_mode", "base" if not parent_ids else "policy"))
         mutation_manifest = dict(proposal.get("mutation_manifest", {}))
-        parameter_constraint_coefficient = float(proposal.get("parameter_constraint_coefficient", 0.05))
+        parameter_constraint_coefficient = float(proposal.get("parameter_constraint_coefficient", 0.0))
         if mutation_kind not in MUTATION_KINDS:
             raise ValueError(f"Unsupported mutation kind: {mutation_kind}")
         if inheritance_mode not in INHERITANCE_MODES:
@@ -292,12 +290,12 @@ class CandidateResult:
     error: str | None = None
 
     @property
-    def fitness(self) -> tuple[float, float, float, float]:
+    def fitness(self) -> tuple[float, float, float]:
         reflection = self.metrics.get("reflection", {}) if isinstance(self.metrics, Mapping) else {}
         diagnostics = reflection.get("diagnostics", {}) if isinstance(reflection, Mapping) else {}
         illegal_count = int(diagnostics.get("illegal_action_count", 0)) if isinstance(diagnostics, Mapping) else 0
         valid = 1.0 if self.status == "completed" and illegal_count == 0 else 0.0
-        return valid, self.teacher_score_rate, self.score_rate, -min(self.kl, 1.0)
+        return valid, self.teacher_score_rate, self.score_rate
 
 
 class EvolutionStore:
@@ -557,7 +555,11 @@ def proposal_schema() -> dict[str, Any]:
         ]
     }
     ppo_properties = {
-        field: {"type": "integer" if field in {"update_epochs", "minibatch_turns"} else "number"}
+        field: (
+            {"type": "number", "const": 0.0}
+            if field == "kl_coefficient"
+            else {"type": "integer" if field in {"update_epochs", "minibatch_turns"} else "number"}
+        )
         for field in asdict(PPOConfig())
     }
     return {
@@ -622,7 +624,7 @@ def proposal_schema() -> dict[str, Any]:
                     "summary": {"type": "string"},
                 }
             ),
-            "parameter_constraint_coefficient": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "parameter_constraint_coefficient": {"type": "number", "const": 0.0},
             "rationale": {"type": "string"},
         },
         "required": [
@@ -668,9 +670,9 @@ def build_codex_prompt(
   by diagnostics. Use only structural, crossover, or restart; feature_generated is deprecated.
 - AST distance 0.20 to 0.65 is a diversity target, not a validity boundary. Safe smaller or larger edits are accepted
   and the server reclassifies mutation_kind, inheritance, constraint, and changed_paths from the actual diff.
-- Island-3 structural proposals may additionally change either the PPO/parameter-constraint family or opponent_mix.
+- Island-3 structural proposals may additionally change either active PPO settings or opponent_mix.
 - Island-3 crossover may recombine multiple reward components/derived metrics, must include a distinct contribution
-  from a secondary parent, and must keep the primary parent's PPO, opponent mix, and parameter constraint.
+  from a secondary parent, and must keep the primary parent's active PPO settings and opponent mix.
 - Declare restart only when intentionally starting from the distilled base without a parent checkpoint."""
     )
     context = {
@@ -691,6 +693,12 @@ def build_codex_prompt(
             "min_city_survival": "minimum individual-City survival; use for local collapse",
             "night_fuel_deficit": "relative signal oriented so larger is better",
             "own_night_fuel_deficit": "absolute own-team deficit; lower is better",
+            "stranded_fuel": (
+                "relative avoidable fuel concentration across disconnected Cities; larger is better"
+            ),
+            "own_stranded_fuel": (
+                "absolute own-team fuel simultaneously surplus in one City and needed by another; lower is better"
+            ),
             "fuel_delivery_coverage": "relative ability to deliver carried fuel to at-risk Cities",
             "own_fuel_delivery_coverage": "absolute own-team delivery coverage; larger is better",
             "turn_phase_metrics": "turn/night/cycle values are gates, not standalone objectives",
@@ -701,7 +709,7 @@ def build_codex_prompt(
         "parents": parent_payload,
         "recent_results": result_payload,
     }
-    return f"""You are evolving a safe reward program and PPO configuration for Lux AI Challenge 2021.
+    prompt = f"""You are evolving a safe reward program and PPO configuration for Lux AI Challenge 2021.
 Return exactly one proposal matching the supplied JSON schema.
 
 Hard constraints:
@@ -710,7 +718,9 @@ Hard constraints:
 - Preserve terminal win/loss reward; design bounded potential shaping for city survival and match strength.
 - The official first-place Teacher is stronger than the distilled bases. Teacher non-regression is a hard objective;
   a self_base gain cannot compensate for a Teacher regression.
-- PPO must remain close to the distilled reference policy and train on one GPU.
+- PPO uses clipping for update stability and the first-place Teacher distillation anchor; it trains on one GPU.
+- Parent-policy KL loss and L2-SP are disabled. Always set ppo_config.kl_coefficient and
+  parameter_constraint_coefficient to 0; do not propose mutations of either field.
 - Opponent weights must sum to exactly 1.0.
 {edit_guidance}
 - Illegal-action events identify hard action-mask defects. Do not trade them against reward and never weaken an
@@ -719,16 +729,20 @@ Hard constraints:
 - Emit reward_program version 2. Derived metrics must use only safe Reward IR expressions in the schema.
 - turn/night/cycle/turns_until_night/night_turns_remaining describe phase and should be used as gate conditions,
   not standalone objectives. Relative city-risk/loss/deficit metrics are oriented so larger is better. Absolute
-  own_city_tiles_at_risk, own_night_fuel_deficit, own_city_tiles_lost, and own_night_fuel_shortage are lower-is-better.
+  own_city_tiles_at_risk, own_night_fuel_deficit, own_stranded_fuel, own_city_tiles_lost, and
+  own_night_fuel_shortage are lower-is-better.
 - min_city_survival is the minimum over individual cities, while city_survival uses aggregate team fuel. Prefer the
   minimum/risk/deficit signals when feedback reports a local night-fuel collapse despite adequate total fuel.
+- own_stranded_fuel is nonzero only when one connected City has surplus fuel while another connected City has a
+  simultaneous deficit. Its relative counterpart stranded_fuel is oriented so larger is better.
 - On island 2, every generation adds or deletes exactly one direct whitelist metric; do not create derived metrics.
 - A restart sets primary_parent_id to null, inheritance_mode to base, and parameter_constraint_coefficient to 0.
 - mutation_kind, parent provenance, inheritance_mode, and changed_paths must truthfully describe the proposal.
 
 Evolution context JSON (authoritative rules, metric semantics, parents, and feedback):
-{json.dumps(context, ensure_ascii=False, separators=(',', ':'), sort_keys=True)}
-"""
+{json.dumps(context, ensure_ascii=False, separators=(",", ":"), sort_keys=True)}
+"""  # noqa: S608
+    return prompt  # noqa: RET504
 
 
 def _stage_priority(stage: str) -> int:
@@ -824,7 +838,6 @@ def _codex_result_feedback(result: CandidateResult) -> dict[str, Any]:
         "policy_loss",
         "value_loss",
         "bc_loss",
-        "kl",
         "entropy",
         "illegal_action_loss",
         "illegal_action_mass_mean",
@@ -832,8 +845,6 @@ def _codex_result_feedback(result: CandidateResult) -> dict[str, Any]:
         "illegal_action_mass_max",
         "effective_reward_scale",
         "reward_scale",
-        "parameter_constraint_coefficient",
-        "parameter_constraint_loss",
         "decisions_per_second",
         "throughput",
     )
@@ -882,7 +893,6 @@ def _codex_result_feedback(result: CandidateResult) -> dict[str, Any]:
         "status": result.status,
         "score_rate": result.score_rate,
         "teacher_score_rate": result.teacher_score_rate,
-        "kl": result.kl,
         "duration_seconds": result.duration_seconds,
         "training_final": {key: last_update[key] for key in training_keys if key in last_update},
         "league_totals": evaluation.get("totals") if isinstance(evaluation, Mapping) else None,
@@ -932,17 +942,19 @@ def candidate_setting_changes(
         parent_reward = dict(parent_reward)
         parent_reward["version"] = 2
         parent_reward["derived_metrics"] = []
+    parent_ppo = asdict(parent.ppo_config)
+    candidate_ppo = asdict(candidate.ppo_config)
+    parent_ppo.pop("kl_coefficient", None)
+    candidate_ppo.pop("kl_coefficient", None)
     parent_settings = {
         "reward_program": parent_reward,
-        "ppo_config": asdict(parent.ppo_config),
+        "ppo_config": parent_ppo,
         "opponent_mix": asdict(parent.opponent_mix),
-        "parameter_constraint_coefficient": parent.parameter_constraint_coefficient,
     }
     candidate_settings = {
         "reward_program": candidate_reward,
-        "ppo_config": asdict(candidate.ppo_config),
+        "ppo_config": candidate_ppo,
         "opponent_mix": asdict(candidate.opponent_mix),
-        "parameter_constraint_coefficient": candidate.parameter_constraint_coefficient,
     }
     before = _flatten_settings(parent_settings)
     after = _flatten_settings(candidate_settings)
@@ -1020,174 +1032,6 @@ def approximate_ast_distance(left: EvolutionCandidate, right: EvolutionCandidate
     return 0.5 * multiset_jaccard(left_subtrees, right_subtrees) + 0.3 * cosine_distance + 0.2 * numeric_distance
 
 
-def _validate_candidate_contract_legacy(parents: list[EvolutionCandidate], candidate: EvolutionCandidate) -> None:
-    """Reject Codex proposals that do not obey the declared island operator."""
-    if not parents:
-        if candidate.mutation_kind not in {"initial", "restart"}:
-            raise ValueError("A parentless candidate must be initial or restart")
-        if candidate.mutation_kind == "restart" and (
-            candidate.primary_parent_id is not None
-            or candidate.inheritance_mode != "base"
-            or candidate.parameter_constraint_coefficient != 0
-        ):
-            raise ValueError("Restart must use base inheritance with no parent parameter constraint")
-        return
-    parent_by_id = {parent.candidate_id: parent for parent in parents}
-    if candidate.mutation_kind != "restart" and candidate.primary_parent_id not in parent_by_id:
-        raise ValueError("Non-restart mutation requires a valid primary parent")
-    primary = parent_by_id.get(candidate.primary_parent_id, parents[0])
-    changes = candidate_setting_changes(primary, candidate)
-    reported = tuple(str(path) for path in candidate.mutation_manifest.get("changed_paths", ()))
-    if changes and not reported:
-        raise ValueError("Mutation manifest omitted changed_paths")
-    for change in changes:
-        path = str(change["path"])
-        if not any(path.startswith(item) or item.startswith(path) for item in reported):
-            raise ValueError(f"Mutation manifest does not cover changed path: {path}")
-    _, _, _, parent_nodes = candidate_ast_descriptor(primary)
-    _, _, _, child_nodes = candidate_ast_descriptor(candidate)
-    expected = {
-        0: {"parameter"},
-        1: {"structural"},
-        2: {"feature_existing"},
-        3: {"structural", "crossover", "restart"},
-    }
-    if candidate.island in expected and candidate.mutation_kind not in expected[candidate.island]:
-        raise ValueError(f"Island {candidate.island} does not allow {candidate.mutation_kind}")
-    if candidate.island == 0:
-        if child_nodes != parent_nodes or len(changes) > 2:
-            raise ValueError("Parameter island may change at most two numeric leaves without changing AST topology")
-        if any(
-            not isinstance(change["before"], (int, float)) or not isinstance(change["after"], (int, float))
-            for change in changes
-        ):
-            raise ValueError("Parameter mutation changed a non-numeric setting")
-        if candidate.inheritance_mode != "policy_value":
-            raise ValueError("Parameter mutations must inherit policy and value")
-    elif candidate.island == 1:
-        changed_components = [
-            (before, after)
-            for before, after in zip(primary.reward_program.components, candidate.reward_program.components)
-            if before != after
-        ]
-        same_non_ast_settings = (
-            len(primary.reward_program.components) == len(candidate.reward_program.components)
-            and primary.reward_program.derived_metrics == candidate.reward_program.derived_metrics
-            and primary.reward_program.reward_scale == candidate.reward_program.reward_scale
-            and primary.reward_program.gamma == candidate.reward_program.gamma
-            and primary.ppo_config == candidate.ppo_config
-            and primary.opponent_mix == candidate.opponent_mix
-            and all(before.name == after.name and before.weight == after.weight for before, after in changed_components)
-        )
-        if (
-            abs(child_nodes - parent_nodes) > 8
-            or candidate.inheritance_mode != "policy"
-            or len(changed_components) != 1
-            or not same_non_ast_settings
-        ):
-            raise ValueError("Structural island exceeded its local-edit or inheritance bound")
-    elif candidate.island == 2:
-
-        def serialize(item: object) -> str:
-            return json.dumps(asdict(item), sort_keys=True, separators=(",", ":"))
-
-        parent_components = Counter(serialize(item) for item in primary.reward_program.components)
-        child_components = Counter(serialize(item) for item in candidate.reward_program.components)
-        component_added = sum((child_components - parent_components).values())
-        component_removed = sum((parent_components - child_components).values())
-        added_components = list((child_components - parent_components).elements())
-        added_direct_metrics = all(
-            json.loads(item).get("expression", {}).get("op") == "metric" for item in added_components
-        )
-        same_non_component_settings = (
-            primary.reward_program.derived_metrics == candidate.reward_program.derived_metrics
-            and primary.reward_program.reward_scale == candidate.reward_program.reward_scale
-            and primary.reward_program.gamma == candidate.reward_program.gamma
-            and primary.ppo_config == candidate.ppo_config
-            and primary.opponent_mix == candidate.opponent_mix
-            and primary.parameter_constraint_coefficient == candidate.parameter_constraint_coefficient
-        )
-        if (
-            component_added + component_removed != 1
-            or not added_direct_metrics
-            or candidate.inheritance_mode != "policy"
-            or not same_non_component_settings
-        ):
-            raise ValueError("Feature island must add or delete exactly one direct metric component")
-    elif candidate.island == 3 and candidate.mutation_kind == "structural":
-        distance = approximate_ast_distance(primary, candidate)
-        inherited_constraint = (
-            primary.parameter_constraint_coefficient if primary.parameter_constraint_coefficient > 0.0 else 0.05
-        )
-        ppo_family_changed = (
-            primary.ppo_config != candidate.ppo_config
-            or inherited_constraint != candidate.parameter_constraint_coefficient
-        )
-        opponent_changed = primary.opponent_mix != candidate.opponent_mix
-        if primary.reward_program == candidate.reward_program:
-            raise ValueError("Island-3 structural mutation must change the reward program")
-        if not _I03_STRUCTURAL_DISTANCE_MIN <= distance <= _I03_STRUCTURAL_DISTANCE_MAX:
-            message = f"Island-3 structural mutation AST distance must be in [0.20, 0.65]; actual={distance:.6f}"
-            raise ValueError(message)
-        if candidate.inheritance_mode != "policy":
-            raise ValueError("Island-3 structural mutation must inherit policy only")
-        if candidate.parameter_constraint_coefficient <= 0.0:
-            raise ValueError("Island-3 structural mutation requires a positive parent parameter constraint")
-        if ppo_family_changed and opponent_changed:
-            raise ValueError("Island-3 structural mutation may change PPO settings or opponent mix, not both")
-    elif candidate.island == 3 and candidate.mutation_kind == "crossover":
-
-        def serialize(item: object) -> str:
-            return json.dumps(asdict(item), sort_keys=True, separators=(",", ":"))
-
-        primary_components = {serialize(component) for component in primary.reward_program.components}
-        primary_derived = {serialize(metric) for metric in primary.reward_program.derived_metrics}
-        secondary_parents = [parent_by_id[item] for item in candidate.secondary_parent_ids if item in parent_by_id]
-        secondary_components = {
-            serialize(component) for parent in secondary_parents for component in parent.reward_program.components
-        }
-        secondary_derived = {
-            serialize(metric) for parent in secondary_parents for metric in parent.reward_program.derived_metrics
-        }
-        candidate_components = {serialize(component) for component in candidate.reward_program.components}
-        candidate_derived = {serialize(metric) for metric in candidate.reward_program.derived_metrics}
-        allowed_components = primary_components | secondary_components
-        allowed_derived = primary_derived | secondary_derived
-        secondary_contribution = bool(
-            (candidate_components & (secondary_components - primary_components))
-            or (candidate_derived & (secondary_derived - primary_derived))
-        )
-        if not secondary_parents or not secondary_contribution:
-            raise ValueError("Crossover must include a distinct contribution from a secondary parent")
-        if not candidate_components <= allowed_components:
-            raise ValueError("Crossover introduced a component not present in its parents")
-        if not candidate_derived <= allowed_derived:
-            raise ValueError("Crossover introduced a derived metric not present in its parents")
-        if (
-            primary.reward_program == candidate.reward_program
-            or primary.reward_program.reward_scale != candidate.reward_program.reward_scale
-            or primary.reward_program.gamma != candidate.reward_program.gamma
-            or primary.ppo_config != candidate.ppo_config
-            or primary.opponent_mix != candidate.opponent_mix
-            or primary.parameter_constraint_coefficient != candidate.parameter_constraint_coefficient
-            or candidate.inheritance_mode != "policy"
-        ):
-            raise ValueError("Crossover may only recombine parent reward components with primary policy inheritance")
-    if candidate.mutation_kind == "restart" and (
-        candidate.primary_parent_id is not None
-        or candidate.inheritance_mode != "base"
-        or candidate.parameter_constraint_coefficient != 0
-    ):
-        raise ValueError("Restart must use base inheritance with no parent parameter constraint")
-    if (
-        candidate.island == 3
-        and candidate.mutation_kind == "restart"
-        and primary.ppo_config != candidate.ppo_config
-        and primary.opponent_mix != candidate.opponent_mix
-    ):
-        raise ValueError("Island-3 restart may change PPO settings or opponent mix, not both")
-
-
 def validate_candidate_safety(parents: list[EvolutionCandidate], candidate: EvolutionCandidate) -> None:
     """Reject only candidates that cannot be executed safely or have broken lineage."""
     parent_by_id = {parent.candidate_id: parent for parent in parents}
@@ -1211,6 +1055,12 @@ def validate_candidate_safety(parents: list[EvolutionCandidate], candidate: Evol
 
 def _serialized_counter(items: object) -> Counter[str]:
     return Counter(json.dumps(asdict(item), sort_keys=True, separators=(",", ":")) for item in items)
+
+
+def _active_ppo_settings(config: PPOConfig) -> dict[str, object]:
+    value = asdict(config)
+    value.pop("kl_coefficient", None)
+    return value
 
 
 def _is_parameter_mutation(primary: EvolutionCandidate, candidate: EvolutionCandidate) -> bool:
@@ -1243,9 +1093,8 @@ def _is_feature_mutation(primary: EvolutionCandidate, candidate: EvolutionCandid
         and primary.reward_program.derived_metrics == candidate.reward_program.derived_metrics
         and primary.reward_program.reward_scale == candidate.reward_program.reward_scale
         and primary.reward_program.gamma == candidate.reward_program.gamma
-        and primary.ppo_config == candidate.ppo_config
+        and _active_ppo_settings(primary.ppo_config) == _active_ppo_settings(candidate.ppo_config)
         and primary.opponent_mix == candidate.opponent_mix
-        and primary.parameter_constraint_coefficient == candidate.parameter_constraint_coefficient
     )
 
 
@@ -1266,9 +1115,8 @@ def _is_local_structural_mutation(primary: EvolutionCandidate, candidate: Evolut
         and primary.reward_program.derived_metrics == candidate.reward_program.derived_metrics
         and primary.reward_program.reward_scale == candidate.reward_program.reward_scale
         and primary.reward_program.gamma == candidate.reward_program.gamma
-        and primary.ppo_config == candidate.ppo_config
+        and _active_ppo_settings(primary.ppo_config) == _active_ppo_settings(candidate.ppo_config)
         and primary.opponent_mix == candidate.opponent_mix
-        and primary.parameter_constraint_coefficient == candidate.parameter_constraint_coefficient
     )
 
 
@@ -1300,9 +1148,8 @@ def _is_pure_crossover(
         and primary.reward_program != candidate.reward_program
         and primary.reward_program.reward_scale == candidate.reward_program.reward_scale
         and primary.reward_program.gamma == candidate.reward_program.gamma
-        and primary.ppo_config == candidate.ppo_config
+        and _active_ppo_settings(primary.ppo_config) == _active_ppo_settings(candidate.ppo_config)
         and primary.opponent_mix == candidate.opponent_mix
-        and primary.parameter_constraint_coefficient == candidate.parameter_constraint_coefficient
     )
 
 
@@ -1341,6 +1188,10 @@ def canonicalize_candidate_proposal(
         effective_kind, scale = "structural", "large"
 
     canonical = copy.deepcopy(dict(proposal))
+    canonical_ppo = dict(canonical["ppo_config"])
+    canonical_ppo["kl_coefficient"] = 0.0
+    canonical["ppo_config"] = canonical_ppo
+    canonical["parameter_constraint_coefficient"] = 0.0
     canonical["mutation_kind"] = effective_kind
     if effective_kind == "restart":
         canonical.update(
@@ -1356,10 +1207,6 @@ def canonicalize_candidate_proposal(
         canonical["inheritance_mode"] = "policy_value" if effective_kind == "parameter" else "policy"
         if effective_kind != "crossover":
             canonical["secondary_parent_ids"] = []
-        coefficient = float(canonical.get("parameter_constraint_coefficient", 0.0))
-        if coefficient == 0.0:
-            coefficient = primary.parameter_constraint_coefficient or 0.05
-        canonical["parameter_constraint_coefficient"] = coefficient
 
     manifest = dict(canonical.get("mutation_manifest", {}))
     manifest["changed_paths"] = []
@@ -1385,6 +1232,7 @@ def canonicalize_candidate_proposal(
         field
         for field in (
             "mutation_kind",
+            "ppo_config",
             "primary_parent_id",
             "secondary_parent_ids",
             "inheritance_mode",
@@ -1416,6 +1264,17 @@ def validate_candidate_mutation(parents: list[EvolutionCandidate], candidate: Ev
     validate_candidate_safety(parents, candidate)
 
 
+def _max_night_start_stranded_snapshot(
+    fuel_snapshots: Iterable[Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
+    night_starts = [event for event in fuel_snapshots if bool(event.get("night_start", False))]
+    return (
+        max(night_starts, key=lambda event: float(event.get("stranded_fuel_fraction", 0.0)))
+        if night_starts
+        else None
+    )
+
+
 def summarize_diagnostic_events(metrics: Mapping[str, Any]) -> dict[str, object]:
     events: list[Mapping[str, Any]] = []
     training = metrics.get("training", {})
@@ -1428,6 +1287,7 @@ def summarize_diagnostic_events(metrics: Mapping[str, Any]) -> dict[str, object]
                 events.extend(event for event in game.get("diagnostic_events", ()) if isinstance(event, Mapping))
     city_events = [dict(event) for event in events if event.get("event") == "city_destroyed_night_fuel"]
     fuel_snapshots = [dict(event) for event in events if event.get("event") == "night_fuel_snapshot"]
+    max_stranded = _max_night_start_stranded_snapshot(fuel_snapshots)
     illegal_events = [dict(event) for event in events if event.get("event") == "illegal_action"]
     illegal_classes = Counter(
         str(event.get("action_class", event.get("action", "unknown"))) for event in illegal_events
@@ -1441,6 +1301,12 @@ def summarize_diagnostic_events(metrics: Mapping[str, Any]) -> dict[str, object]
         "min_night_fuel_margin": min(
             (float(event.get("min_city_fuel_margin", -1.0)) for event in fuel_snapshots),
             default=None,
+        ),
+        "max_night_start_stranded_fuel_fraction": (
+            float(max_stranded.get("stranded_fuel_fraction", 0.0)) if max_stranded is not None else None
+        ),
+        "max_night_start_stranded_fuel_turn": (
+            int(max_stranded.get("turn", 0)) if max_stranded is not None else None
         ),
         "last_night_city_zero_count": sum(
             int(event.get("turn", -1)) >= 350 and int(event.get("city_tiles", 0)) == 0
@@ -1486,6 +1352,7 @@ def compact_candidate_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
             if events:
                 city_events = [event for event in events if event.get("event") == "city_destroyed_night_fuel"]
                 fuel_snapshots = [event for event in events if event.get("event") == "night_fuel_snapshot"]
+                max_stranded = _max_night_start_stranded_snapshot(fuel_snapshots)
                 illegal_events = [event for event in events if event.get("event") == "illegal_action"]
                 compact_game["diagnostics"] = {
                     "city_tile_loss_turns": sorted({int(event["turn"]) for event in city_events}),
@@ -1494,6 +1361,14 @@ def compact_candidate_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
                     "min_night_fuel_margin": min(
                         (float(event.get("min_city_fuel_margin", -1.0)) for event in fuel_snapshots),
                         default=None,
+                    ),
+                    "max_night_start_stranded_fuel_fraction": (
+                        float(max_stranded.get("stranded_fuel_fraction", 0.0))
+                        if max_stranded is not None
+                        else None
+                    ),
+                    "max_night_start_stranded_fuel_turn": (
+                        int(max_stranded.get("turn", 0)) if max_stranded is not None else None
                     ),
                     "illegal_action_turns": sorted({int(event["turn"]) for event in illegal_events}),
                     "illegal_action_count": len(illegal_events),
@@ -1530,7 +1405,6 @@ def add_candidate_reflection(
             improvement = {
                 "score_rate_delta": result.score_rate - parent_result.score_rate,
                 "teacher_score_rate_delta": result.teacher_score_rate - parent_result.teacher_score_rate,
-                "kl_delta": result.kl - parent_result.kl,
                 "duration_seconds_delta": result.duration_seconds - parent_result.duration_seconds,
             }
         parent_comparisons.append(
@@ -1802,7 +1676,7 @@ def initial_candidate(*, island: int, seed: int) -> EvolutionCandidate:
         "secondary_parent_ids": [],
         "inheritance_mode": "base",
         "mutation_manifest": {"changed_paths": [], "summary": "Seeded bounded initialization"},
-        "parameter_constraint_coefficient": 0.05,
+        "parameter_constraint_coefficient": 0.0,
         "rationale": "Bounded human initialization for the first island population.",
     }
     return EvolutionCandidate.from_proposal(proposal, generation=0, island=island, parent_ids=())
@@ -1956,12 +1830,13 @@ def mutate_candidate(
     reward["version"] = 2
     reward.setdefault("derived_metrics", [])
     ppo = asdict(parent.ppo_config)
+    ppo["kl_coefficient"] = 0.0
     opponent = asdict(parent.opponent_mix)
     changed_paths: list[str] = []
     selected_secondary_ids: list[str] = []
     kind = "parameter"
     inheritance = "policy_value"
-    constraint = parent.parameter_constraint_coefficient if parent.parameter_constraint_coefficient > 0.0 else 0.05
+    constraint = 0.0
 
     if island == 0:
         if rng.random() < 0.6:
@@ -1973,12 +1848,9 @@ def mutate_candidate(
             )
             changed_paths.append(f"reward_program.components[{index}].weight")
         else:
-            selected = rng.choice(("learning_rate", "entropy_coefficient", "kl_coefficient", "bc_coefficient"))
+            selected = rng.choice(("learning_rate", "entropy_coefficient", "bc_coefficient"))
             ppo[selected] = float(ppo[selected]) * math.exp(rng.gauss(0.0, 0.12))
             changed_paths.append(f"ppo_config.{selected}")
-        if rng.random() < 0.25:
-            constraint = max(0.0, min(1.0, constraint * math.exp(rng.gauss(0.0, 0.2))))
-            changed_paths.append("parameter_constraint_coefficient")
     elif island == 1:
         kind = "structural"
         inheritance = "policy"
@@ -1993,7 +1865,7 @@ def mutate_candidate(
         changed_paths.append(f"reward_program.components[{index}].expression")
     elif island == 2:
         inheritance = "policy"
-        constraint = parent.parameter_constraint_coefficient
+        constraint = 0.0
         used = {
             component["expression"].get("name")
             for component in reward["components"]
@@ -2041,7 +1913,7 @@ def mutate_candidate(
             changed_paths.append("reward_program")
         elif draw < crossover_threshold and secondary_parents:
             kind = "crossover"
-            constraint = parent.parameter_constraint_coefficient
+            constraint = 0.0
             crossed = _crossover_reward(parent, secondary_parents, rng)
             if crossed is not None:
                 reward, donor_id = crossed
@@ -2049,9 +1921,7 @@ def mutate_candidate(
                 changed_paths.extend(("reward_program.derived_metrics", "reward_program.components"))
             else:
                 kind = "structural"
-                constraint = (
-                    parent.parameter_constraint_coefficient if parent.parameter_constraint_coefficient > 0.0 else 0.05
-                )
+                constraint = 0.0
                 reward = _mutate_large_structural_reward(parent, rng)
         else:
             kind = "structural"
@@ -2061,7 +1931,7 @@ def mutate_candidate(
                 crossed = _crossover_reward(parent, secondary_parents, rng)
                 if crossed is not None:
                     kind = "crossover"
-                    constraint = parent.parameter_constraint_coefficient
+                    constraint = 0.0
                     reward, donor_id = crossed
                     selected_secondary_ids = [donor_id]
                     changed_paths.extend(("reward_program.derived_metrics", "reward_program.components"))
@@ -2073,11 +1943,6 @@ def mutate_candidate(
                     changed_paths.append("reward_program")
             else:
                 changed_paths.append("reward_program.components")
-    if (
-        constraint != parent.parameter_constraint_coefficient
-        and "parameter_constraint_coefficient" not in changed_paths
-    ):
-        changed_paths.append("parameter_constraint_coefficient")
     parent_ids = (parent.candidate_id, *(item.candidate_id for item in secondary_parents))
     proposal = {
         "reward_program": reward,

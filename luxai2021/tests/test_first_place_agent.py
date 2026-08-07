@@ -23,3 +23,14 @@ def test_one_on_one_cli_selects_first_place_agent(monkeypatch):
     actual = main.create_agent("teacher.pt", "first-place", "cpu", "auto")
 
     assert actual is expected
+
+
+def test_one_on_one_cli_accepts_repeated_games_and_optional_replays():
+    args = main.build_parser().parse_args(
+        ["--games", "5", "--seed", "123", "--save-replays", "--replay-dir", "custom-replays"]
+    )
+
+    assert args.games == 5
+    assert args.seed == 123
+    assert args.save_replays
+    assert args.replay_dir == "custom-replays"

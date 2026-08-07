@@ -1,9 +1,23 @@
+# ruff: noqa: ANN001, ANN201, S101
+
 import json
+from copy import deepcopy
 
 from luxai2021.env.agent import Agent
 from luxai2021.game.constants import LuxMatchConfigs_Default
 from luxai2021.game.game import Game
 from luxai2021.game.replay import Replay
+
+
+def test_game_records_winner_when_replay_is_disabled():
+    config = deepcopy(LuxMatchConfigs_Default)
+    config["seed"] = 42
+    config["parameters"]["MAX_DAYS"] = 1
+    game = Game(config)
+
+    assert game.run_turn_with_actions([])
+    assert game.replay is None
+    assert game.last_winning_team in {0, 1}
 
 
 def test_replay_records_agent_names_result_and_file(tmp_path):

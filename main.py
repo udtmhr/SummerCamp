@@ -28,8 +28,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--seed",
         type=parse_seed,
         default=None,
-        help="Map and team-assignment seed. Use an integer to reproduce a match; default: random.",
+        help="First map and team-assignment seed. Later games use consecutive seeds; default: random.",
     )
+    parser.add_argument("--games", type=int, default=1, help="Number of games to play.")
     parser.add_argument("--model-a", default="models/bc_v2/best.pt", help="First model checkpoint.")
     parser.add_argument("--model-b", default="models/bc_v2/best.pt", help="Second model checkpoint.")
     parser.add_argument(
@@ -57,7 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "none", "rot180"),
         help="Inference augmentation for model B; first-place auto uses rot180.",
     )
-    parser.add_argument("--replay-dir", default="replays", help="Replay output directory.")
+    parser.add_argument("--save-replays", action="store_true", help="Save one replay file per game.")
+    parser.add_argument("--replay-dir", default="replays", help="Replay output directory when saving is enabled.")
     return parser
 
 
@@ -69,41 +71,56 @@ def create_agent(checkpoint: str, model_type: str, device: str, tta: str) -> Beh
 
 def main() -> None:
     args = build_parser().parse_args()
-    seed = args.seed if args.seed is not None else secrets.randbelow(2**31)
+    if args.games < 1:
+        raise ValueError("--games must be positive")
+    first_seed = args.seed if args.seed is not None else secrets.randbelow(2**31 - args.games + 1)
 
     config = dict(LuxMatchConfigs_Default)
-    config["seed"] = seed
+    config["seed"] = first_seed
 
     agent_a = create_agent(args.model_a, args.type_a, args.device, args.tta_a)
     agent_a.replay_name = args.model_a
     agent_b = create_agent(args.model_b, args.type_b, args.device, args.tta_b)
     agent_b.replay_name = args.model_b
 
-    match_name = f"{model_label(args.model_a)}-vs-{model_label(args.model_b)}_seed{seed}"
+    match_label = f"{model_label(args.model_a)}-vs-{model_label(args.model_b)}"
     env = LuxEnvironment(
         config,
         agent_a,
         agent_b,
-        replay_folder=args.replay_dir,
-        replay_prefix=match_name,
+        replay_folder=args.replay_dir if args.save_replays else None,
+        replay_prefix=match_label,
     )
 
-    with suppress(StopIteration):
-        env.reset(seed=seed)
+    wins = {"A": 0, "B": 0}
+    for game_index in range(args.games):
+        seed = first_seed + game_index
+        env.replay_prefix = f"{match_label}_seed{seed}"
+        with suppress(StopIteration):
+            env.reset(seed=seed)
 
-    team_names = {
-        agent_a.team: agent_a.replay_name,
-        agent_b.team: agent_b.replay_name,
-    }
-    winner = env.game.last_winning_team
-    replay_path = rename_replay(env.game.last_replay_file, team_names[winner])
-    env.game.last_replay_file = str(replay_path)
+        team_sides = {agent_a.team: "A", agent_b.team: "B"}
+        team_names = {agent_a.team: agent_a.replay_name, agent_b.team: agent_b.replay_name}
+        winner_team = env.game.last_winning_team
+        winner_side = team_sides[winner_team]
+        wins[winner_side] += 1
 
-    print(f"Seed: {seed}")
-    print(f"試合: Team 0={team_names[0]} vs Team 1={team_names[1]}")
-    print(f"勝者: Team {winner} ({team_names[winner]})")
-    print("終了ターン:", env.game.state["turn"])
-    print("Replay:", env.game.last_replay_file)
+        replay_path = None
+        if args.save_replays:
+            replay_path = rename_replay(env.game.last_replay_file, team_names[winner_team])
+            env.game.last_replay_file = str(replay_path)
+
+        print(
+            f"Game {game_index + 1}/{args.games}: seed={seed} "
+            f"Team 0={team_names[0]} Team 1={team_names[1]} "
+            f"winner={winner_side} ({team_names[winner_team]}) turn={env.game.state['turn']}"
+        )
+        if replay_path is not None:
+            print(f"Replay: {replay_path}")
+
+    print("\nResults")
+    print(f"A: {args.model_a}  {wins['A']}/{args.games} wins ({wins['A'] / args.games:.1%})")
+    print(f"B: {args.model_b}  {wins['B']}/{args.games} wins ({wins['B'] / args.games:.1%})")
 
 
 if __name__ == "__main__":

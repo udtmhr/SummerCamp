@@ -18,7 +18,7 @@ from luxai2021.imitation.agent import BehaviorCloningAgent, FirstPlaceAgent
 from luxai2021.rl.policy import deterministic_outcome
 
 
-def _survival_summary(game: object, team: int) -> dict[str, float | bool | None]:
+def _survival_summary(game: object, team: int) -> dict[str, float | bool | int | None]:
     events = [
         event
         for event in getattr(game, "diagnostic_events", ())
@@ -32,6 +32,12 @@ def _survival_summary(game: object, team: int) -> dict[str, float | bool | None]
     )
     last_night = [event for event in snapshots if int(event.get("turn", -1)) >= 350]
     last_night_start = min(last_night, key=lambda event: int(event.get("turn", 0))) if last_night else None
+    night_starts = [event for event in snapshots if bool(event.get("night_start", False))]
+    max_stranded = (
+        max(night_starts, key=lambda event: float(event.get("stranded_fuel_fraction", 0.0)))
+        if night_starts
+        else None
+    )
     return {
         "final_city_tiles": float(final_city_tiles),
         "final_city_zero": final_city_tiles == 0,
@@ -44,6 +50,12 @@ def _survival_summary(game: object, team: int) -> dict[str, float | bool | None]
             min(float(event.get("min_city_fuel_margin", -1.0)) for event in snapshots)
             if snapshots
             else None
+        ),
+        "max_night_start_stranded_fuel_fraction": (
+            float(max_stranded.get("stranded_fuel_fraction", 0.0)) if max_stranded is not None else None
+        ),
+        "max_night_start_stranded_fuel_turn": (
+            int(max_stranded.get("turn", 0)) if max_stranded is not None else None
         ),
         "normalized_city_tile_loss": sum(int(event.get("city_tiles_lost", 0)) for event in city_losses)
         / peak_city_tiles,
@@ -269,6 +281,7 @@ def _paired_survival_deltas(
         "final_city_zero_delta": mean_delta("final_city_zero"),
         "last_night_survival_delta": mean_delta("last_night_survival"),
         "night_fuel_margin_delta": mean_delta("min_night_fuel_margin"),
+        "stranded_fuel_delta": mean_delta("max_night_start_stranded_fuel_fraction"),
         "normalized_city_tile_loss_delta": mean_delta("normalized_city_tile_loss"),
     }
 
@@ -289,9 +302,13 @@ def acceptance_report(
     enforce_teacher_guard: bool = False,
     teacher_noninferiority_margin: float = 0.02,
     require_survival: bool = False,
+    require_stranded_fuel: bool = False,
+    stranded_fuel_noninferiority_margin: float = 0.02,
 ) -> dict[str, object]:
     if candidates.keys() != baselines.keys():
         raise ValueError("Acceptance requires matching candidate and baseline architectures")
+    if not 0.0 <= stranded_fuel_noninferiority_margin <= 1.0:
+        raise ValueError("Stranded-fuel noninferiority margin must be in [0, 1]")
     architecture_reports = {}
     combined = []
     for architecture in sorted(candidates):
@@ -314,6 +331,7 @@ def acceptance_report(
         final_zero_delta = survival.get("final_city_zero_delta")
         last_night_delta = survival.get("last_night_survival_delta")
         fuel_margin_delta = survival.get("night_fuel_margin_delta")
+        stranded_fuel_delta = survival.get("stranded_fuel_delta")
         survival_passes = (
             not require_survival
             or (
@@ -324,6 +342,14 @@ def acceptance_report(
                 and float(last_night_delta) >= 0.0
                 and fuel_margin_delta is not None
                 and float(fuel_margin_delta) >= -0.02
+            )
+        )
+        stranded_fuel_passes = (
+            not require_stranded_fuel
+            or (
+                bool(survival.get("available"))
+                and stranded_fuel_delta is not None
+                and float(stranded_fuel_delta) <= stranded_fuel_noninferiority_margin
             )
         )
         teacher_passes = (
@@ -337,6 +363,12 @@ def acceptance_report(
                 and base_delta >= 0.0
             )
         )
+        score_latency_passes = (
+            point_delta >= 0.0
+            and min(anchor_deltas.values()) >= -0.05
+            and candidate_p95 < 1.0
+            and candidate_p95 <= baseline_p95 * 1.1
+        )
         architecture_reports[architecture] = {
             "score_rate_delta": point_delta,
             "bootstrap_lcb": bootstrap_lower_bound(list(seed_deltas.values()), seed=seed),
@@ -347,15 +379,16 @@ def acceptance_report(
             "teacher_bootstrap_lcb": teacher_lcb,
             "base_score_rate_delta": base_delta,
             "survival": survival,
+            "stranded_fuel_delta": stranded_fuel_delta,
             "teacher_guard_passes": teacher_passes,
             "survival_passes": survival_passes,
+            "stranded_fuel_passes": stranded_fuel_passes,
+            "score_latency_passes": score_latency_passes,
             "passes": (
-                point_delta >= 0.0
-                and min(anchor_deltas.values()) >= -0.05
-                and candidate_p95 < 1.0
-                and candidate_p95 <= baseline_p95 * 1.1
+                score_latency_passes
                 and teacher_passes
                 and survival_passes
+                and stranded_fuel_passes
             ),
         }
     combined_lcb = bootstrap_lower_bound(combined, seed=seed)

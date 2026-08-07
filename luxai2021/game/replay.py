@@ -80,7 +80,9 @@ class Replay:
         """
         self.data['width'] = game.map.width
         self.data['height'] = game.map.height
-        winner = game.get_winning_team()
+        winner = game.last_winning_team
+        if winner is None:
+            winner = game.get_winning_team()
         game.last_winning_team = winner
         loser = Constants.TEAM.B if winner == Constants.TEAM.A else Constants.TEAM.A
         self.data["results"]["ranks"] = [

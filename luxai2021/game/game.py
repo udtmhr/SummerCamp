@@ -534,6 +534,7 @@ class Game:
         self.run_cooldowns()
 
         if match_over:
+            self.last_winning_team = self.get_winning_team()
             if self.replay:
                 # Write the replay to a file
                 self.replay.write(self)
@@ -547,12 +548,29 @@ class Game:
         return False
 
     def record_night_fuel_diagnostics(self):
-        remaining_turns = 40 - int(self.state["turn"]) % 40
+        turn = int(self.state["turn"])
+        day_length = int(self.configs["parameters"]["DAY_LENGTH"])
+        night_length = int(self.configs["parameters"]["NIGHT_LENGTH"])
+        cycle_length = day_length + night_length
+        cycle = turn % cycle_length
+        remaining_turns = cycle_length - cycle
         for team in [Constants.TEAM.A, Constants.TEAM.B]:
             cities = [city for city in self.cities.values() if city.team == team]
             city_tiles = sum(len(city.city_cells) for city in cities)
             fuel = sum(max(float(city.fuel), 0.0) for city in cities)
-            required = sum(max(float(city.get_light_upkeep()), 0.0) * remaining_turns for city in cities)
+            requirements = [max(float(city.get_light_upkeep()), 0.0) * remaining_turns for city in cities]
+            fuels = [max(float(city.fuel), 0.0) for city in cities]
+            required = sum(requirements)
+            fuel_deficit = sum(
+                max(requirement - city_fuel, 0.0)
+                for requirement, city_fuel in zip(requirements, fuels)
+            )
+            fuel_surplus = sum(
+                max(city_fuel - requirement, 0.0)
+                for requirement, city_fuel in zip(requirements, fuels)
+            )
+            stranded_fuel = min(fuel_deficit, fuel_surplus)
+            stranded_fraction = stranded_fuel / max(required, 1e-6) if required > 0.0 else 0.0
             margins = [
                 (float(city.fuel) - float(city.get_light_upkeep()) * remaining_turns)
                 / max(float(city.get_light_upkeep()) * remaining_turns, 1.0)
@@ -561,13 +579,18 @@ class Game:
             self.diagnostic_events.append(
                 {
                     "event": "night_fuel_snapshot",
-                    "turn": int(self.state["turn"]),
+                    "turn": turn,
                     "team": int(team),
+                    "night_start": cycle == day_length,
                     "city_count": len(cities),
                     "city_tiles": city_tiles,
                     "peak_city_tiles": int(self.diagnostic_peak_city_tiles[team]),
                     "fuel": fuel,
                     "required_fuel": required,
+                    "fuel_deficit": fuel_deficit,
+                    "fuel_surplus": fuel_surplus,
+                    "stranded_fuel": stranded_fuel,
+                    "stranded_fuel_fraction": max(0.0, min(1.0, stranded_fraction)),
                     "fuel_margin": max(-1.0, min(1.0, (fuel - required) / max(required, 1.0))),
                     "min_city_fuel_margin": max(-1.0, min(1.0, min(margins, default=-1.0))),
                 }

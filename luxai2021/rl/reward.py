@@ -32,6 +32,7 @@ METRIC_NAMES = frozenset(
         "min_city_survival",
         "city_tiles_at_risk",
         "night_fuel_deficit",
+        "stranded_fuel",
         "fuel_delivery_coverage",
         "city_tile_loss",
         "night_fuel_shortage",
@@ -43,6 +44,7 @@ METRIC_NAMES = frozenset(
         "own_min_city_survival",
         "own_city_tiles_at_risk",
         "own_night_fuel_deficit",
+        "own_stranded_fuel",
         "own_fuel_delivery_coverage",
         "own_city_tiles_lost",
         "own_night_fuel_shortage",
@@ -53,6 +55,7 @@ LOWER_IS_BETTER_METRIC_NAMES = frozenset(
     {
         "own_city_tiles_at_risk",
         "own_night_fuel_deficit",
+        "own_stranded_fuel",
         "own_city_tiles_lost",
         "own_night_fuel_shortage",
     }

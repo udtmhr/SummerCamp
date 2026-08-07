@@ -122,6 +122,7 @@ def _strategic_team_values(
     city_tiles = sum(len(city.city_cells) for city in cities)
     required_fuel = 0.0
     fuel_deficit = 0.0
+    fuel_surplus = 0.0
     survival_turns = []
     at_risk_cells = []
     safe_cells = []
@@ -130,8 +131,10 @@ def _strategic_team_values(
         fuel = max(float(city.fuel), 0.0)
         requirement = upkeep * required_night_turns
         deficit = max(requirement - fuel, 0.0)
+        surplus = max(fuel - requirement, 0.0)
         required_fuel += requirement
         fuel_deficit += deficit
+        fuel_surplus += surplus
         survival_turns.append(fuel / upkeep if upkeep > 1e-6 else float(night_length))
         (at_risk_cells if deficit > 1e-6 else safe_cells).extend(city.city_cells)
 
@@ -139,11 +142,13 @@ def _strategic_team_values(
         min_survival = min(min(survival_turns) / max(night_length, 1), 1.0)
         at_risk_fraction = len(at_risk_cells) / max(city_tiles, 1)
         deficit_fraction = fuel_deficit / max(required_fuel, 1e-6)
+        stranded_fraction = min(fuel_deficit, fuel_surplus) / max(required_fuel, 1e-6)
     else:
         # A destroyed city must not look safer than a surviving city.
         min_survival = 0.0
         at_risk_fraction = 1.0
         deficit_fraction = 1.0
+        stranded_fraction = 0.0
 
     def position(item: object) -> tuple[int, int]:
         return int(item.pos.x), int(item.pos.y)
@@ -193,6 +198,7 @@ def _strategic_team_values(
         "min_city_survival": min_survival,
         "city_tiles_at_risk": min(max(at_risk_fraction, 0.0), 1.0),
         "night_fuel_deficit": min(max(deficit_fraction, 0.0), 1.0),
+        "stranded_fuel": min(max(stranded_fraction, 0.0), 1.0),
         "fuel_delivery_coverage": delivery_coverage,
         "city_tiles_lost": city_tiles_lost / (city_tiles_lost + _CITY_LOSS_NORMALIZER),
         "night_fuel_shortage": len(loss_events) / (len(loss_events) + _SHORTAGE_NORMALIZER),
@@ -280,6 +286,7 @@ def metrics_from_game(game: object, team: int) -> GameMetrics:
         "min_city_survival": own_strategy["min_city_survival"] - opponent_strategy["min_city_survival"],
         "city_tiles_at_risk": opponent_strategy["city_tiles_at_risk"] - own_strategy["city_tiles_at_risk"],
         "night_fuel_deficit": opponent_strategy["night_fuel_deficit"] - own_strategy["night_fuel_deficit"],
+        "stranded_fuel": opponent_strategy["stranded_fuel"] - own_strategy["stranded_fuel"],
         "fuel_delivery_coverage": (
             own_strategy["fuel_delivery_coverage"] - opponent_strategy["fuel_delivery_coverage"]
         ),
@@ -297,6 +304,7 @@ def metrics_from_game(game: object, team: int) -> GameMetrics:
         "own_min_city_survival": own_strategy["min_city_survival"],
         "own_city_tiles_at_risk": own_strategy["city_tiles_at_risk"],
         "own_night_fuel_deficit": own_strategy["night_fuel_deficit"],
+        "own_stranded_fuel": own_strategy["stranded_fuel"],
         "own_fuel_delivery_coverage": own_strategy["fuel_delivery_coverage"],
         "own_city_tiles_lost": own_strategy["city_tiles_lost"],
         "own_night_fuel_shortage": own_strategy["night_fuel_shortage"],

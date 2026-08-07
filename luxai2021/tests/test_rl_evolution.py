@@ -51,7 +51,7 @@ from luxai2021.imitation.model import (
     load_bc_checkpoint,
 )
 from luxai2021.rl.batched_rollout import ActorCriticBatcher, InferenceBatcher
-from luxai2021.rl.evaluation import acceptance_report, paired_seed_deltas
+from luxai2021.rl.evaluation import _survival_summary, acceptance_report, paired_seed_deltas
 from luxai2021.rl.evolution import (
     CandidateResult,
     CodexCandidateGenerator,
@@ -128,6 +128,7 @@ def _metrics(**updates):
         "min_city_survival": 0.0,
         "city_tiles_at_risk": 0.0,
         "night_fuel_deficit": 0.0,
+        "stranded_fuel": 0.0,
         "fuel_delivery_coverage": 0.0,
         "city_tile_loss": 0.0,
         "night_fuel_shortage": 0.0,
@@ -139,6 +140,7 @@ def _metrics(**updates):
         "own_min_city_survival": 0.0,
         "own_city_tiles_at_risk": 0.0,
         "own_night_fuel_deficit": 0.0,
+        "own_stranded_fuel": 0.0,
         "own_fuel_delivery_coverage": 0.0,
         "own_city_tiles_lost": 0.0,
         "own_night_fuel_shortage": 0.0,
@@ -296,6 +298,89 @@ def test_metric_dsl_exposes_phase_local_city_risk_and_delivery():
     assert set(components) == {"delivery_distance", "raw_deficit"}
 
 
+def _spawn_disconnected_city(game, team):
+    own_positions = {
+        (int(cell.pos.x), int(cell.pos.y))
+        for city in game.cities.values()
+        if city.team == team
+        for cell in city.city_cells
+    }
+    for y in range(game.map.height):
+        for x in range(game.map.width):
+            cell = game.map.get_cell(x, y)
+            if not cell.is_city_tile() and all(abs(x - px) + abs(y - py) > 1 for px, py in own_positions):
+                return game.spawn_city_tile(team, x, y)
+    raise AssertionError("No disconnected City location is available")
+
+
+def test_stranded_fuel_tracks_only_simultaneous_surplus_and_deficit_across_cities():
+    game = Game({"seed": 13})
+    _spawn_disconnected_city(game, 0)
+    own_cities = [city for city in game.cities.values() if city.team == 0]
+    assert len(own_cities) == 2
+    game.state["turn"] = 29
+    required = [float(city.get_light_upkeep()) * 10.0 for city in own_cities]
+    own_cities[0].fuel = required[0] + required[1]
+    own_cities[1].fuel = 0.0
+    for city in game.cities.values():
+        if city.team == 1:
+            city.fuel = float(city.get_light_upkeep()) * 10.0
+
+    stranded = metrics_from_game(game, 0)
+    expected = required[1] / sum(required)
+    assert stranded.get("own_stranded_fuel") == pytest.approx(expected)
+    assert stranded.get("stranded_fuel") == pytest.approx(-expected)
+    assert 0.0 <= stranded.get("own_stranded_fuel") <= 1.0
+
+    for city, requirement in zip(own_cities, required):
+        city.fuel = requirement * 0.5
+    assert metrics_from_game(game, 0).get("own_stranded_fuel") == 0.0
+
+    for city, requirement in zip(own_cities, required):
+        city.fuel = requirement
+    assert metrics_from_game(game, 0).get("own_stranded_fuel") == 0.0
+
+
+def test_stranded_fuel_is_zero_for_no_city_and_one_connected_city():
+    game = Game({"seed": 19})
+    own_city = next(city for city in game.cities.values() if city.team == 0)
+    origin = own_city.city_cells[0].pos
+    adjacent = next(
+        cell
+        for cell in game.map.get_adjacent_cells(game.map.get_cell(origin.x, origin.y))
+        if not cell.is_city_tile()
+    )
+    game.spawn_city_tile(0, adjacent.pos.x, adjacent.pos.y)
+    assert len([city for city in game.cities.values() if city.team == 0]) == 1
+    assert metrics_from_game(game, 0).get("own_stranded_fuel") == 0.0
+
+    for city_id in [city.id for city in game.cities.values() if city.team == 0]:
+        game.destroy_city(0, city_id)
+    assert metrics_from_game(game, 0).get("own_stranded_fuel") == 0.0
+
+
+def test_own_stranded_fuel_can_produce_negative_potential_shaping():
+    program = RewardProgram.from_dict(
+        {
+            "version": 2,
+            "derived_metrics": [],
+            "components": [
+                {
+                    "name": "avoid_stranded_fuel",
+                    "expression": {"op": "metric", "name": "own_stranded_fuel"},
+                    "weight": -1.0,
+                }
+            ],
+            "reward_scale": 0.2,
+            "gamma": 1.0,
+        }
+    )
+    before = _metrics(own_stranded_fuel=0.0)
+    after = _metrics(own_stranded_fuel=0.5)
+
+    assert program.reward(before, after).shaping < 0.0
+
+
 def test_city_loss_metric_is_cumulative_for_potential_difference_reward():
     game = Game({"seed": 13})
     own_city = next(city for city in game.cities.values() if city.team == 0)
@@ -399,6 +484,8 @@ def test_parameter_mutation_keeps_ast_shape_and_validates_island_contract():
 
 
 def test_existing_feature_mutation_uses_safe_phase_and_risk_signs_in_every_generation():
+    assert "own_stranded_fuel" in DIRECT_REWARD_METRIC_NAMES
+    assert "own_stranded_fuel" in LOWER_IS_BETTER_METRIC_NAMES
     parent = initial_candidate(island=2, seed=12)
     additions = 0
     for generation in (1, 2):
@@ -500,9 +587,10 @@ def test_island3_structural_soft_accepts_compound_training_setting_changes():
         reward_program=structural.reward_program.to_dict(),
     )
     proposal["ppo_config"]["learning_rate"] *= 1.1
+    proposal["ppo_config"]["kl_coefficient"] = 0.5
     proposal["parameter_constraint_coefficient"] = 0.05
     proposal["mutation_manifest"]["changed_paths"].extend(
-        ("ppo_config.learning_rate", "parameter_constraint_coefficient")
+        ("ppo_config.learning_rate", "ppo_config.kl_coefficient", "parameter_constraint_coefficient")
     )
     ppo_child = EvolutionCandidate.from_proposal(
         proposal,
@@ -512,18 +600,17 @@ def test_island3_structural_soft_accepts_compound_training_setting_changes():
     )
     validate_candidate_mutation([parent], ppo_child)
 
-    zero_constraint = copy.deepcopy(proposal)
-    zero_constraint["parameter_constraint_coefficient"] = 0.0
-    zero_canonical, zero_constraint_child, zero_report = canonicalize_candidate_proposal(
-        zero_constraint,
+    canonical, canonical_child, report = canonicalize_candidate_proposal(
+        proposal,
         [parent],
         generation=1,
         island=3,
     )
-    assert zero_constraint_child.inheritance_mode == "policy"
-    assert zero_constraint_child.parameter_constraint_coefficient == 0.05
-    assert "parameter_constraint_coefficient" in zero_report["corrected_fields"]
-    assert zero_canonical["mutation_manifest"]["changed_paths"]
+    assert canonical_child.inheritance_mode == "policy"
+    assert canonical_child.ppo_config.kl_coefficient == 0.0
+    assert canonical_child.parameter_constraint_coefficient == 0.0
+    assert {"ppo_config", "parameter_constraint_coefficient"} <= set(report["corrected_fields"])
+    assert canonical["mutation_manifest"]["changed_paths"]
 
     opponent_proposal = _candidate_proposal(
         parent,
@@ -754,9 +841,12 @@ def test_codex_proposal_schema_uses_supported_structured_output_constructs():
 
     visit(schema)
     assert schema["properties"]["reward_program"]["properties"]["version"]["type"] == "integer"
+    assert schema["properties"]["ppo_config"]["properties"]["kl_coefficient"]["const"] == 0.0
+    assert schema["properties"]["parameter_constraint_coefficient"]["const"] == 0.0
     encoded = json.dumps(schema)
     assert "own_at_risk_city_tiles" in encoded
     assert "own_night_fuel_deficit" in encoded
+    assert "own_stranded_fuel" in encoded
 
     island3_prompt = build_codex_prompt([initial_candidate(island=3, seed=1)], [], island=3, generation=1)
     assert "coordinated edits across multiple components" in island3_prompt
@@ -765,6 +855,7 @@ def test_codex_proposal_schema_uses_supported_structured_output_constructs():
     assert "https://www.lux-ai.org/specs-2021#Background" in island3_prompt
     assert "360 turns" in island3_prompt
     assert "Teacher non-regression is a hard objective" in island3_prompt
+    assert "simultaneous deficit" in island3_prompt
 
 
 def test_rules_context_is_versioned_and_complete():
@@ -832,18 +923,15 @@ def test_teacher_milestone_selection_prefers_teacher_score_then_latest(tmp_path,
     assert json.loads((tmp_path / "milestone_selection.json").read_text())["selected_checkpoint"] == str(selected)
 
 
-def test_legacy_manifest_preserves_pre_curriculum_anchor_behavior():
+def test_legacy_manifest_requires_a_new_run_for_metric_schema_change():
     args = SimpleNamespace(
         curriculum_profile="teacher_guarded_near_sparse",
         bc_anchor_max_turns=0,
         bc_anchor_sampling="phase-balanced",
     )
 
-    _apply_coordinator_manifest(args, {"schema_version": 2, "arguments": {}})
-
-    assert args.curriculum_profile == "legacy"
-    assert args.bc_anchor_max_turns == 64
-    assert args.bc_anchor_sampling == "replay"
+    with pytest.raises(ValueError, match="Reward metric schema changed"):
+        _apply_coordinator_manifest(args, {"schema_version": 3, "arguments": {}})
 
 
 def test_phase_balanced_sampler_covers_all_turn_strata():
@@ -973,6 +1061,7 @@ def test_codex_generator_soft_accepts_and_reclassifies_semantic_deviation(tmp_pa
 
     assert candidate.mutation_kind == "parameter"
     assert candidate.inheritance_mode == "policy_value"
+    assert candidate.parameter_constraint_coefficient == 0.0
     assert len(prompts) == 1
     assert metadata["attempts"] == 1
     assert metadata["rejected_attempts"] == []
@@ -1168,7 +1257,6 @@ def test_short_full_turn_ppo_smoke_updates_finite_parameters(tmp_path):
     )
     trainer = PPOTrainer(
         actor,
-        copy.deepcopy(actor.policy),
         PPOConfig(update_epochs=1, minibatch_turns=4, bc_coefficient=0.0),
         torch.device("cpu"),
     )
@@ -1181,6 +1269,9 @@ def test_short_full_turn_ppo_smoke_updates_finite_parameters(tmp_path):
     assert any(not torch.equal(before[name], value) for name, value in actor.named_parameters())
     assert 0.0 <= metrics["illegal_action_mass_mean"] <= 1.0
     assert metrics["illegal_action_loss"] >= 0.0
+    assert "kl" not in metrics
+    assert "parameter_constraint_loss" not in metrics
+    assert "parameter_constraint_coefficient" not in metrics
     checkpoint_path = tmp_path / "latest_rl.pt"
     trainer.save_training_checkpoint(
         checkpoint_path,
@@ -1189,10 +1280,17 @@ def test_short_full_turn_ppo_smoke_updates_finite_parameters(tmp_path):
         update=0,
         metrics=metrics,
     )
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    assert "reference_policy" not in checkpoint
+    assert "parameter_reference" not in checkpoint
+    assert "parameter_constraint_coefficient" not in checkpoint
+    checkpoint["reference_policy"] = copy.deepcopy(actor.policy).state_dict()
+    checkpoint["parameter_reference"] = {"legacy": torch.ones(1)}
+    checkpoint["parameter_constraint_coefficient"] = 0.05
+    torch.save(checkpoint, checkpoint_path)
     resumed_actor = FullTurnActorCritic(_small_policy())
     resumed = PPOTrainer(
         resumed_actor,
-        copy.deepcopy(resumed_actor.policy),
         PPOConfig(update_epochs=1, minibatch_turns=4, bc_coefficient=0.0),
         torch.device("cpu"),
     )
@@ -1207,24 +1305,17 @@ def test_short_full_turn_ppo_smoke_updates_finite_parameters(tmp_path):
     )
 
 
-def test_parameter_constraint_is_relative_and_cosine_decays_to_zero():
+def test_parent_kl_and_parameter_constraint_are_absent_from_trainer():
     actor = FullTurnActorCritic(_small_policy())
     trainer = PPOTrainer(
         actor,
-        copy.deepcopy(actor.policy),
-        PPOConfig(),
+        PPOConfig(kl_coefficient=0.8),
         torch.device("cpu"),
-        parameter_constraint_coefficient=0.05,
-        parameter_constraint_decay_decisions=100,
-        constrain_value_head=True,
     )
-    source = torch.zeros((), requires_grad=True)
-    assert float(trainer._parameter_constraint_loss(source)) == pytest.approx(0.0)
-    with torch.no_grad():
-        next(actor.policy.parameters()).add_(0.01)
-    assert float(trainer._parameter_constraint_loss(source)) > 0.0
-    trainer.set_schedule_state(constraint_progress=100, joint_update=3)
-    assert trainer.current_parameter_constraint_coefficient() == pytest.approx(0.0)
+    assert not hasattr(trainer, "reference_policy")
+    assert not hasattr(trainer, "parameter_reference")
+    assert not hasattr(trainer, "parameter_constraint_coefficient")
+    trainer.set_schedule_state(joint_update=3)
 
 
 def test_critic_warmup_never_changes_policy_parameters():
@@ -1251,7 +1342,7 @@ def test_critic_warmup_never_changes_policy_parameters():
 
 def test_training_checkpoint_v2_restores_budget_progress_and_legacy_estimate(tmp_path):
     actor = FullTurnActorCritic(_small_policy())
-    trainer = PPOTrainer(actor, copy.deepcopy(actor.policy), PPOConfig(), torch.device("cpu"))
+    trainer = PPOTrainer(actor, PPOConfig(), torch.device("cpu"))
     checkpoint_path = tmp_path / "latest_rl.pt"
     trainer.save_training_checkpoint(
         checkpoint_path,
@@ -1279,10 +1370,9 @@ def test_training_checkpoint_v2_restores_budget_progress_and_legacy_estimate(tmp
     assert restored.cumulative_decisions == 1234
     assert restored.cumulative_turns == 456
     assert restored.cumulative_episodes == 7
-    assert restored.constraint_progress == 789
+    assert restored.curriculum_progress_decisions == 789
     assert restored.joint_update == 2
     trainer.set_schedule_state(
-        constraint_progress=restored.constraint_progress,
         joint_update=restored.joint_update,
     )
     assert trainer.actor_lr_multiplier == 1.0
@@ -1307,7 +1397,7 @@ def test_training_checkpoint_v2_restores_budget_progress_and_legacy_estimate(tmp
 
 def test_training_checkpoint_can_resume_compatible_weights_from_an_older_base_path(tmp_path):
     actor = FullTurnActorCritic(_small_policy())
-    trainer = PPOTrainer(actor, copy.deepcopy(actor.policy), PPOConfig(), torch.device("cpu"))
+    trainer = PPOTrainer(actor, PPOConfig(), torch.device("cpu"))
     checkpoint_path = tmp_path / "latest_rl.pt"
     trainer.save_training_checkpoint(
         checkpoint_path,
@@ -1480,6 +1570,41 @@ def test_teacher_guard_rejects_base_gain_that_regresses_teacher():
     assert report["promote"] is False
 
 
+@pytest.mark.parametrize(
+    ("candidate_stranded", "passes"),
+    [(0.119, True), (0.121, False)],
+)
+def test_stranded_fuel_promotion_gate_uses_two_percent_noninferiority_margin(
+    candidate_stranded, passes
+):
+    def evaluation(outcomes, stranded):
+        games = [
+            {
+                "anchor": "resattn8-base",
+                "seed": seed,
+                "orientation": 0,
+                "outcome": outcome,
+                "survival": {"max_night_start_stranded_fuel_fraction": stranded},
+            }
+            for seed, outcome in enumerate(outcomes, start=10)
+        ]
+        return {"games": games, "candidate_inference_p95_seconds": 0.1}
+
+    baseline = evaluation([-1.0, -1.0, -1.0], 0.1)
+    candidate = evaluation([1.0, 1.0, 1.0], candidate_stranded)
+    report = acceptance_report(
+        {"resattn8": candidate},
+        {"resattn8": baseline},
+        require_stranded_fuel=True,
+        seed=5,
+    )
+
+    architecture = report["architectures"]["resattn8"]
+    assert architecture["stranded_fuel_delta"] == pytest.approx(candidate_stranded - 0.1)
+    assert architecture["stranded_fuel_passes"] is passes
+    assert report["promote"] is passes
+
+
 def test_legal_mask_tightening_never_reenables_existing_illegal_actions():
     existing = np.array([True, False, True, False])
     additional = np.array([True, True, False, False])
@@ -1516,8 +1641,10 @@ def test_engine_records_night_city_loss_and_invalid_action_turns():
     fuel_event = game.diagnostic_events[-2]
     assert fuel_event["event"] == "night_fuel_snapshot"
     assert fuel_event["team"] == 0
+    assert fuel_event["night_start"] is True
     assert fuel_event["city_tiles"] >= 1
     assert fuel_event["fuel_margin"] < 0
+    assert 0.0 <= fuel_event["stranded_fuel_fraction"] <= 1.0
 
     game.handle_night()
 
@@ -1533,6 +1660,40 @@ def test_engine_records_night_city_loss_and_invalid_action_turns():
     assert illegal["event"] == "illegal_action"
     assert illegal["turn"] == 30
     assert illegal["details"]["unit_id"] == "missing"
+
+
+def test_survival_summary_uses_maximum_night_start_stranded_fuel():
+    game = Game({"seed": 13})
+    game.diagnostic_events.extend(
+        [
+            {
+                "event": "night_fuel_snapshot",
+                "turn": 30,
+                "team": 0,
+                "night_start": True,
+                "stranded_fuel_fraction": 0.1,
+            },
+            {
+                "event": "night_fuel_snapshot",
+                "turn": 31,
+                "team": 0,
+                "night_start": False,
+                "stranded_fuel_fraction": 0.9,
+            },
+            {
+                "event": "night_fuel_snapshot",
+                "turn": 70,
+                "team": 0,
+                "night_start": True,
+                "stranded_fuel_fraction": 0.4,
+            },
+        ]
+    )
+
+    summary = _survival_summary(game, 0)
+
+    assert summary["max_night_start_stranded_fuel_fraction"] == pytest.approx(0.4)
+    assert summary["max_night_start_stranded_fuel_turn"] == 70
 
 
 def test_reflection_contains_parent_changes_improvement_and_diagnostic_turns():
@@ -1551,6 +1712,12 @@ def test_reflection_contains_parent_changes_improvement_and_diagnostic_turns():
             "training": {
                 "diagnostic_events": [
                     {"event": "city_destroyed_night_fuel", "turn": 31, "city_tiles_lost": 2},
+                    {
+                        "event": "night_fuel_snapshot",
+                        "turn": 30,
+                        "night_start": True,
+                        "stranded_fuel_fraction": 0.4,
+                    },
                     {"event": "illegal_action", "turn": 32, "action_class": "MoveAction"},
                 ]
             }
@@ -1566,8 +1733,10 @@ def test_reflection_contains_parent_changes_improvement_and_diagnostic_turns():
     reflection = reflected.metrics["reflection"]
 
     assert reflection["diagnostics"]["city_tile_loss_turns"] == [31]
+    assert reflection["diagnostics"]["max_night_start_stranded_fuel_fraction"] == pytest.approx(0.4)
+    assert reflection["diagnostics"]["max_night_start_stranded_fuel_turn"] == 30
     assert reflection["diagnostics"]["illegal_action_turns"] == [32]
-    assert reflected.metrics["training"]["diagnostic_event_count"] == 2
+    assert reflected.metrics["training"]["diagnostic_event_count"] == 3
     assert "diagnostic_events" not in reflected.metrics["training"]
     comparison = reflection["parent_comparisons"][0]
     assert comparison["changes"]
@@ -1901,7 +2070,11 @@ def test_worker_inherits_resattn8_only_from_coordinator_manifest():
 
     _apply_coordinator_manifest(
         worker_args,
-        {"arguments": {"resattn8_only": True, "resattn8_checkpoint": "original.pt"}},
+        {
+            "schema_version": 4,
+            "metric_schema_version": 2,
+            "arguments": {"resattn8_only": True, "resattn8_checkpoint": "original.pt"},
+        },
     )
 
     assert worker_args.resattn8_only is True
