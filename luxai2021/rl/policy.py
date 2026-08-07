@@ -3,12 +3,12 @@ from __future__ import annotations
 # ruff: noqa: C901, PLR0912, PLR0913, PLR0915, TC003
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 from torch import Tensor, nn
-from torch.distributions import Categorical
 
 from luxai2021.env.agent import Agent
 from luxai2021.game.actions import ResearchAction, SpawnCartAction, SpawnWorkerAction
@@ -61,6 +61,7 @@ class EpisodeTrajectory:
     seed: int
     opponent: str
     diagnostic_events: list[dict[str, object]] = field(default_factory=list)
+    timings: dict[str, float] = field(default_factory=dict)
 
 
 class FullTurnActorCritic(nn.Module):
@@ -111,10 +112,14 @@ class FullTurnActorCritic(nn.Module):
         )
 
 
-def _distribution(logits: Tensor, legal_mask: np.ndarray | Tensor) -> Categorical:
+def _action_statistics(logits: Tensor, legal_mask: np.ndarray | Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """Return normalized log-probabilities, probabilities, and entropy once."""
     mask = torch.as_tensor(legal_mask, dtype=torch.bool, device=logits.device)
-    masked = apply_legal_action_mask(logits[None], mask[None])[0]
-    return Categorical(logits=masked.float())
+    masked = apply_legal_action_mask(logits[None], mask[None])[0].float()
+    log_probabilities = masked - masked.logsumexp(dim=-1, keepdim=True)
+    probabilities = torch.softmax(log_probabilities, dim=-1)
+    entropy = -(probabilities * log_probabilities.clamp_min(torch.finfo(log_probabilities.dtype).min)).sum()
+    return log_probabilities, probabilities, entropy
 
 
 class RolloutAgent(BehaviorCloningAgent):
@@ -140,17 +145,24 @@ class RolloutAgent(BehaviorCloningAgent):
         self.tta = "none"
         self.records: list[TurnRecord] = []
         self.generator = torch.Generator(device="cpu")
+        self.timing_seconds: dict[str, float] = {}
 
     def game_start(self, game: object) -> None:
         self.records = []
+        self.timing_seconds = {
+            "snapshot": 0.0,
+            "encode": 0.0,
+            "inference_wait": 0.0,
+            "action_decode": 0.0,
+            "reward_metrics": 0.0,
+        }
         seed = int(getattr(game, "configs", {}).get("seed", 0))
         self.generator.manual_seed(seed * 2 + self.team)
 
-    def _choose_action(self, distribution: Categorical) -> Tensor:
+    def _choose_action(self, probabilities: Tensor) -> Tensor:
         if self.deterministic:
-            return distribution.logits.argmax()
-        probabilities = distribution.probs.float().cpu()
-        return torch.multinomial(probabilities, 1, generator=self.generator).squeeze(0)
+            return probabilities.argmax()
+        return torch.multinomial(probabilities.cpu(), 1, generator=self.generator).squeeze(0)
 
     def _sample_units(
         self,
@@ -189,11 +201,12 @@ class RolloutAgent(BehaviorCloningAgent):
                         additional_allow[index] = False
             legal = monotonically_tighten_legal_mask(existing_legal, additional_allow)
             y, x = unit.pos.y + y_offset, unit.pos.x + x_offset
-            distribution = _distribution(output[entity][0, :, y, x], legal)
-            action_tensor = self._choose_action(distribution).to(distribution.logits.device)
+            log_probabilities, probabilities, entropy = _action_statistics(output[entity][0, :, y, x], legal)
+            action_tensor = self._choose_action(probabilities).to(log_probabilities.device)
             action_index = int(action_tensor)
             action_name = action_names[action_index]
-            candidate = _Candidate("stay", float(distribution.logits[action_index]))
+            selected_log_probability = float(log_probabilities[action_index])
+            candidate = _Candidate("stay", selected_log_probability)
             destination = None
             transfer_target = None
             transfer_amount = 0
@@ -201,7 +214,7 @@ class RolloutAgent(BehaviorCloningAgent):
                 direction = action_name[-1]
                 dx, dy = self._direction_delta(direction)
                 destination = (unit.pos.x + dx, unit.pos.y + dy)
-                candidate = _Candidate("move", float(distribution.logits[action_index]), direction)
+                candidate = _Candidate("move", selected_log_probability, direction)
                 if not game.map.get_cell(*destination).is_city_tile():
                     reserved_destinations.add(destination)
             elif action_name.startswith("transfer_"):
@@ -222,9 +235,9 @@ class RolloutAgent(BehaviorCloningAgent):
                     reserved_capacity[transfer_target.id] = (
                         reserved_capacity.get(transfer_target.id, 0) + transfer_amount
                     )
-                    candidate = _Candidate("transfer", float(distribution.logits[action_index]), direction, resource)
+                    candidate = _Candidate("transfer", selected_log_probability, direction, resource)
             elif action_name in {"build_city", "pillage"}:
-                candidate = _Candidate(action_name, float(distribution.logits[action_index]))
+                candidate = _Candidate(action_name, selected_log_probability)
             choice = _Choice(unit, candidate, destination, transfer_target, transfer_amount)
             choices.append(choice)
             decision = ActionDecision(
@@ -232,8 +245,8 @@ class RolloutAgent(BehaviorCloningAgent):
                 position=(y, x),
                 action=action_index,
                 legal_mask=torch.from_numpy(legal),
-                old_log_prob=float(distribution.log_prob(action_tensor)),
-                entropy=float(distribution.entropy()),
+                old_log_prob=selected_log_probability,
+                entropy=float(entropy),
                 identity=unit.id,
             )
             decisions.append(decision)
@@ -247,10 +260,9 @@ class RolloutAgent(BehaviorCloningAgent):
             if decision.action == 0:
                 continue
             logits = output[decision.entity][0, :, decision.position[0], decision.position[1]]
-            distribution = _distribution(logits, decision.legal_mask)
-            action = torch.zeros((), device=logits.device, dtype=torch.long)
+            log_probabilities, _, _ = _action_statistics(logits, decision.legal_mask)
             decision.action = 0
-            decision.old_log_prob = float(distribution.log_prob(action))
+            decision.old_log_prob = float(log_probabilities[0])
         return choices, decisions
 
     @staticmethod
@@ -291,8 +303,8 @@ class RolloutAgent(BehaviorCloningAgent):
                 additional_allow[3] = False
             legal = monotonically_tighten_legal_mask(base_legal, additional_allow)
             y, x = tile.pos.y + y_offset, tile.pos.x + x_offset
-            distribution = _distribution(output["city_tile"][0, :, y, x], legal)
-            action_tensor = self._choose_action(distribution).to(distribution.logits.device)
+            log_probabilities, probabilities, entropy = _action_statistics(output["city_tile"][0, :, y, x], legal)
+            action_tensor = self._choose_action(probabilities).to(log_probabilities.device)
             action_index = int(action_tensor)
             action_name = CITY_ACTIONS[action_index]
             if action_name in {"build_worker", "build_cart"}:
@@ -308,22 +320,29 @@ class RolloutAgent(BehaviorCloningAgent):
                     position=(y, x),
                     action=action_index,
                     legal_mask=torch.from_numpy(legal),
-                    old_log_prob=float(distribution.log_prob(action_tensor)),
-                    entropy=float(distribution.entropy()),
+                    old_log_prob=float(log_probabilities[action_index]),
+                    entropy=float(entropy),
                     identity=tile.get_tile_id(),
                 )
             )
         return actions, decisions
 
     def process_turn(self, game: object, team: int) -> list[object]:
+        snapshot_started = perf_counter()
         snapshot = snapshot_from_game(game)
+        self.timing_seconds["snapshot"] += perf_counter() - snapshot_started
+        encode_started = perf_counter()
         observation_cpu = torch.from_numpy(encode_snapshot(snapshot, team))
+        self.timing_seconds["encode"] += perf_counter() - encode_started
+        inference_started = perf_counter()
         if self.inference_backend is None:
             observation = observation_cpu[None].to(self.device)
             with torch.inference_mode():
                 output, value = self.actor_critic(observation)
         else:
             output, value = self.inference_backend(observation_cpu)
+        self.timing_seconds["inference_wait"] += perf_counter() - inference_started
+        decode_started = perf_counter()
         x_offset, y_offset = snapshot.padding
         unit_choices, unit_decisions = self._sample_units(
             game,
@@ -341,11 +360,15 @@ class RolloutAgent(BehaviorCloningAgent):
             x_offset,
             y_offset,
         )
+        self.timing_seconds["action_decode"] += perf_counter() - decode_started
         if self.record_trajectory:
+            metrics_started = perf_counter()
+            metrics = metrics_from_game(game, team)
+            self.timing_seconds["reward_metrics"] += perf_counter() - metrics_started
             self.records.append(
                 TurnRecord(
                     observation=observation_cpu,
-                    metrics=metrics_from_game(game, team),
+                    metrics=metrics,
                     decisions=unit_decisions + city_decisions,
                     value=float(value.reshape(-1)[0]),
                 )

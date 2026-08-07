@@ -104,6 +104,22 @@ def test_snapshot_encoding_is_centered_and_team_relative():
     assert own[FEATURE_INDEX["board_size"], 8, 8] == BOARD_SIZES.index(16)
 
 
+def test_snapshot_and_encoding_are_cached_only_for_the_current_game_state():
+    game = Game({**LuxMatchConfigs_Default, "seed": 123})
+    first = snapshot_from_game(game)
+    assert snapshot_from_game(game) is first
+    assert encode_snapshot(first, 0) is encode_snapshot(first, 0)
+    assert first.cached_encoding(1) is not None
+    assert first.units_by_position is first.units_by_position
+    assert first.city_teams_by_position is first.city_teams_by_position
+
+    game.run_turn_with_actions([])
+    second = snapshot_from_game(game)
+    assert second is not first
+    game.reset()
+    assert snapshot_from_game(game) is not second
+
+
 def test_hybrid_features_encode_stacks_full_cargo_and_categories():
     updates = [
         "u 0 0 u_1 1 1 3 100 0 0",

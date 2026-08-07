@@ -89,6 +89,7 @@ class Game:
         # logging so training/evaluation can inspect failures without writing
         # replay files.
         self.diagnostic_events = []
+        self.performance_seconds = {"game_step": 0.0}
         self.diagnostic_peak_city_tiles = {Constants.TEAM.A: 0, Constants.TEAM.B: 0}
         self.cities = {}  # string -> City
         self.cells_with_roads = set() # Set, maintained to speed up agent designs that want to build road maps

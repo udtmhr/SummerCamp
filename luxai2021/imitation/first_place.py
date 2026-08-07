@@ -400,19 +400,12 @@ def predict_first_place(
     return {name: value.float().cpu() for name, value in output.items()}
 
 
-def _units_by_position(snapshot: BoardSnapshot) -> dict[tuple[int, int], list[object]]:
-    result: dict[tuple[int, int], list[object]] = {}
-    for unit in snapshot.units.values():
-        result.setdefault((unit.x, unit.y), []).append(unit)
-    return result
-
-
 def first_place_unit_legal_mask(snapshot: BoardSnapshot, unit: object) -> np.ndarray:
     actions = FIRST_PLACE_WORKER_ACTIONS if unit.unit_type == 0 else FIRST_PLACE_CART_ACTIONS
     mask = np.zeros(len(actions), dtype=np.bool_)
     mask[0] = True
-    units_at = _units_by_position(snapshot)
-    city_teams = {(tile.x, tile.y): tile.team for tile in snapshot.city_tiles}
+    units_at = snapshot.units_by_position
+    city_teams = snapshot.city_teams_by_position
     capacities = GAME_CONSTANTS["PARAMETERS"]["RESOURCE_CAPACITY"]
     for direction_index, direction in enumerate(("n", "e", "s", "w")):
         dx, dy = {"n": (0, -1), "e": (1, 0), "s": (0, 1), "w": (-1, 0)}[direction]

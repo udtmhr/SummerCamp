@@ -730,12 +730,20 @@ uv run --locked python examples/evolve_rl.py \
 `--resattn8-only` disables UNet opponents, probes, training, baselines, and final evaluation. The defaults screen 24
 ResAttn8 candidates for 550,000 sampled decisions, continue the best eight for another
 1,925,000 decisions, and train the best two with ResAttn8 for 9,900,000 decisions each. A candidate runs
-four Lux environments concurrently; candidate and opponent inference requests are collected into GPU batches while
-action decoding remains environment-local. PPO also evaluates all decisions of each entity type as tensors instead of
+four Lux environments concurrently. `--rollout-backend lockstep` selects a rendezvous: candidate and opponent requests
+wait for all active games and then run as one fixed-size GPU batch. Games that finish early leave the rendezvous before
+the next turn. The default `auto` currently retains `threaded` because the end-to-end 2x acceptance gate has not been
+met; the effective backend and fallback reason are recorded in artifacts.
+`--rollout-precision auto` uses BF16 on supported CUDA devices and FP32 elsewhere; `--rollout-compile auto|on|off`
+controls the measured `torch.compile` path. PPO also evaluates all decisions of each entity type as tensors instead of
 one Python operation per unit. Tune `--rollout-envs` for each GPU and `--decisions-per-update` for the rollout/update
-balance. In ResAttn8-only mode, screening/medium/final evaluation uses 12/24/100 fixed seeds, both player orientations,
-the distilled ResAttn8 base plus the original first-place policy, no replay output, paired bootstrap reporting, and an
-inference-latency guard. Re-running the same command resumes completed candidates and stage checkpoints. Use
+balance. Metrics record batch fill, queue wait, tensor staging, forward/copy time, game step, observation encoding,
+action decoding, reward metrics, rollout throughput, PPO update time, precision, compilation, fallback reason, and
+peak CUDA allocation. Each candidate artifact also stores the calibrated backend, precision, compile state, and
+fallback reason in `rollout_runtime.json`. In ResAttn8-only mode, screening/medium/final evaluation uses 12/24/100
+fixed seeds, both player orientations, the distilled ResAttn8 base plus the original first-place policy, no replay
+output, paired bootstrap reporting, and an inference-latency guard. Re-running the same command resumes completed
+candidates and stage checkpoints. Use
 `--no-codex` for deterministic numeric mutations, or `--overwrite-run` to intentionally start that run directory
 again. A dry-run directory cannot be reused for training because its candidates were generated without Codex. The
 Codex CLI must already be installed and authenticated when proposal generation is enabled. Prompts are supplied via
@@ -746,6 +754,27 @@ lineage-invalid proposals are returned to Codex with the exact validator error a
 (`--codex-validation-retries`). Rejected proposals and errors are retained beside the accepted proposal for
 audit. After repair retries are exhausted, proposal errors stop the coordinator before registering or training that
 candidate; deterministic fallback is available only with the explicit `--allow-codex-fallback` option.
+
+Benchmark the target GPU before a long run. The first configuration is the speedup baseline; additional checkpoints
+compare the existing lightweight students without replacing any model:
+
+```bash
+uv run --locked python benchmarks/benchmark_evolve_rollout.py \
+  --device cuda --decisions 40000 --repeats 3 \
+  --checkpoint resattn8=models/distilled/resattn8_v2_selfplay_ft/best.pt \
+  --checkpoint resnet17x32=models/distilled/resnet17x32_s42/best.pt \
+  --checkpoint resnet17x48=models/distilled/resnet17x48_s42/best.pt \
+  --rollout-envs 1 --rollout-envs 2 --rollout-envs 4 --rollout-envs 8 \
+  --backend lockstep --precision auto --compile auto \
+  --output /tmp/lux-rollout-benchmark.json
+```
+
+Use `--seconds 60` instead of `--decisions 40000` for the fixed-wall-clock comparison. The budget flags are mutually
+exclusive; omitting both uses 40,000 decisions.
+
+Throughput alone does not promote a lightweight model. Train it in a separate run and apply the existing matched
+seed/orientation, Teacher non-regression, and city/fuel survival gates. Retain it only when those gates pass and median
+rollout throughput is at least 25% above the ResAttn8 control.
 
 #### Smartphone notifications
 

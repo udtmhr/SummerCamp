@@ -37,6 +37,8 @@ from luxai2021.rl.batched_rollout import (
     BatchedOpponentPool,
     BehaviorCloningBatcher,
     FirstPlaceBatcher,
+    configure_rollout_determinism,
+    resolve_rollout_precision,
 )
 from luxai2021.rl.evaluation import (
     LeagueMember,
@@ -64,8 +66,10 @@ from luxai2021.rl.notifications import EvolutionNotifier
 from luxai2021.rl.policy import FullTurnActorCritic, RolloutAgent
 from luxai2021.rl.ppo import (
     PPOTrainer,
+    aggregate_episode_timings,
     apply_reward_program,
     collect_episodes_batched,
+    resolve_rollout_backend,
     value_head_calibration_loss,
     warmup_value_head,
 )
@@ -92,6 +96,8 @@ _FATAL_CUDA_ERROR_MARKERS = (
 _AUTOMATIC_INFRASTRUCTURE_RETRIES = 2
 _METRIC_SCHEMA_VERSION = 2
 _RUN_MANIFEST_SCHEMA_VERSION = 4
+_NATIVE_CPU_GATE_MIN_DECISIONS = 40_000
+_NATIVE_CPU_GATE_SHARE = 0.25
 _RETRYABLE_INFRASTRUCTURE_ERROR_MARKERS = (
     "filenotfounderror",
     "no such file or directory",
@@ -122,6 +128,10 @@ _RUN_MANIFEST_ARGUMENTS = (
     "final_decisions",
     "decisions_per_update",
     "rollout_envs",
+    "rollout_backend",
+    "rollout_precision",
+    "rollout_compile",
+    "rollout_batch_wait_ms",
     "medium_count",
     "final_count",
     "episodes_per_update",
@@ -194,6 +204,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final-decisions", type=int, default=9_900_000)
     parser.add_argument("--decisions-per-update", type=int, default=40_000)
     parser.add_argument("--rollout-envs", type=int, default=4)
+    parser.add_argument("--rollout-backend", choices=("auto", "lockstep", "threaded"), default="auto")
+    parser.add_argument("--rollout-precision", choices=("auto", "fp32", "bf16", "fp16"), default="auto")
+    parser.add_argument("--rollout-compile", choices=("auto", "on", "off"), default="auto")
+    parser.add_argument("--rollout-batch-wait-ms", type=float, default=2.0)
     parser.add_argument("--medium-count", type=int, default=8)
     parser.add_argument("--final-count", type=int, default=2)
     parser.add_argument("--episodes-per-update", type=int, default=2)
@@ -619,24 +633,51 @@ def batched_opponent_pool(
     snapshot: FullTurnActorCritic,
     device: torch.device,
     rollout_envs: int,
+    rollout_backend: str = "auto",
+    rollout_precision: str = "auto",
+    rollout_compile: str = "auto",
+    rollout_batch_wait_ms: float = 2.0,
 ) -> tuple[BatchedOpponentPool, dict[str, tuple[str, Callable[[], Agent]]]]:
     device_name = str(device)
+    wait_seconds = rollout_batch_wait_ms / 1000.0
+    pad_batches = resolve_rollout_backend(rollout_backend) == "lockstep"
     self_base = BehaviorCloningBatcher(
         BehaviorCloningAgent(str(base_checkpoint), device=device_name, tta="none"),
         rollout_envs,
         name="lux-self-base-inference",
+        wait_seconds=wait_seconds,
+        precision=rollout_precision,
+        compile_mode=rollout_compile,
+        pad_batches=pad_batches,
     )
     other_base = BehaviorCloningBatcher(
         BehaviorCloningAgent(str(other_checkpoint), device=device_name, tta="none"),
         rollout_envs,
         name="lux-other-base-inference",
+        wait_seconds=wait_seconds,
+        precision=rollout_precision,
+        compile_mode=rollout_compile,
+        pad_batches=pad_batches,
     )
     teacher = FirstPlaceBatcher(
         FirstPlaceAgent(str(teacher_checkpoint), device=device_name, tta="none"),
         rollout_envs,
         name="lux-teacher-inference",
+        wait_seconds=wait_seconds,
+        precision=rollout_precision,
+        compile_mode=rollout_compile,
+        pad_batches=pad_batches,
     )
-    snapshot_backend = ActorCriticBatcher(snapshot, device, rollout_envs, name="lux-snapshot-inference")
+    snapshot_backend = ActorCriticBatcher(
+        snapshot,
+        device,
+        rollout_envs,
+        name="lux-snapshot-inference",
+        wait_seconds=wait_seconds,
+        precision=rollout_precision,
+        compile_mode=rollout_compile,
+        pad_batches=pad_batches,
+    )
     resources = BatchedOpponentPool(
         {
             "self_base": self_base,
@@ -688,6 +729,10 @@ def train_candidate(
     resume_from: Path | None = None,
     resume_budget_progress: bool = True,
     checkpoint_callback: Callable[[Path, Mapping[str, object]], None] | None = None,
+    rollout_backend: str = "auto",
+    rollout_precision: str = "auto",
+    rollout_compile: str = "auto",
+    rollout_batch_wait_ms: float = 2.0,
 ) -> tuple[Path, dict[str, object]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     base_checkpoint_sha256 = _sha256_file(base_checkpoint)
@@ -784,6 +829,10 @@ def train_candidate(
         device,
         rollout_envs,
         name="lux-candidate-inference",
+        wait_seconds=rollout_batch_wait_ms / 1000.0,
+        precision=rollout_precision,
+        compile_mode=rollout_compile,
+        pad_batches=resolve_rollout_backend(rollout_backend) == "lockstep",
     )
     opponent_resources, pool = batched_opponent_pool(
         base_checkpoint=base_checkpoint,
@@ -792,6 +841,10 @@ def train_candidate(
         snapshot=snapshot,
         device=device,
         rollout_envs=rollout_envs,
+        rollout_backend=rollout_backend,
+        rollout_precision=rollout_precision,
+        rollout_compile=rollout_compile,
+        rollout_batch_wait_ms=rollout_batch_wait_ms,
     )
     effective_reward_program = candidate.reward_program
     reward_calibration: dict[str, object] = {
@@ -828,6 +881,7 @@ def train_candidate(
             device=device,
             inference_backend=candidate_batcher.submit,
             max_turns=max_turns,
+            rollout_backend=rollout_backend,
         )
         if parent_reward_program is not None:
             transitions = [
@@ -869,6 +923,7 @@ def train_candidate(
                     device=device,
                     inference_backend=candidate_batcher.submit,
                     max_turns=max_turns,
+                    rollout_backend=rollout_backend,
                 )
                 warmup_episodes.extend(wave)
                 warmup_turns += sum(len(episode.records) for episode in wave)
@@ -893,6 +948,11 @@ def train_candidate(
             if decision_budget is not None
             else time.monotonic() < deadline or update == 0
         ):
+            candidate_batcher.reset_metrics()
+            opponent_resources.reset_metrics()
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+            rollout_started = time.monotonic()
             episodes = []
             update_decisions = 0
             target_update_decisions = decisions_per_update if decision_budget is not None else None
@@ -929,14 +989,18 @@ def train_candidate(
                     device=device,
                     inference_backend=candidate_batcher.submit,
                     max_turns=max_turns,
+                    rollout_backend=rollout_backend,
                 )
                 episodes.extend(wave)
                 update_decisions += sum(len(record.decisions) for episode in wave for record in episode.records)
             _synchronize_cuda(device, "rollout collection")
+            rollout_seconds = time.monotonic() - rollout_started
             actor_critic.train()
             trainer.set_schedule_state(joint_update=joint_update)
+            ppo_update_started = time.monotonic()
             metrics = trainer.update(episodes)
             _synchronize_cuda(device, "PPO update")
+            ppo_update_seconds = time.monotonic() - ppo_update_started
             actor_critic.eval()
             cumulative_decisions += int(metrics["decisions"])
             curriculum_progress_decisions += int(metrics["decisions"])
@@ -950,6 +1014,11 @@ def train_candidate(
                 for record_index, record in enumerate(episode.records):
                     terminal = episode.outcome if record_index + 1 == len(episode.records) else 0.0
                     shaping_values.append(record.reward - terminal)
+            rollout_stage_seconds = aggregate_episode_timings(episodes)
+            native_cpu_stage_seconds = sum(
+                rollout_stage_seconds.get(name, 0.0) for name in ("snapshot", "encode", "game_step", "reward_metrics")
+            )
+            native_cpu_estimated_share = min(native_cpu_stage_seconds / max(rollout_seconds, 1e-6), 1.0)
             metrics.update(
                 {
                     "update": update,
@@ -962,6 +1031,25 @@ def train_candidate(
                     "candidate_inference": candidate_batcher.metrics(),
                     "opponent_inference": opponent_resources.metrics(),
                     "rollout_envs": rollout_envs,
+                    "rollout_backend": resolve_rollout_backend(rollout_backend),
+                    "rollout_precision_requested": rollout_precision,
+                    "rollout_compile_requested": rollout_compile,
+                    "rollout_batch_wait_ms": rollout_batch_wait_ms,
+                    "rollout_seconds": rollout_seconds,
+                    "ppo_update_seconds": ppo_update_seconds,
+                    "rollout_games_per_second": len(episodes) / max(rollout_seconds, 1e-6),
+                    "rollout_turns_per_second": float(metrics["turns"]) / max(rollout_seconds, 1e-6),
+                    "rollout_decisions_per_second": float(metrics["decisions"]) / max(rollout_seconds, 1e-6),
+                    "rollout_stage_seconds": rollout_stage_seconds,
+                    "native_cpu_gate": {
+                        "stage_seconds": native_cpu_stage_seconds,
+                        "estimated_end_to_end_share": native_cpu_estimated_share,
+                        "sample_sufficient": int(metrics["decisions"]) >= _NATIVE_CPU_GATE_MIN_DECISIONS,
+                        "eligible": (
+                            int(metrics["decisions"]) >= _NATIVE_CPU_GATE_MIN_DECISIONS
+                            and native_cpu_estimated_share >= _NATIVE_CPU_GATE_SHARE
+                        ),
+                    },
                     "calibrated_reward_scale": effective_reward_program.reward_scale,
                     "effective_reward_scale": scheduled_reward_program.reward_scale,
                     "reward_shaping_multiplier": shaping_multiplier,
@@ -1023,6 +1111,24 @@ def train_candidate(
     final_metrics = history[-1] if history else resumed_metrics
     if final_metrics is None:
         raise RuntimeError("Training completed without a checkpoint or a PPO update")
+    candidate_runtime_value = final_metrics.get("candidate_inference", {})
+    opponent_runtime_value = final_metrics.get("opponent_inference", {})
+    candidate_runtime = candidate_runtime_value if isinstance(candidate_runtime_value, Mapping) else {}
+    opponent_runtime = opponent_runtime_value if isinstance(opponent_runtime_value, Mapping) else {}
+    rollout_runtime = {
+        "backend_requested": rollout_backend,
+        "backend_effective": resolve_rollout_backend(rollout_backend),
+        "backend_fallback_reason": (
+            "lockstep_acceptance_not_met" if rollout_backend == "auto" else None
+        ),
+        "precision_requested": rollout_precision,
+        "precision_effective": candidate_runtime.get("precision"),
+        "compile_requested": rollout_compile,
+        "compile_effective": candidate_runtime.get("compile_effective"),
+        "compile_fallback_reason": candidate_runtime.get("compile_fallback_reason"),
+        "candidate": candidate_runtime,
+        "opponents": opponent_runtime,
+    }
     summary = {
         "candidate_id": candidate.candidate_id,
         "base_name": base_name,
@@ -1055,10 +1161,19 @@ def train_candidate(
         "decision_budget": decision_budget,
         "decisions_per_update": decisions_per_update,
         "rollout_envs": rollout_envs,
+        "rollout_backend": resolve_rollout_backend(rollout_backend),
+        "rollout_precision": rollout_precision,
+        "rollout_compile": rollout_compile,
+        "rollout_batch_wait_ms": rollout_batch_wait_ms,
+        "rollout_runtime": rollout_runtime,
         "history": history,
         "final_metrics": final_metrics,
         "diagnostic_events": diagnostic_events,
     }
+    (output_dir / "rollout_runtime.json").write_text(
+        json.dumps(rollout_runtime, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
     actor_critic.export_policy(
         output_dir / "best.pt",
         epoch=max(0, update - 1),
@@ -1276,6 +1391,10 @@ def candidate_result(
             resume_from=resume_from,
             resume_budget_progress=resume_from == current_checkpoint,
             checkpoint_callback=checkpoint_callback,
+            rollout_backend=args.rollout_backend,
+            rollout_precision=args.rollout_precision,
+            rollout_compile=args.rollout_compile,
+            rollout_batch_wait_ms=args.rollout_batch_wait_ms,
         )
         milestone_selection: dict[str, object] = {"enabled": False}
         if args.curriculum_profile != "legacy" and stage.startswith("final-"):
@@ -1424,6 +1543,14 @@ def _apply_coordinator_manifest(args: argparse.Namespace, manifest: Mapping[str,
         args.curriculum_profile = "legacy"
         args.bc_anchor_max_turns = 64
         args.bc_anchor_sampling = "replay"
+    # Runs created before rollout runtime controls were recorded must resume with
+    # the historical eager FP32 threaded path, rather than silently changing
+    # trajectories because the new CLI defaults are auto-selected.
+    if "rollout_backend" not in coordinator_args and hasattr(args, "rollout_backend"):
+        args.rollout_backend = "threaded"
+        args.rollout_precision = "fp32"
+        args.rollout_compile = "off"
+        args.rollout_batch_wait_ms = 2.0
     expected_rules = manifest.get("lux_s1_rules")
     if expected_rules is not None:
         current_rules = lux_s1_rules_context()
@@ -2159,6 +2286,8 @@ def main(
         raise ValueError("Population sizes must be positive")
     if args.rollout_envs < 1 or args.decisions_per_update < 1:
         raise ValueError("Rollout environment and decision budgets must be positive")
+    if args.rollout_batch_wait_ms < 0:
+        raise ValueError("Rollout batch wait must be non-negative")
     if not args.no_bc_anchor and (args.bc_replays < 1 or args.bc_batch_size < 1):
         raise ValueError("BC anchor replay and batch counts must be positive")
     if args.bc_anchor_max_turns < 0:
@@ -2167,12 +2296,14 @@ def main(
         raise ValueError("Teacher noninferiority margin must be in [0, 0.1]")
     repository = Path(__file__).resolve().parents[1]
     device = resolve_device(args.device)
+    configure_rollout_determinism(device)
     if not args.no_codex and not args.dry_run and shutil.which(args.codex_executable) is None:
         message = f"Codex executable is unavailable: {args.codex_executable}"
         raise FileNotFoundError(message)
     store = EvolutionStore(run_dir)
     if existing_manifest is None:
         generation_mode = "dry_run" if args.dry_run else ("deterministic" if args.no_codex else "codex")
+        effective_precision, _ = resolve_rollout_precision(args.rollout_precision, device)
         manifest = {
             "schema_version": _RUN_MANIFEST_SCHEMA_VERSION,
             "metric_schema_version": _METRIC_SCHEMA_VERSION,
@@ -2180,6 +2311,18 @@ def main(
             "git_revision": git_revision(repository),
             "arguments": vars(args),
             "device": str(device),
+            "rollout_runtime": {
+                "backend_requested": args.rollout_backend,
+                "backend_effective": resolve_rollout_backend(args.rollout_backend),
+                "backend_fallback_reason": (
+                    "lockstep_acceptance_not_met" if args.rollout_backend == "auto" else None
+                ),
+                "precision_requested": args.rollout_precision,
+                "precision_effective": effective_precision,
+                "compile_requested": args.rollout_compile,
+                "compile_effective": "pending_runtime_calibration" if device.type == "cuda" else "off",
+                "compile_fallback_reason": None if device.type == "cuda" else "compile_requires_cuda",
+            },
             "codex_available": shutil.which(args.codex_executable) is not None,
             "bases": {name: getattr(args, f"{name}_checkpoint") for name in _active_base_names(args)},
             "run_kind": "dry-run" if args.dry_run else "training",

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 # ruff: noqa: C901, EM102, FBT003, PLC0415, PLR0912, PLR0913, PLR0915, PLR2004, TC001, TC003
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -25,6 +26,13 @@ from luxai2021.rl.policy import (
 from luxai2021.rl.reward import RewardProgram
 
 TRAINING_CHECKPOINT_SCHEMA_VERSION = 3
+AUTO_ROLLOUT_BACKEND = "threaded"
+
+
+def resolve_rollout_backend(requested: str) -> str:
+    if requested not in {"auto", "lockstep", "threaded"}:
+        raise ValueError(f"Unsupported rollout backend: {requested}")
+    return AUTO_ROLLOUT_BACKEND if requested == "auto" else requested
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
@@ -107,6 +115,7 @@ def finish_episode(
     seed: int,
     opponent: str,
 ) -> EpisodeTrajectory:
+    reward_started = perf_counter()
     final_metrics = metrics_from_game(game, agent.team)
     outcome = deterministic_outcome(game, agent.team)
     records = agent.records
@@ -121,7 +130,18 @@ def finish_episode(
         for event in getattr(game, "diagnostic_events", ())
         if int(event.get("team", agent.team)) == agent.team
     ]
-    return EpisodeTrajectory(agent.team, records, final_metrics, outcome, seed, opponent, diagnostic_events)
+    timings = dict(agent.timing_seconds)
+    timings["reward_finalize"] = perf_counter() - reward_started
+    timings.update(getattr(game, "performance_seconds", {}))
+    return EpisodeTrajectory(agent.team, records, final_metrics, outcome, seed, opponent, diagnostic_events, timings)
+
+
+def aggregate_episode_timings(episodes: Iterable[EpisodeTrajectory]) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    for episode in episodes:
+        for name, seconds in episode.timings.items():
+            totals[name] = totals.get(name, 0.0) + float(seconds)
+    return totals
 
 
 def calculate_gae(episodes: Iterable[EpisodeTrajectory], config: PPOConfig) -> list[TurnRecord]:
@@ -306,6 +326,60 @@ def collect_episode(
     max_turns: int | None = None,
     inference_backend: Callable[[Tensor], tuple[dict[str, Tensor], Tensor]] | None = None,
 ) -> EpisodeTrajectory:
+    runner = _prepare_episode(
+        actor_critic,
+        opponent_factory,
+        reward_program,
+        device=device,
+        seed=seed,
+        opponent_name=opponent_name,
+        max_turns=max_turns,
+        inference_backend=inference_backend,
+    )
+    return runner.run()
+
+
+@dataclass
+class _PreparedEpisode:
+    rollout_agent: RolloutAgent
+    opponent_agent: Agent
+    environment: LuxEnvironment
+    reward_program: RewardProgram
+    seed: int
+    opponent_name: str
+
+    def run(self) -> EpisodeTrajectory:
+        with suppress(StopIteration):
+            self.environment.reset(seed=self.seed)
+        return finish_episode(
+            self.rollout_agent,
+            self.environment.game,
+            self.reward_program,
+            seed=self.seed,
+            opponent=self.opponent_name,
+        )
+
+    def rollout_batchers(self, candidate_backend: object | None) -> set[object]:
+        result = set()
+        if candidate_backend is not None:
+            result.add(candidate_backend)
+        opponent_backend = getattr(self.opponent_agent, "rollout_batcher", None)
+        if opponent_backend is not None:
+            result.add(opponent_backend)
+        return result
+
+
+def _prepare_episode(
+    actor_critic: FullTurnActorCritic,
+    opponent_factory: Callable[[], Agent],
+    reward_program: RewardProgram,
+    *,
+    device: torch.device,
+    seed: int,
+    opponent_name: str,
+    max_turns: int | None,
+    inference_backend: Callable[[Tensor], tuple[dict[str, Tensor], Tensor]] | None,
+) -> _PreparedEpisode:
     rollout_agent = RolloutAgent(
         actor_critic,
         device=device if inference_backend is None else "cpu",
@@ -318,9 +392,7 @@ def collect_episode(
         config["parameters"]["MAX_DAYS"] = max_turns
     config["seed"] = seed
     environment = LuxEnvironment(config, rollout_agent, opponent)
-    with suppress(StopIteration):
-        environment.reset(seed=seed)
-    return finish_episode(rollout_agent, environment.game, reward_program, seed=seed, opponent=opponent_name)
+    return _PreparedEpisode(rollout_agent, opponent, environment, reward_program, seed, opponent_name)
 
 
 def collect_episodes_batched(
@@ -331,14 +403,15 @@ def collect_episodes_batched(
     device: torch.device,
     inference_backend: Callable[[Tensor], tuple[dict[str, Tensor], Tensor]],
     max_turns: int | None = None,
+    rollout_backend: str = "threaded",
 ) -> list[EpisodeTrajectory]:
     """Run one lockstep wave while a shared backend batches policy inference."""
     if not episode_specs:
         return []
+    effective_backend = resolve_rollout_backend(rollout_backend)
 
-    def collect(spec: tuple[Callable[[], Agent], int, str]) -> EpisodeTrajectory:
-        opponent_factory, seed, opponent_name = spec
-        return collect_episode(
+    runners = [
+        _prepare_episode(
             actor_critic,
             opponent_factory,
             reward_program,
@@ -348,9 +421,34 @@ def collect_episodes_batched(
             max_turns=max_turns,
             inference_backend=inference_backend,
         )
+        for opponent_factory, seed, opponent_name in episode_specs
+    ]
+    candidate_backend = getattr(inference_backend, "__self__", None)
+    if not hasattr(candidate_backend, "batch_scope"):
+        candidate_backend = None
+    participant_counts: dict[object, int] = {}
+    runner_backends = []
+    for runner in runners:
+        backends = runner.rollout_batchers(candidate_backend)
+        runner_backends.append(backends)
+        for backend in backends:
+            participant_counts[backend] = participant_counts.get(backend, 0) + 1
 
-    with ThreadPoolExecutor(max_workers=len(episode_specs), thread_name_prefix="lux-rollout") as executor:
-        return list(executor.map(collect, episode_specs))
+    def collect(item: tuple[_PreparedEpisode, set[object]]) -> EpisodeTrajectory:
+        runner, backends = item
+        try:
+            return runner.run()
+        finally:
+            if effective_backend == "lockstep":
+                for backend in backends:
+                    backend.participant_done()
+
+    with ExitStack() as scopes:
+        if effective_backend == "lockstep":
+            for backend, participants in participant_counts.items():
+                scopes.enter_context(backend.batch_scope(participants))
+        with ThreadPoolExecutor(max_workers=len(runners), thread_name_prefix="lux-rollout") as executor:
+            return list(executor.map(collect, zip(runners, runner_backends)))
 
 
 class PPOTrainer:

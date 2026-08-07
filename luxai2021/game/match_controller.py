@@ -341,7 +341,9 @@ class MatchController:
                         handled = True
 
                 if not handled:
+                    game_step_started = time.perf_counter()
                     game_over = self.game.run_turn_with_actions(self.action_buffer)
+                    self.game.performance_seconds["game_step"] += time.perf_counter() - game_step_started
             except Exception as e:
                 # Log exception
                 self.log_error("ERROR: Critical error occurred in turn simulation.")

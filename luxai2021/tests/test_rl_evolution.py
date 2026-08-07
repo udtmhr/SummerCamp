@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from torch.distributions import Categorical
 
 from examples.evolve_rl import (
     PhaseBalancedBatchSampler,
@@ -75,13 +76,14 @@ from luxai2021.rl.evolution import (
 )
 from luxai2021.rl.job_api import JobApiClient, JobApiServer
 from luxai2021.rl.metrics import GameMetrics, MetricContext, metrics_from_game
-from luxai2021.rl.policy import FullTurnActorCritic, RolloutAgent
+from luxai2021.rl.policy import FullTurnActorCritic, RolloutAgent, _action_statistics
 from luxai2021.rl.ppo import (
     PPOConfig,
     PPOTrainer,
     _checkpoint_cuda_rng_state,
     collect_episode,
     collect_episodes_batched,
+    resolve_rollout_backend,
     warmup_value_head,
 )
 from luxai2021.rl.reward import (
@@ -1492,6 +1494,7 @@ def test_inference_batcher_and_parallel_rollout_batch_requests():
             device=torch.device("cpu"),
             inference_backend=actor_batcher.submit,
             max_turns=4,
+            rollout_backend="lockstep",
         )
     finally:
         rollout_metrics = actor_batcher.metrics()
@@ -1499,6 +1502,100 @@ def test_inference_batcher_and_parallel_rollout_batch_requests():
     assert len(episodes) == 2
     assert all(episode.records for episode in episodes)
     assert rollout_metrics["samples"] == sum(len(episode.records) for episode in episodes)
+    assert rollout_metrics["mean_batch_fill_ratio"] == 1.0
+    assert rollout_metrics["mean_batch_size"] == 2.0
+
+
+def test_rollout_action_statistics_match_categorical_reference():
+    logits = torch.tensor([0.25, -0.5, 1.0, 0.75])
+    legal = torch.tensor([True, False, True, True])
+    reference = Categorical(logits=logits.masked_fill(~legal, torch.finfo(logits.dtype).min))
+
+    log_probabilities, probabilities, entropy = _action_statistics(logits, legal)
+
+    assert torch.equal(log_probabilities, reference.logits)
+    assert torch.equal(probabilities, reference.probs)
+    assert torch.equal(entropy, reference.entropy())
+
+
+def test_lockstep_inference_drops_finished_participants_without_partial_batches():
+    barrier = threading.Barrier(3)
+    batcher = InferenceBatcher(lambda values: values, max_batch_size=3, wait_seconds=0.001, name="test-lockstep")
+    outputs = [[], [], []]
+
+    def submit(index, steps):
+        try:
+            barrier.wait()
+            for step in range(steps):
+                outputs[index].append(batcher.submit((index, step)))
+        finally:
+            batcher.participant_done()
+
+    try:
+        with batcher.batch_scope(3):
+            threads = [
+                threading.Thread(target=submit, args=(0, 1)),
+                threading.Thread(target=submit, args=(1, 2)),
+                threading.Thread(target=submit, args=(2, 2)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        metrics = batcher.metrics()
+    finally:
+        batcher.close()
+
+    assert outputs == [[(0, 0)], [(1, 0), (1, 1)], [(2, 0), (2, 1)]]
+    assert metrics["samples"] == 5
+    assert metrics["batches"] == 2
+    assert metrics["mean_batch_fill_ratio"] == 1.0
+
+
+def test_lockstep_fp32_preserves_threaded_rollout_trajectory():
+    torch.manual_seed(1234)
+    prototype = FullTurnActorCritic(_small_policy()).eval()
+
+    def collect(backend):
+        actor = copy.deepcopy(prototype).eval()
+        opponent = copy.deepcopy(prototype).eval()
+        batcher = ActorCriticBatcher(
+            actor,
+            torch.device("cpu"),
+            2,
+            name=f"test-{backend}",
+            wait_seconds=0.0,
+            precision="fp32",
+            pad_batches=backend == "lockstep",
+        )
+        try:
+            return collect_episodes_batched(
+                actor,
+                [
+                    (lambda: RolloutAgent(opponent, device="cpu", deterministic=True), 71, "snapshot"),
+                    (lambda: RolloutAgent(opponent, device="cpu", deterministic=True), 72, "snapshot"),
+                ],
+                default_reward_program(),
+                device=torch.device("cpu"),
+                inference_backend=batcher.submit,
+                max_turns=8,
+                rollout_backend=backend,
+            )
+        finally:
+            batcher.close()
+
+    def signature(episodes):
+        return [
+            (
+                episode.team,
+                episode.outcome,
+                episode.final_metrics.values,
+                [[(decision.identity, decision.action) for decision in record.decisions] for record in episode.records],
+            )
+            for episode in episodes
+        ]
+
+    assert signature(collect("lockstep")) == signature(collect("threaded"))
 
 
 def test_dry_run_archive_is_json_serializable():
@@ -2079,6 +2176,34 @@ def test_worker_inherits_resattn8_only_from_coordinator_manifest():
 
     assert worker_args.resattn8_only is True
     assert worker_args.resattn8_checkpoint == "original.pt"
+
+
+def test_worker_uses_legacy_rollout_runtime_for_old_manifest():
+    worker_args = SimpleNamespace(
+        rollout_backend="auto",
+        rollout_precision="auto",
+        rollout_compile="auto",
+        rollout_batch_wait_ms=9.0,
+    )
+
+    _apply_coordinator_manifest(
+        worker_args,
+        {
+            "schema_version": 4,
+            "metric_schema_version": 2,
+            "arguments": {},
+        },
+    )
+
+    assert worker_args.rollout_backend == "threaded"
+    assert worker_args.rollout_precision == "fp32"
+    assert worker_args.rollout_compile == "off"
+    assert worker_args.rollout_batch_wait_ms == 2.0
+
+
+def test_auto_rollout_backend_stays_threaded_until_acceptance_gate_passes():
+    assert resolve_rollout_backend("auto") == "threaded"
+    assert resolve_rollout_backend("lockstep") == "lockstep"
 
 
 def test_stage_selection_is_frozen_and_uses_only_completed_source_stage(tmp_path):
