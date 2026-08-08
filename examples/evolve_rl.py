@@ -158,6 +158,7 @@ _RUN_MANIFEST_ARGUMENTS = (
     "codex_validation_retries",
     "no_codex",
     "allow_codex_fallback",
+    "fixed_candidate",
 )
 
 
@@ -247,6 +248,10 @@ def parse_args() -> argparse.Namespace:
         help="Retry schema-valid Codex proposals rejected by the mutation validator (default: 2).",
     )
     parser.add_argument("--no-codex", action="store_true")
+    parser.add_argument(
+        "--fixed-candidate",
+        help="Train one immutable candidate proposal through short, medium, and final stages.",
+    )
     parser.add_argument(
         "--allow-codex-fallback",
         action="store_true",
@@ -373,6 +378,44 @@ def _validate_checkpoint_descriptors(args: argparse.Namespace, manifest: Mapping
 
 def _candidate_provenance_path(run_dir: Path, candidate_id: str) -> Path:
     return run_dir / "provenance" / f"{candidate_id}.json"
+
+
+def _load_fixed_candidate(path: Path) -> EvolutionCandidate:
+    if not path.is_file():
+        message = f"Fixed candidate does not exist: {path}"
+        raise FileNotFoundError(message)
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise TypeError("Fixed candidate must be a JSON object")
+    allowed = {"reward_program", "ppo_config", "opponent_mix", "rationale"}
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        message = f"Fixed candidate contains unsupported fields: {unknown}"
+        raise ValueError(message)
+    proposal = {
+        **value,
+        "mutation_kind": "initial",
+        "primary_parent_id": None,
+        "secondary_parent_ids": [],
+        "inheritance_mode": "base",
+        "mutation_manifest": {
+            "changed_paths": [],
+            "summary": "User-selected immutable fixed candidate",
+        },
+        "parameter_constraint_coefficient": 0.0,
+    }
+    return EvolutionCandidate.from_proposal(proposal, generation=0, island=0, parent_ids=())
+
+
+def _validate_fixed_candidate_descriptor(path: Path, manifest: Mapping[str, object]) -> None:
+    expected = manifest.get("fixed_candidate_descriptor")
+    if expected is None:
+        return
+    if not isinstance(expected, dict):
+        raise TypeError("Fixed candidate descriptor is invalid")
+    actual = {"path": str(path), "size": path.stat().st_size, "sha256": _sha256_file(path)}
+    if actual != expected:
+        raise ValueError("Fixed candidate changed; preserve this run and start a new run directory")
 
 
 def _save_candidate_provenance(run_dir: Path, candidate: EvolutionCandidate, value: Mapping[str, object]) -> None:
@@ -1565,6 +1608,11 @@ def _apply_coordinator_manifest(args: argparse.Namespace, manifest: Mapping[str,
         args.curriculum_profile = "legacy"
         args.bc_anchor_max_turns = 64
         args.bc_anchor_sampling = "replay"
+    stored_curriculum = manifest.get("training_curriculum")
+    if stored_curriculum is not None and hasattr(args, "curriculum_profile"):
+        current_curriculum = training_curriculum(args.curriculum_profile).to_dict()
+        if stored_curriculum != current_curriculum:
+            raise ValueError("Training curriculum changed; preserve this run and start a new run directory")
     # Runs created before rollout runtime controls were recorded must resume with
     # the historical eager FP32 threaded path, rather than silently changing
     # trajectories because the new CLI defaults are auto-selected.
@@ -2304,6 +2352,17 @@ def main(
     if existing_manifest is not None:
         _validate_run_kind(existing_manifest, dry_run=args.dry_run)
         _apply_coordinator_manifest(args, existing_manifest)
+    fixed_candidate_path = Path(args.fixed_candidate) if args.fixed_candidate else None
+    fixed_candidate = _load_fixed_candidate(fixed_candidate_path) if fixed_candidate_path is not None else None
+    if existing_manifest is not None and fixed_candidate_path is not None:
+        _validate_fixed_candidate_descriptor(fixed_candidate_path, existing_manifest)
+    if fixed_candidate is not None:
+        args.islands = 1
+        args.initial_per_island = 1
+        args.generations = 0
+        args.medium_count = 1
+        args.final_count = 1
+        args.no_codex = True
     if args.islands < 1 or args.initial_per_island < 1 or args.generations < 0:
         raise ValueError("Population sizes must be positive")
     if args.rollout_envs < 1 or args.decisions_per_update < 1:
@@ -2324,8 +2383,20 @@ def main(
         raise FileNotFoundError(message)
     store = EvolutionStore(run_dir)
     if existing_manifest is None:
-        generation_mode = "dry_run" if args.dry_run else ("deterministic" if args.no_codex else "codex")
+        generation_mode = (
+            "fixed"
+            if fixed_candidate is not None
+            else "dry_run"
+            if args.dry_run
+            else "deterministic"
+            if args.no_codex
+            else "codex"
+        )
         effective_precision, _ = resolve_rollout_precision(args.rollout_precision, device)
+        effective_backend = resolve_rollout_backend(args.rollout_backend)
+        compile_can_calibrate = device.type == "cuda" and (
+            args.rollout_compile == "on" or (args.rollout_compile == "auto" and effective_backend == "lockstep")
+        )
         manifest = {
             "schema_version": _RUN_MANIFEST_SCHEMA_VERSION,
             "metric_schema_version": _METRIC_SCHEMA_VERSION,
@@ -2335,15 +2406,21 @@ def main(
             "device": str(device),
             "rollout_runtime": {
                 "backend_requested": args.rollout_backend,
-                "backend_effective": resolve_rollout_backend(args.rollout_backend),
+                "backend_effective": effective_backend,
                 "backend_fallback_reason": (
                     "lockstep_acceptance_not_met" if args.rollout_backend == "auto" else None
                 ),
                 "precision_requested": args.rollout_precision,
                 "precision_effective": effective_precision,
                 "compile_requested": args.rollout_compile,
-                "compile_effective": "pending_runtime_calibration" if device.type == "cuda" else "off",
-                "compile_fallback_reason": None if device.type == "cuda" else "compile_requires_cuda",
+                "compile_effective": "pending_runtime_calibration" if compile_can_calibrate else "off",
+                "compile_fallback_reason": (
+                    None
+                    if compile_can_calibrate or args.rollout_compile == "off"
+                    else "compile_requires_cuda"
+                    if device.type != "cuda"
+                    else "auto_compile_requires_static_batches"
+                ),
             },
             "codex_available": shutil.which(args.codex_executable) is not None,
             "bases": {name: getattr(args, f"{name}_checkpoint") for name in _active_base_names(args)},
@@ -2357,6 +2434,15 @@ def main(
             "lux_s1_rules": lux_s1_rules_context(),
             "training_curriculum": training_curriculum(args.curriculum_profile).to_dict(),
             "checkpoint_descriptors": {} if args.dry_run else _checkpoint_descriptors(args),
+            "fixed_candidate_descriptor": (
+                {
+                    "path": str(fixed_candidate_path),
+                    "size": fixed_candidate_path.stat().st_size,
+                    "sha256": _sha256_file(fixed_candidate_path),
+                }
+                if fixed_candidate_path is not None
+                else None
+            ),
         }
         store.save_manifest(manifest)
     else:
@@ -2625,7 +2711,7 @@ def main(
         if existing_initial:
             base = existing_initial[0]
         else:
-            base = initial_candidate(island=island, seed=args.seed)
+            base = fixed_candidate if fixed_candidate is not None else initial_candidate(island=island, seed=args.seed)
             register(base, candidate_provenance(base, "initial", generation=0, island=island))
         island_parents[island] = base
         base_wave.append(short_job(base))

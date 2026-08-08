@@ -663,10 +663,18 @@ New runs embed the official Lux AI Season 1 rules URL and the SHA-256 of the pac
 manifest and every Codex prompt. The manifest fixes reward metric schema v2 so a run cannot mix candidates evaluated
 with different metric sets. The search treats the original first-place Teacher as the strongest anchor: Teacher
 score is ranked before aggregate score, and final promotion requires paired Teacher non-regression as well as a
-non-negative distilled-base delta. The default `teacher_guarded_near_sparse` curriculum raises the Teacher opponent
+non-negative distilled-base delta. The optional `teacher_guarded_near_sparse` curriculum raises the Teacher opponent
 floor from 25% to 50%, keeps at least 10% snapshot play, and anneals potential-based shaping from 100% to 5% while
 leaving the terminal win/loss reward unchanged. Use `--curriculum-profile terminal_only_ablation` for an explicit
 terminal-only ablation or `legacy` only when reproducing an old run.
+
+The default dense-shaping reward uses linear potential differencing with absolute own-team penalties for next-night
+fuel deficit and cumulative city-tile loss. Its reward scale is 0.5: the six component weights have an L1 envelope of
+5.2, so the scaled envelope is 2.6 instead of growing beyond the previous four-component envelope of 3.0. Terminal
+win/loss remains unscaled. The BC anchor coefficient starts at 0.025 and its curriculum multiplier stays at 1.0 through
+20% progress (the end of short+medium under the default budgets), then reaches 0.8 at 70% and 0.2 at completion.
+Because candidates and curricula are content-frozen in run artifacts, use a new run directory when adopting these
+defaults; an older run with a different stored curriculum is rejected rather than silently changing its learning rule.
 
 The default BC anchor uses 128 deterministically selected replays, all available turns, and phase-balanced batches
 over four 90-turn phases crossed with day/night. Final stages export curriculum milestones and screen them against the
@@ -727,17 +735,37 @@ uv run --locked python examples/evolve_rl.py \
   --resattn8-only
 ```
 
+To train the reviewed survival-focused candidate only, through short, medium, and final stages, use:
+
+```bash
+uv run --locked python examples/evolve_rl.py \
+  --run-dir shared/lux-survival-linear-v1 \
+  --fixed-candidate configs/rl_candidates/survival_linear_v1.json \
+  --resattn8-checkpoint models/distilled/resnet17x48_s42/best.pt \
+  --curriculum-profile dense_shaping \
+  --rollout-backend threaded --rollout-compile off \
+  --device cuda --resattn8-only
+```
+
+Fixed-candidate mode forces a one-candidate, zero-generation run and selects that same candidate for medium and final
+training. Its source JSON and digest are frozen in the run manifest, so resume the same command after interruption and
+use a new run directory if the candidate definition changes.
+
 `--resattn8-only` disables UNet opponents, probes, training, baselines, and final evaluation. The defaults screen 24
 ResAttn8 candidates for 550,000 sampled decisions, continue the best eight for another
 1,925,000 decisions, and train the best two with ResAttn8 for 9,900,000 decisions each. A candidate runs
-four Lux environments concurrently. `--rollout-backend lockstep` selects a rendezvous: candidate and opponent requests
-wait for all active games and then run as one fixed-size GPU batch. Games that finish early leave the rendezvous before
+16 Lux environments concurrently by default. `--rollout-backend lockstep` selects a rendezvous: candidate and opponent
+requests wait for all active games and then run as one fixed-size GPU batch. Games that finish early leave the rendezvous before
 the next turn. The default `auto` currently retains `threaded` because the end-to-end 2x acceptance gate has not been
 met; the effective backend and fallback reason are recorded in artifacts.
-`--rollout-precision auto` uses BF16 on supported CUDA devices and FP32 elsewhere; `--rollout-compile auto|on|off`
-controls the measured `torch.compile` path. PPO also evaluates all decisions of each entity type as tensors instead of
-one Python operation per unit. Tune `--rollout-envs` for each GPU and `--decisions-per-update` for the rollout/update
-balance. Metrics record batch fill, queue wait, tensor staging, forward/copy time, game step, observation encoding,
+`--rollout-precision auto` uses BF16 on supported CUDA devices and FP32 elsewhere. `--rollout-compile auto` only
+calibrates `torch.compile` for lockstep's fixed padded batches; the default threaded variable-batch backend stays eager
+because repeated calibration cost did not improve its measured steady-state throughput. `on` still explicitly enables
+compile for either backend. Compile attempts, calibration time, fallback details, and the effective mode are recorded.
+Inductor compiler workers are forced away from unsafe fork startup before rollout compilation. PPO also evaluates all
+decisions of each entity type as tensors instead of one Python operation per unit. Tune `--rollout-envs` for each GPU
+and `--decisions-per-update` for the rollout/update balance. Metrics record batch fill, queue wait, tensor staging,
+forward/copy time, game step, observation encoding,
 action decoding, reward metrics, rollout throughput, PPO update time, precision, compilation, fallback reason, and
 peak CUDA allocation. Each candidate artifact also stores the calibrated backend, precision, compile state, and
 fallback reason in `rollout_runtime.json`. In ResAttn8-only mode, screening/medium/final evaluation uses 12/24/100

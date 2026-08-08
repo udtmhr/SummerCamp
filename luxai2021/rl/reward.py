@@ -245,10 +245,7 @@ class RewardProgram:
             for component in self.components
         }
         raw_sum = sum(component.weight * values[component.name] for component in self.components)
-        if self.mode == "potential_tanh":
-            potential = tanh(raw_sum)
-        else:
-            potential = max(-5.0, min(5.0, raw_sum))
+        potential = tanh(raw_sum) if self.mode == "potential_tanh" else max(-5.0, min(5.0, raw_sum))
         if not isfinite(potential):
             raise ValueError("Reward program produced a non-finite potential")
         return potential, values
@@ -427,6 +424,10 @@ def _evaluate_expression(
 
 
 def default_reward_program(mode: str = "potential_linear") -> RewardProgram:
+    # The component L1 envelope grows from 3.0 to 5.2 with the two survival
+    # penalties. A 0.5 scale keeps the scaled envelope at 2.6, below the old
+    # 3.0 envelope, while preserving the component ratios that counter city
+    # expansion. The terminal outcome remains unscaled.
     return RewardProgram.from_dict(
         {
             "version": REWARD_PROGRAM_VERSION,
@@ -440,8 +441,18 @@ def default_reward_program(mode: str = "potential_linear") -> RewardProgram:
                 },
                 {"name": "units", "expression": {"op": "metric", "name": "units"}, "weight": 0.5},
                 {"name": "research", "expression": {"op": "metric", "name": "research"}, "weight": 0.2},
+                {
+                    "name": "own_night_fuel_deficit",
+                    "expression": {"op": "metric", "name": "own_night_fuel_deficit"},
+                    "weight": -1.0,
+                },
+                {
+                    "name": "own_city_tiles_lost",
+                    "expression": {"op": "metric", "name": "own_city_tiles_lost"},
+                    "weight": -1.2,
+                },
             ],
-            "reward_scale": 1.0,
+            "reward_scale": 0.5,
             "gamma": 0.995,
         }
     )

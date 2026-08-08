@@ -79,7 +79,7 @@ class OpponentMix:
         if count <= 0:
             return []
         values = asdict(self)
-        raw_counts = {name: int(round(weight * count)) for name, weight in values.items()}
+        raw_counts = {name: round(weight * count) for name, weight in values.items()}
         current_sum = sum(raw_counts.values())
         if current_sum != count:
             diff = count - current_sum
@@ -170,7 +170,9 @@ def training_curriculum(name: str) -> TrainingCurriculum:
             ((0.0, 0.10), (1.0, 0.10)),
             ((0.0, 1.0), (1.0, 1.0)),
             snapshot_floor=0.10,
-            bc_coefficient_points=((0.0, 1.0), (0.5, 0.5), (1.0, 0.0)),
+            # Short + medium end near 20% of the default total budget. Keep the
+            # teacher anchor intact through that failure-prone interval.
+            bc_coefficient_points=((0.0, 1.0), (0.20, 1.0), (0.70, 0.8), (1.0, 0.2)),
         )
     raise ValueError(f"Unknown curriculum profile: {name}")
 
@@ -1692,7 +1694,7 @@ class CodexCandidateGenerator:
 
 def initial_candidate(*, island: int, seed: int) -> EvolutionCandidate:
     rng = random.Random(seed + island)
-    base_ppo = PPOConfig(bc_coefficient=0.01)
+    base_ppo = PPOConfig(bc_coefficient=0.025)
     reward = default_reward_program().to_dict()
     reward["version"] = 2
     reward["derived_metrics"] = []

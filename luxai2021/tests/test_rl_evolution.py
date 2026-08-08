@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import gzip
 import json
+import random
 import threading
 from collections import Counter
 from pathlib import Path
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from torch._inductor import config as inductor_config
 from torch.distributions import Categorical
 
 from examples.evolve_rl import (
@@ -27,6 +29,7 @@ from examples.evolve_rl import (
     _is_fatal_cuda_error,
     _is_retryable_infrastructure_failure,
     _job_retry_count,
+    _load_fixed_candidate,
     _load_or_create_stage_selection,
     _record_job_retry,
     _record_skipped_job,
@@ -35,6 +38,7 @@ from examples.evolve_rl import (
     _sync_api_claim,
     _validate_candidate_provenance,
     _validate_checkpoint_descriptors,
+    _validate_fixed_candidate_descriptor,
     _validate_run_kind,
     execute_evolution_job,
 )
@@ -51,7 +55,7 @@ from luxai2021.imitation.model import (
     ModelConfig,
     load_bc_checkpoint,
 )
-from luxai2021.rl.batched_rollout import ActorCriticBatcher, InferenceBatcher
+from luxai2021.rl.batched_rollout import ActorCriticBatcher, InferenceBatcher, _CompiledInference
 from luxai2021.rl.evaluation import _survival_summary, acceptance_report, paired_seed_deltas
 from luxai2021.rl.evolution import (
     CandidateResult,
@@ -178,6 +182,53 @@ def test_reward_program_is_bounded_and_preserves_terminal_reward():
     assert breakdown.terminal == 1.0
     assert 1.0 < breakdown.total <= 3.0
     assert set(breakdown.components) == {component.name for component in program.components}
+
+
+def test_default_reward_penalizes_absolute_fuel_deficit_and_city_loss():
+    program = default_reward_program()
+    safe = _metrics(own_night_fuel_deficit=0.0, own_city_tiles_lost=0.0)
+    unsafe = _metrics(own_night_fuel_deficit=0.5, own_city_tiles_lost=0.25)
+
+    breakdown = program.reward(safe, unsafe)
+    weights = {component.name: component.weight for component in program.components}
+
+    assert program.mode == "potential_linear"
+    assert program.reward_scale == pytest.approx(0.5)
+    assert sum(abs(weight) for weight in weights.values()) == pytest.approx(5.2)
+    assert weights["own_night_fuel_deficit"] == pytest.approx(-1.0)
+    assert weights["own_city_tiles_lost"] == pytest.approx(-1.2)
+    assert "night_fuel_deficit" not in weights
+    assert "city_tile_loss" not in weights
+    assert breakdown.shaping < 0.0
+
+
+def test_survival_linear_fixed_candidate_matches_safe_defaults():
+    path = Path("configs/rl_candidates/survival_linear_v1.json")
+    candidate = _load_fixed_candidate(path)
+    weights = {component.name: component.weight for component in candidate.reward_program.components}
+
+    assert candidate.mutation_kind == "initial"
+    assert candidate.reward_program.mode == "potential_linear"
+    assert candidate.reward_program.reward_scale == pytest.approx(0.5)
+    assert weights["own_night_fuel_deficit"] == pytest.approx(-1.0)
+    assert weights["own_city_tiles_lost"] == pytest.approx(-1.2)
+    assert candidate.ppo_config.bc_coefficient == pytest.approx(0.025)
+    assert candidate.opponent_mix.teacher == pytest.approx(0.25)
+
+
+def test_fixed_candidate_descriptor_rejects_changed_file(tmp_path):
+    path = tmp_path / "candidate.json"
+    path.write_text("{}", encoding="utf-8")
+    manifest = {
+        "fixed_candidate_descriptor": {
+            "path": str(path),
+            "size": path.stat().st_size,
+            "sha256": "changed",
+        }
+    }
+
+    with pytest.raises(ValueError, match="Fixed candidate changed"):
+        _validate_fixed_candidate_descriptor(path, manifest)
 
 
 @pytest.mark.parametrize(
@@ -439,13 +490,15 @@ def test_sparse_component_is_not_used_for_inverse_rms_calibration():
 
 
 def test_candidate_round_trip_and_resume_store(tmp_path):
-    candidate = mutate_candidate(initial_candidate(island=1, seed=7), generation=2, island=1, seed=8)
+    initial = initial_candidate(island=1, seed=7)
+    candidate = mutate_candidate(initial, generation=2, island=1, seed=8)
     store = EvolutionStore(tmp_path)
     store.save_candidate(candidate)
 
     loaded = store.candidates()
 
     assert loaded == [candidate]
+    assert initial.ppo_config.bc_coefficient == pytest.approx(0.025)
     assert EvolutionCandidate.from_dict(candidate.to_dict()) == candidate
     assert proposal_schema()["additionalProperties"] is False
     assert sum(vars(OpponentMix()).values()) == pytest.approx(1.0)
@@ -896,8 +949,9 @@ def test_dense_shaping_curriculum_maintains_shaping_and_decays_bc():
     assert curriculum.shaping_multiplier(1.0) == pytest.approx(1.0)
 
     assert curriculum.bc_coefficient_multiplier(0.0) == pytest.approx(1.0)
-    assert curriculum.bc_coefficient_multiplier(0.5) == pytest.approx(0.5)
-    assert curriculum.bc_coefficient_multiplier(1.0) == pytest.approx(0.0)
+    assert curriculum.bc_coefficient_multiplier(0.2) == pytest.approx(1.0)
+    assert curriculum.bc_coefficient_multiplier(0.7) == pytest.approx(0.8)
+    assert curriculum.bc_coefficient_multiplier(1.0) == pytest.approx(0.2)
 
     mixes = [curriculum.opponent_mix(proposed, progress) for progress in (0.0, 0.5, 1.0)]
     assert all(mix.teacher == pytest.approx(0.20) for mix in mixes)  # max(proposed.teacher 0.20, floor 0.10)
@@ -1521,6 +1575,39 @@ def test_inference_batcher_and_parallel_rollout_batch_requests():
     assert rollout_metrics["samples"] == sum(len(episode.records) for episode in episodes)
     assert rollout_metrics["mean_batch_fill_ratio"] == 1.0
     assert rollout_metrics["mean_batch_size"] == 2.0
+
+
+def test_auto_compile_skips_variable_batches_without_calling_torch_compile(monkeypatch):
+    compile_calls = []
+    monkeypatch.setattr(torch, "compile", lambda module, **kwargs: compile_calls.append(kwargs) or module)
+    inference = _CompiledInference(
+        torch.nn.Identity(),
+        torch.device("cuda"),
+        "auto",
+        auto_eligible=False,
+    )
+
+    output = inference(torch.ones(1))
+
+    assert torch.equal(output, torch.ones(1))
+    assert compile_calls == []
+    assert inference.compile_attempts == 0
+    assert inference.fallback_reason == "auto_compile_requires_static_batches"
+
+
+def test_compile_runs_once_per_instance_and_repairs_fork_worker_start(monkeypatch):
+    compile_calls = []
+    monkeypatch.setattr(inductor_config, "worker_start_method", "fork")
+    monkeypatch.setattr(torch, "compile", lambda module, **kwargs: compile_calls.append(kwargs) or module)
+    inference = _CompiledInference(torch.nn.Identity(), torch.device("cuda"), "on")
+
+    inference(torch.ones(1))
+    inference(torch.ones(1))
+
+    assert compile_calls == [{"mode": "reduce-overhead"}]
+    assert inference.compile_attempts == 1
+    assert inference.compile_seconds >= 0.0
+    assert inductor_config.worker_start_method == "subprocess"
 
 
 def test_rollout_action_statistics_match_categorical_reference():
@@ -2218,6 +2305,27 @@ def test_worker_uses_legacy_rollout_runtime_for_old_manifest():
     assert worker_args.rollout_batch_wait_ms == 2.0
 
 
+def test_manifest_rejects_changed_training_curriculum():
+    worker_args = SimpleNamespace(
+        curriculum_profile="dense_shaping",
+        bc_anchor_max_turns=0,
+        bc_anchor_sampling="phase-balanced",
+    )
+    stale_curriculum = training_curriculum("dense_shaping").to_dict()
+    stale_curriculum["bc_coefficient_points"] = [[0.0, 1.0], [0.5, 0.5], [1.0, 0.0]]
+
+    with pytest.raises(ValueError, match="Training curriculum changed"):
+        _apply_coordinator_manifest(
+            worker_args,
+            {
+                "schema_version": 4,
+                "metric_schema_version": 2,
+                "arguments": {"curriculum_profile": "dense_shaping"},
+                "training_curriculum": stale_curriculum,
+            },
+        )
+
+
 def test_auto_rollout_backend_stays_threaded_until_acceptance_gate_passes():
     assert resolve_rollout_backend("auto") == "threaded"
     assert resolve_rollout_backend("lockstep") == "lockstep"
@@ -2392,9 +2500,8 @@ def test_infrastructure_failures_are_retryable_but_candidate_errors_are_not(tmp_
 
 
 def test_opponent_mix_allocate_counts_and_shuffles():
-    import random
     mix = OpponentMix(self_base=0.40, other_base=0.10, teacher=0.10, snapshot=0.40)
-    rng = random.Random(42)
+    rng = random.Random(42)  # noqa: S311
     allocated = mix.allocate(16, rng)
 
     assert len(allocated) == 16

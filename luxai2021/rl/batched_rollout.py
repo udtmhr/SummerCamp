@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 import torch
 from torch import Tensor
+from torch._inductor import config as inductor_config
 
 from luxai2021.env.agent import Agent
 from luxai2021.imitation.agent import BehaviorCloningAgent, FirstPlaceAgent
@@ -232,7 +233,14 @@ class _ObservationStager:
 
 
 class _CompiledInference:
-    def __init__(self, module: torch.nn.Module, device: torch.device, requested: str) -> None:
+    def __init__(
+        self,
+        module: torch.nn.Module,
+        device: torch.device,
+        requested: str,
+        *,
+        auto_eligible: bool = True,
+    ) -> None:
         if requested not in {"auto", "on", "off"}:
             message = f"Unsupported rollout compile mode: {requested}"
             raise ValueError(message)
@@ -241,10 +249,17 @@ class _CompiledInference:
         self.requested = requested
         self.effective = "off"
         self.fallback_reason: str | None = None
+        self.error_detail: str | None = None
         self.compiled: torch.nn.Module | None = None
-        self.calibrated = requested == "off" or device.type != "cuda"
+        self.compile_attempts = 0
+        self.compile_seconds = 0.0
+        self.calibrated = (
+            requested == "off" or device.type != "cuda" or (requested == "auto" and not auto_eligible)
+        )
         if device.type != "cuda" and requested != "off":
             self.fallback_reason = "compile_requires_cuda"
+        elif requested == "auto" and not auto_eligible:
+            self.fallback_reason = "auto_compile_requires_static_batches"
 
     @staticmethod
     def _synchronize(device: torch.device) -> None:
@@ -253,6 +268,11 @@ class _CompiledInference:
 
     def _make_compiled(self) -> torch.nn.Module:
         if self.compiled is None:
+            # Handle callers that imported Inductor before luxai2021.rl. A pool
+            # already configured for fork is unsafe once rollout threads exist.
+            if inductor_config.worker_start_method == "fork":
+                inductor_config.worker_start_method = "subprocess"
+            self.compile_attempts += 1
             self.compiled = torch.compile(self.eager, mode="reduce-overhead")
         return self.compiled
 
@@ -264,6 +284,7 @@ class _CompiledInference:
             if self.calibrated:
                 model = self.compiled if self.effective == "on" else self.eager
                 return model(batch)
+            calibration_started = time.perf_counter()
             try:
                 compiled = self._make_compiled()
                 if self.requested == "on":
@@ -293,7 +314,10 @@ class _CompiledInference:
                 self.effective = "off"
                 self.calibrated = True
                 self.fallback_reason = f"compile_failed:{type(error).__name__}"
+                self.error_detail = repr(error).replace("\n", " ")[:500]
                 return self.eager(batch)
+            finally:
+                self.compile_seconds += time.perf_counter() - calibration_started
 
 
 class ActorCriticBatcher:
@@ -313,7 +337,12 @@ class ActorCriticBatcher:
         self.device = device
         self.precision, self.autocast_dtype = resolve_rollout_precision(precision, device)
         self.stager = _ObservationStager(device, max_batch_size, pad_batches=pad_batches)
-        self.inference_model = _CompiledInference(actor_critic, device, compile_mode)
+        self.inference_model = _CompiledInference(
+            actor_critic,
+            device,
+            compile_mode,
+            auto_eligible=pad_batches,
+        )
         self.stage_seconds = {"host_stage_and_h2d_submit": 0.0, "forward": 0.0, "device_to_host": 0.0}
 
         def infer(observations: list[Tensor]) -> list[tuple[dict[str, Tensor], Tensor]]:
@@ -363,6 +392,9 @@ class ActorCriticBatcher:
                 "compile_requested": self.inference_model.requested,
                 "compile_effective": self.inference_model.effective,
                 "compile_fallback_reason": self.inference_model.fallback_reason,
+                "compile_error_detail": self.inference_model.error_detail,
+                "compile_attempts": self.inference_model.compile_attempts,
+                "compile_seconds": self.inference_model.compile_seconds,
                 "stage_seconds": dict(self.stage_seconds),
                 "peak_cuda_memory_allocated_bytes": (
                     int(torch.cuda.max_memory_allocated(self.device)) if self.device.type == "cuda" else None
@@ -395,7 +427,12 @@ class BehaviorCloningBatcher:
         self.precision, self.autocast_dtype = resolve_rollout_precision(precision, prototype.device)
         self.stager = _ObservationStager(prototype.device, max_batch_size, pad_batches=pad_batches)
         compiled_mode = compile_mode if prototype.tta == "none" else "off"
-        self.inference_model = _CompiledInference(prototype.model, prototype.device, compiled_mode)
+        self.inference_model = _CompiledInference(
+            prototype.model,
+            prototype.device,
+            compiled_mode,
+            auto_eligible=pad_batches,
+        )
         self.compile_requested = compile_mode
         self.compile_fallback_reason = (
             "compile_requires_tta_none" if prototype.tta != "none" and compile_mode != "off" else None
@@ -465,6 +502,9 @@ class BehaviorCloningBatcher:
                 "compile_requested": self.compile_requested,
                 "compile_effective": self.inference_model.effective,
                 "compile_fallback_reason": self.compile_fallback_reason or self.inference_model.fallback_reason,
+                "compile_error_detail": self.inference_model.error_detail,
+                "compile_attempts": self.inference_model.compile_attempts,
+                "compile_seconds": self.inference_model.compile_seconds,
                 "stage_seconds": dict(self.stage_seconds),
             }
         )
