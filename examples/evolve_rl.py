@@ -17,7 +17,7 @@ import threading
 import time
 import traceback
 from collections.abc import Mapping
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
