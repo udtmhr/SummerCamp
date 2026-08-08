@@ -139,13 +139,21 @@ class DerivedMetric:
     expression: Mapping[str, Any]
 
 
+REWARD_MODES = ("potential_linear", "potential_tanh", "direct_step")
+
+
 @dataclass(frozen=True)
 class RewardProgram:
     components: tuple[RewardComponent, ...]
     derived_metrics: tuple[DerivedMetric, ...] = ()
-    reward_scale: float = 0.2
+    reward_scale: float = 1.0
     gamma: float = 0.995
     version: int = 1
+    mode: str = "potential_linear"
+
+    def __post_init__(self) -> None:
+        if self.mode not in REWARD_MODES:
+            raise ValueError(f"Unsupported reward mode: {self.mode}")
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> RewardProgram:
@@ -187,10 +195,13 @@ class RewardProgram:
                 raise ValueError("Reward component weights must be finite and in [-5, 5]")
             names.add(name)
             components.append(RewardComponent(name, expression, weight))
-        reward_scale = float(value.get("reward_scale", 0.2))
+        reward_scale = float(value.get("reward_scale", 1.0))
         gamma = float(value.get("gamma", 0.995))
-        if not isfinite(reward_scale) or not 0.0 <= reward_scale <= 0.5:
-            raise ValueError("reward_scale must be in [0, 0.5]")
+        mode = str(value.get("mode", "potential_linear"))
+        if mode not in REWARD_MODES:
+            raise ValueError(f"Unsupported reward mode: {mode}")
+        if not isfinite(reward_scale) or not 0.0 <= reward_scale <= 2.0:
+            raise ValueError("reward_scale must be in [0, 2.0]")
         if not isfinite(gamma) or not 0.9 <= gamma <= 1.0:
             raise ValueError("reward gamma must be in [0.9, 1.0]")
         return cls(
@@ -199,11 +210,13 @@ class RewardProgram:
             reward_scale=reward_scale,
             gamma=gamma,
             version=version,
+            mode=mode,
         )
 
     def to_dict(self) -> dict[str, Any]:
         value = {
             "version": self.version,
+            "mode": self.mode,
             "components": [
                 {"name": item.name, "expression": dict(item.expression), "weight": item.weight}
                 for item in self.components
@@ -231,7 +244,11 @@ class RewardProgram:
             )
             for component in self.components
         }
-        potential = tanh(sum(component.weight * values[component.name] for component in self.components))
+        raw_sum = sum(component.weight * values[component.name] for component in self.components)
+        if self.mode == "potential_tanh":
+            potential = tanh(raw_sum)
+        else:
+            potential = max(-5.0, min(5.0, raw_sum))
         if not isfinite(potential):
             raise ValueError("Reward program produced a non-finite potential")
         return potential, values
@@ -245,10 +262,18 @@ class RewardProgram:
     ) -> RewardBreakdown:
         if terminal_outcome not in {-1.0, 0.0, 1.0}:
             raise ValueError("Terminal outcome must be -1, 0, or 1")
-        previous_potential, _ = self.potential(previous)
+        previous_potential, prev_component_values = self.potential(previous)
         next_potential, component_values = self.potential(following)
-        shaping = self.reward_scale * (self.gamma * next_potential - previous_potential)
-        total = max(-1.5, min(1.5, terminal_outcome + shaping))
+
+        if self.mode == "direct_step":
+            shaping = self.reward_scale * sum(
+                component.weight * (component_values[component.name] - prev_component_values[component.name])
+                for component in self.components
+            )
+        else:
+            shaping = self.reward_scale * (self.gamma * next_potential - previous_potential)
+
+        total = max(-3.0, min(3.0, terminal_outcome + shaping))
         return RewardBreakdown(
             total=total,
             terminal=terminal_outcome,
@@ -401,10 +426,11 @@ def _evaluate_expression(
     return _evaluate_expression(expression[branch], metrics, derived_values)
 
 
-def default_reward_program() -> RewardProgram:
+def default_reward_program(mode: str = "potential_linear") -> RewardProgram:
     return RewardProgram.from_dict(
         {
             "version": REWARD_PROGRAM_VERSION,
+            "mode": mode,
             "components": [
                 {"name": "city_tiles", "expression": {"op": "metric", "name": "city_tiles"}, "weight": 1.5},
                 {
@@ -415,7 +441,7 @@ def default_reward_program() -> RewardProgram:
                 {"name": "units", "expression": {"op": "metric", "name": "units"}, "weight": 0.5},
                 {"name": "research", "expression": {"op": "metric", "name": "research"}, "weight": 0.2},
             ],
-            "reward_scale": 0.2,
+            "reward_scale": 1.0,
             "gamma": 0.995,
         }
     )
@@ -475,7 +501,7 @@ def calibrate_reward_scale(
     nominal_ratio = max(0.8, min(1.25, child.reward_scale / max(parent.reward_scale, 1e-6)))
     fallback = parent_rms is None or child_rms is None or parent_rms < 1e-8 or child_rms < 1e-8
     unbounded = parent_scale * nominal_ratio if fallback else parent_scale * parent_rms * nominal_ratio / child_rms
-    effective = max(0.01, min(0.5, max(parent_scale * 0.5, min(parent_scale * 2.0, unbounded))))
+    effective = max(0.01, min(2.0, max(parent_scale * 0.5, min(parent_scale * 2.0, unbounded))))
     if not isfinite(effective):
         raise ValueError("Reward calibration produced a non-finite scale")
     calibrated = RewardProgram(

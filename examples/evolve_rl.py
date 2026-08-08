@@ -203,7 +203,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--medium-decisions", type=int, default=1_925_000)
     parser.add_argument("--final-decisions", type=int, default=9_900_000)
     parser.add_argument("--decisions-per-update", type=int, default=40_000)
-    parser.add_argument("--rollout-envs", type=int, default=4)
+    parser.add_argument("--rollout-envs", type=int, default=16)
     parser.add_argument("--rollout-backend", choices=("auto", "lockstep", "threaded"), default="auto")
     parser.add_argument("--rollout-precision", choices=("auto", "fp32", "bf16", "fp16"), default="auto")
     parser.add_argument("--rollout-compile", choices=("auto", "on", "off"), default="auto")
@@ -227,8 +227,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--curriculum-profile",
-        choices=("teacher_guarded_near_sparse", "terminal_only_ablation", "legacy"),
-        default="teacher_guarded_near_sparse",
+        choices=("dense_shaping", "teacher_guarded_near_sparse", "terminal_only_ablation", "legacy"),
+        default="dense_shaping",
+    )
+    parser.add_argument(
+        "--reward-mode",
+        choices=("potential_linear", "potential_tanh", "direct_step"),
+        default=None,
+        help="Override candidate reward mode (default: potential_linear from candidate).",
     )
     parser.add_argument("--teacher-noninferiority-margin", type=float, default=0.02)
     parser.add_argument("--codex-executable", default="codex")
@@ -733,6 +739,7 @@ def train_candidate(
     rollout_precision: str = "auto",
     rollout_compile: str = "auto",
     rollout_batch_wait_ms: float = 2.0,
+    reward_mode: str | None = None,
 ) -> tuple[Path, dict[str, object]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     base_checkpoint_sha256 = _sha256_file(base_checkpoint)
@@ -846,6 +853,16 @@ def train_candidate(
         rollout_compile=rollout_compile,
         rollout_batch_wait_ms=rollout_batch_wait_ms,
     )
+    if reward_mode is not None:
+        candidate_reward = RewardProgram(
+            candidate.reward_program.components,
+            candidate.reward_program.derived_metrics,
+            reward_scale=candidate.reward_program.reward_scale,
+            gamma=candidate.reward_program.gamma,
+            version=candidate.reward_program.version,
+            mode=reward_mode,
+        )
+        candidate = replace(candidate, reward_program=candidate_reward)
     effective_reward_program = candidate.reward_program
     reward_calibration: dict[str, object] = {
         "proposed_scale": candidate.reward_program.reward_scale,
@@ -868,6 +885,7 @@ def train_candidate(
             reward_scale=resumed_scale,
             gamma=candidate.reward_program.gamma,
             version=candidate.reward_program.version,
+            mode=candidate.reward_program.mode,
         )
     elif resume_from is None:
         calibration_specs = []
@@ -968,16 +986,18 @@ def train_candidate(
                 curriculum_progress = min(max(curriculum_progress_decisions / curriculum_total, 0.0), 1.0)
                 active_opponent_mix = curriculum.opponent_mix(candidate.opponent_mix, curriculum_progress)
                 shaping_multiplier = curriculum.shaping_multiplier(curriculum_progress)
+                bc_coefficient_multiplier = curriculum.bc_coefficient_multiplier(curriculum_progress)
                 scheduled_reward_program = RewardProgram(
                     effective_reward_program.components,
                     effective_reward_program.derived_metrics,
                     reward_scale=effective_reward_program.reward_scale * shaping_multiplier,
                     gamma=effective_reward_program.gamma,
                     version=effective_reward_program.version,
+                    mode=effective_reward_program.mode,
                 )
-                opponent_key = active_opponent_mix.choose(rng)
-                opponent_name, factory = pool[opponent_key]
-                for _ in range(wave_size):
+                allocated_opponents = active_opponent_mix.allocate(wave_size, rng)
+                for opponent_key in allocated_opponents:
+                    opponent_name, factory = pool[opponent_key]
                     episode_seed = seed + episode_index
                     episode_index += 1
                     specs.append((factory, episode_seed, opponent_name))
@@ -996,7 +1016,7 @@ def train_candidate(
             _synchronize_cuda(device, "rollout collection")
             rollout_seconds = time.monotonic() - rollout_started
             actor_critic.train()
-            trainer.set_schedule_state(joint_update=joint_update)
+            trainer.set_schedule_state(joint_update=joint_update, bc_coefficient_multiplier=bc_coefficient_multiplier)
             ppo_update_started = time.monotonic()
             metrics = trainer.update(episodes)
             _synchronize_cuda(device, "PPO update")
@@ -1064,6 +1084,7 @@ def train_candidate(
                     "curriculum_progress_decisions": curriculum_progress_decisions,
                     "joint_update": joint_update,
                     "actor_lr_multiplier": trainer.actor_lr_multiplier,
+                    "bc_coefficient_multiplier": bc_coefficient_multiplier,
                 }
             )
             history.append(metrics)
@@ -1388,6 +1409,7 @@ def candidate_result(
             parent_reward_program=parent.reward_program if parent is not None else None,
             parent_effective_scale=parent_effective_scale,
             critic_warmup_episodes=args.critic_warmup_episodes,
+            reward_mode=args.reward_mode,
             resume_from=resume_from,
             resume_budget_progress=resume_from == current_checkpoint,
             checkpoint_callback=checkpoint_callback,

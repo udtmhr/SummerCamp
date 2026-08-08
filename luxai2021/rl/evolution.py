@@ -75,6 +75,24 @@ class OpponentMix:
                 return name
         return "snapshot"
 
+    def allocate(self, count: int, rng: random.Random) -> list[str]:
+        if count <= 0:
+            return []
+        values = asdict(self)
+        raw_counts = {name: int(round(weight * count)) for name, weight in values.items()}
+        current_sum = sum(raw_counts.values())
+        if current_sum != count:
+            diff = count - current_sum
+            sorted_names = sorted(values.keys(), key=lambda k: values[k], reverse=True)
+            for i in range(abs(diff)):
+                target_name = sorted_names[i % len(sorted_names)]
+                raw_counts[target_name] += 1 if diff > 0 else -1
+        allocated = []
+        for name, n in raw_counts.items():
+            allocated.extend([name] * max(0, n))
+        rng.shuffle(allocated)
+        return allocated
+
 
 def _piecewise_linear(points: tuple[tuple[float, float], ...], progress: float) -> float:
     value = min(max(float(progress), 0.0), 1.0)
@@ -91,9 +109,13 @@ class TrainingCurriculum:
     teacher_floor_points: tuple[tuple[float, float], ...]
     shaping_multiplier_points: tuple[tuple[float, float], ...]
     snapshot_floor: float = 0.10
+    bc_coefficient_points: tuple[tuple[float, float], ...] = ((0.0, 1.0), (1.0, 1.0))
 
     def shaping_multiplier(self, progress: float) -> float:
         return _piecewise_linear(self.shaping_multiplier_points, progress)
+
+    def bc_coefficient_multiplier(self, progress: float) -> float:
+        return _piecewise_linear(self.bc_coefficient_points, progress)
 
     def opponent_mix(self, proposed: OpponentMix, progress: float) -> OpponentMix:
         if self.name == "legacy":
@@ -122,6 +144,7 @@ class TrainingCurriculum:
             "teacher_floor_points": [list(point) for point in self.teacher_floor_points],
             "shaping_multiplier_points": [list(point) for point in self.shaping_multiplier_points],
             "snapshot_floor": self.snapshot_floor,
+            "bc_coefficient_points": [list(point) for point in self.bc_coefficient_points],
         }
 
 
@@ -140,6 +163,14 @@ def training_curriculum(name: str) -> TrainingCurriculum:
             name,
             teacher_points,
             ((0.0, 1.0), (0.30, 1.0), (0.60, 0.50), (0.80, 0.0), (1.0, 0.0)),
+        )
+    if name == "dense_shaping":
+        return TrainingCurriculum(
+            name,
+            ((0.0, 0.10), (1.0, 0.10)),
+            ((0.0, 1.0), (1.0, 1.0)),
+            snapshot_floor=0.10,
+            bc_coefficient_points=((0.0, 1.0), (0.5, 0.5), (1.0, 0.0)),
         )
     raise ValueError(f"Unknown curriculum profile: {name}")
 
@@ -1661,7 +1692,7 @@ class CodexCandidateGenerator:
 
 def initial_candidate(*, island: int, seed: int) -> EvolutionCandidate:
     rng = random.Random(seed + island)
-    base_ppo = PPOConfig()
+    base_ppo = PPOConfig(bc_coefficient=0.01)
     reward = default_reward_program().to_dict()
     reward["version"] = 2
     reward["derived_metrics"] = []
@@ -1670,7 +1701,7 @@ def initial_candidate(*, island: int, seed: int) -> EvolutionCandidate:
     proposal = {
         "reward_program": reward,
         "ppo_config": asdict(base_ppo),
-        "opponent_mix": asdict(OpponentMix()),
+        "opponent_mix": asdict(OpponentMix(self_base=0.40, other_base=0.10, teacher=0.10, snapshot=0.40)),
         "mutation_kind": "initial",
         "primary_parent_id": None,
         "secondary_parent_ids": [],

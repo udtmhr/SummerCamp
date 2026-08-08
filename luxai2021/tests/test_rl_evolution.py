@@ -176,7 +176,7 @@ def test_reward_program_is_bounded_and_preserves_terminal_reward():
     breakdown = program.reward(previous, following, terminal_outcome=1.0)
 
     assert breakdown.terminal == 1.0
-    assert 1.0 < breakdown.total <= 1.5
+    assert 1.0 < breakdown.total <= 3.0
     assert set(breakdown.components) == {component.name for component in program.components}
 
 
@@ -435,7 +435,7 @@ def test_sparse_component_is_not_used_for_inverse_rms_calibration():
 
     assert report["child_component_activity"]["sparse_signal"] < 0.01
     assert "sparse_signal" not in report["child_dense_components"]
-    assert 0.01 <= calibrated.reward_scale <= 0.5
+    assert 0.01 <= calibrated.reward_scale <= 2.0
 
 
 def test_candidate_round_trip_and_resume_store(tmp_path):
@@ -885,6 +885,23 @@ def test_teacher_guarded_curriculum_anneals_reward_and_increases_teacher():
     assert [mix.teacher for mix in mixes] == pytest.approx([0.25, 0.30, 0.40, 0.50])
     assert all(sum(vars(mix).values()) == pytest.approx(1.0) for mix in mixes)
     assert all(mix.snapshot >= 0.1 for mix in mixes)
+
+
+def test_dense_shaping_curriculum_maintains_shaping_and_decays_bc():
+    curriculum = training_curriculum("dense_shaping")
+    proposed = OpponentMix()
+
+    assert curriculum.shaping_multiplier(0.0) == pytest.approx(1.0)
+    assert curriculum.shaping_multiplier(0.5) == pytest.approx(1.0)
+    assert curriculum.shaping_multiplier(1.0) == pytest.approx(1.0)
+
+    assert curriculum.bc_coefficient_multiplier(0.0) == pytest.approx(1.0)
+    assert curriculum.bc_coefficient_multiplier(0.5) == pytest.approx(0.5)
+    assert curriculum.bc_coefficient_multiplier(1.0) == pytest.approx(0.0)
+
+    mixes = [curriculum.opponent_mix(proposed, progress) for progress in (0.0, 0.5, 1.0)]
+    assert all(mix.teacher == pytest.approx(0.20) for mix in mixes)  # max(proposed.teacher 0.20, floor 0.10)
+    assert all(sum(vars(mix).values()) == pytest.approx(1.0) for mix in mixes)
 
 
 def test_curriculum_stage_offsets_keep_final_phase_after_cross_stage_resume():
@@ -2372,3 +2389,32 @@ def test_infrastructure_failures_are_retryable_but_candidate_errors_are_not(tmp_
     skipped = json.loads((tmp_path / "jobs" / "skipped" / f"{job.job_id}.json").read_text())
     assert skipped["status"] == "skipped_after_infrastructure_retries"
     assert skipped["retry_count"] == 2
+
+
+def test_opponent_mix_allocate_counts_and_shuffles():
+    import random
+    mix = OpponentMix(self_base=0.40, other_base=0.10, teacher=0.10, snapshot=0.40)
+    rng = random.Random(42)
+    allocated = mix.allocate(16, rng)
+
+    assert len(allocated) == 16
+    assert allocated.count("self_base") == 6
+    assert allocated.count("snapshot") == 6
+    assert allocated.count("teacher") == 2
+    assert allocated.count("other_base") == 2
+
+
+def test_reward_program_modes():
+    previous = _metrics(city_tiles=-0.5, city_survival=-0.5)
+    following = _metrics(city_tiles=0.5, city_survival=0.5)
+
+    linear_prog = default_reward_program(mode="potential_linear")
+    tanh_prog = default_reward_program(mode="potential_tanh")
+    direct_prog = default_reward_program(mode="direct_step")
+
+    linear_breakdown = linear_prog.reward(previous, following, terminal_outcome=1.0)
+    tanh_breakdown = tanh_prog.reward(previous, following, terminal_outcome=1.0)
+    direct_breakdown = direct_prog.reward(previous, following, terminal_outcome=1.0)
+
+    assert linear_breakdown.shaping > tanh_breakdown.shaping
+    assert direct_breakdown.shaping == pytest.approx(linear_prog.reward_scale * (1.5 * 1.0 + 0.8 * 1.0))

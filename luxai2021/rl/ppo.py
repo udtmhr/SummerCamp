@@ -467,6 +467,7 @@ class PPOTrainer:
         self.bc_batch_provider = bc_batch_provider
         self.illegal_action_coefficient = float(illegal_action_coefficient)
         self.actor_lr_multiplier = 1.0
+        self.bc_coefficient_multiplier = 1.0
         self.optimizer = torch.optim.AdamW(
             actor_critic.parameters(),
             lr=config.learning_rate,
@@ -559,7 +560,7 @@ class PPOTrainer:
                     policy_loss
                     + self.config.value_coefficient * value_loss
                     - self.config.entropy_coefficient * entropy
-                    + self.config.bc_coefficient * bc_loss
+                    + self.config.bc_coefficient * self.bc_coefficient_multiplier * bc_loss
                     + self.illegal_action_coefficient * illegal_action_loss
                 )
                 if not torch.isfinite(loss):
@@ -604,7 +605,7 @@ class PPOTrainer:
         return result
 
     def _distillation_anchor_loss(self, zero_source: Tensor) -> Tensor:
-        if self.bc_batch_provider is None or self.config.bc_coefficient == 0:
+        if self.bc_batch_provider is None or self.config.bc_coefficient == 0 or self.bc_coefficient_multiplier == 0:
             return zero_source.sum() * 0.0
         from luxai2021.imitation.distillation import augment_distillation_batch, distillation_loss
 
@@ -619,8 +620,9 @@ class PPOTrainer:
             hard_label_weight=0.0,
         )["loss"]
 
-    def set_schedule_state(self, *, joint_update: int) -> None:
+    def set_schedule_state(self, *, joint_update: int, bc_coefficient_multiplier: float = 1.0) -> None:
         self.actor_lr_multiplier = (0.25, 0.5, 1.0)[min(max(int(joint_update), 0), 2)]
+        self.bc_coefficient_multiplier = float(bc_coefficient_multiplier)
 
     def save_training_checkpoint(
         self,
