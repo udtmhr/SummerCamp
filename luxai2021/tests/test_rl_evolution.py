@@ -85,6 +85,7 @@ from luxai2021.rl.ppo import (
     PPOConfig,
     PPOTrainer,
     _checkpoint_cuda_rng_state,
+    calculate_gae,
     collect_episode,
     collect_episodes_batched,
     resolve_rollout_backend,
@@ -194,12 +195,52 @@ def test_default_reward_penalizes_absolute_fuel_deficit_and_city_loss():
 
     assert program.mode == "potential_linear"
     assert program.reward_scale == pytest.approx(0.5)
+    assert program.terminal_reward_scale == pytest.approx(10.0)
+    assert program.normalize_total is True
     assert sum(abs(weight) for weight in weights.values()) == pytest.approx(5.2)
     assert weights["own_night_fuel_deficit"] == pytest.approx(-1.0)
     assert weights["own_city_tiles_lost"] == pytest.approx(-1.2)
     assert "night_fuel_deficit" not in weights
     assert "city_tile_loss" not in weights
     assert breakdown.shaping < 0.0
+
+
+def test_normalized_terminal_reward_cannot_be_reversed_by_potential_shaping():
+    program = RewardProgram.from_dict(
+        {
+            "components": [{"name": "signal", "expression": {"op": "metric", "name": "city_tiles"}, "weight": 5}],
+            "reward_scale": 0.5,
+            "gamma": 0.995,
+            "terminal_reward_scale": 10.0,
+            "normalize_total": True,
+        }
+    )
+    high = _metrics(city_tiles=1.0)
+    low = _metrics(city_tiles=-1.0)
+
+    win = program.reward(high, low, terminal_outcome=1.0)
+    loss = program.reward(low, high, terminal_outcome=-1.0)
+
+    assert win.total > 0.0
+    assert loss.total < 0.0
+    assert win.total == pytest.approx(1.0 + win.shaping)
+    assert loss.total == pytest.approx(-1.0 + loss.shaping)
+    assert max(abs(win.total), abs(loss.total)) < 1.5
+
+
+def test_normalized_reward_rejects_terminal_scale_that_shaping_can_reverse():
+    with pytest.raises(ValueError, match="must exceed"):
+        RewardProgram.from_dict(
+            {
+                "components": [
+                    {"name": "signal", "expression": {"op": "metric", "name": "city_tiles"}, "weight": 5}
+                ],
+                "reward_scale": 0.5,
+                "gamma": 0.995,
+                "terminal_reward_scale": 4.0,
+                "normalize_total": True,
+            }
+        )
 
 
 def test_survival_linear_fixed_candidate_matches_safe_defaults():
@@ -210,9 +251,12 @@ def test_survival_linear_fixed_candidate_matches_safe_defaults():
     assert candidate.mutation_kind == "initial"
     assert candidate.reward_program.mode == "potential_linear"
     assert candidate.reward_program.reward_scale == pytest.approx(0.5)
+    assert candidate.reward_program.terminal_reward_scale == pytest.approx(10.0)
+    assert candidate.reward_program.normalize_total is True
     assert weights["own_night_fuel_deficit"] == pytest.approx(-1.0)
     assert weights["own_city_tiles_lost"] == pytest.approx(-1.2)
     assert candidate.ppo_config.bc_coefficient == pytest.approx(0.025)
+    assert candidate.ppo_config.gae_lambda == pytest.approx(0.98)
     assert candidate.opponent_mix.teacher == pytest.approx(0.25)
 
 
@@ -2524,4 +2568,22 @@ def test_reward_program_modes():
     direct_breakdown = direct_prog.reward(previous, following, terminal_outcome=1.0)
 
     assert linear_breakdown.shaping > tanh_breakdown.shaping
-    assert direct_breakdown.shaping == pytest.approx(linear_prog.reward_scale * (1.5 * 1.0 + 0.8 * 1.0))
+    assert direct_breakdown.shaping == pytest.approx(
+        linear_prog.reward_scale * (1.5 * 1.0 + 0.8 * 1.0) / linear_prog.terminal_reward_scale
+    )
+
+
+def test_gae_return_is_td_lambda_target():
+    first = SimpleNamespace(reward=0.1, value=0.2, advantage=0.0, return_value=0.0)
+    second = SimpleNamespace(reward=1.0, value=0.4, advantage=0.0, return_value=0.0)
+    episode = SimpleNamespace(records=[first, second])
+    config = PPOConfig(gamma=0.9, gae_lambda=0.8)
+
+    calculate_gae([episode], config)
+
+    expected_last = 1.0
+    expected_first = (1.0 - config.gae_lambda) * (0.1 + config.gamma * 0.4) + config.gae_lambda * (
+        0.1 + config.gamma * expected_last
+    )
+    assert second.return_value == pytest.approx(expected_last)
+    assert first.return_value == pytest.approx(expected_first)

@@ -904,6 +904,8 @@ def train_candidate(
             gamma=candidate.reward_program.gamma,
             version=candidate.reward_program.version,
             mode=reward_mode,
+            terminal_reward_scale=candidate.reward_program.terminal_reward_scale,
+            normalize_total=candidate.reward_program.normalize_total,
         )
         candidate = replace(candidate, reward_program=candidate_reward)
     effective_reward_program = candidate.reward_program
@@ -929,6 +931,8 @@ def train_candidate(
             gamma=candidate.reward_program.gamma,
             version=candidate.reward_program.version,
             mode=candidate.reward_program.mode,
+            terminal_reward_scale=candidate.reward_program.terminal_reward_scale,
+            normalize_total=candidate.reward_program.normalize_total,
         )
     elif resume_from is None:
         calibration_specs = []
@@ -1037,6 +1041,8 @@ def train_candidate(
                     gamma=effective_reward_program.gamma,
                     version=effective_reward_program.version,
                     mode=effective_reward_program.mode,
+                    terminal_reward_scale=effective_reward_program.terminal_reward_scale,
+                    normalize_total=effective_reward_program.normalize_total,
                 )
                 allocated_opponents = active_opponent_mix.allocate(wave_size, rng)
                 for opponent_key in allocated_opponents:

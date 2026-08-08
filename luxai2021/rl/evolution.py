@@ -22,6 +22,7 @@ from luxai2021.rl.reward import (
     METRIC_NAMES,
     METRIC_SELECTORS,
     METRIC_SUM_NAMES,
+    REWARD_MODES,
     RewardProgram,
     default_reward_program,
 )
@@ -604,6 +605,7 @@ def proposal_schema() -> dict[str, Any]:
                 "type": "object",
                 "properties": {
                     "version": {"type": "integer", "const": 2},
+                    "mode": {"type": "string", "enum": list(REWARD_MODES)},
                     "derived_metrics": {
                         "type": "array",
                         "maxItems": 16,
@@ -631,8 +633,19 @@ def proposal_schema() -> dict[str, Any]:
                     },
                     "reward_scale": {"type": "number"},
                     "gamma": {"type": "number"},
+                    "terminal_reward_scale": {"type": "number"},
+                    "normalize_total": {"type": "boolean"},
                 },
-                "required": ["version", "derived_metrics", "components", "reward_scale", "gamma"],
+                "required": [
+                    "version",
+                    "mode",
+                    "derived_metrics",
+                    "components",
+                    "reward_scale",
+                    "gamma",
+                    "terminal_reward_scale",
+                    "normalize_total",
+                ],
                 "additionalProperties": False,
             },
             "ppo_config": {

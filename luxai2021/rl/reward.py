@@ -150,10 +150,24 @@ class RewardProgram:
     gamma: float = 0.995
     version: int = 1
     mode: str = "potential_linear"
+    terminal_reward_scale: float = 1.0
+    normalize_total: bool = False
 
     def __post_init__(self) -> None:
         if self.mode not in REWARD_MODES:
             raise ValueError(f"Unsupported reward mode: {self.mode}")
+        if not isfinite(self.terminal_reward_scale) or not 1.0 <= self.terminal_reward_scale <= 100.0:
+            raise ValueError("terminal_reward_scale must be in [1, 100]")
+        if not isinstance(self.normalize_total, bool):
+            raise TypeError("normalize_total must be a boolean")
+        if self.mode == "direct_step":
+            maximum_shaping = self.reward_scale * 2.0 * sum(abs(component.weight) for component in self.components)
+        elif self.mode == "potential_tanh":
+            maximum_shaping = self.reward_scale * (1.0 + self.gamma)
+        else:
+            maximum_shaping = self.reward_scale * 5.0 * (1.0 + self.gamma)
+        if self.normalize_total and self.terminal_reward_scale <= maximum_shaping:
+            raise ValueError("terminal_reward_scale must exceed the maximum potential shaping magnitude")
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> RewardProgram:
@@ -198,6 +212,8 @@ class RewardProgram:
         reward_scale = float(value.get("reward_scale", 1.0))
         gamma = float(value.get("gamma", 0.995))
         mode = str(value.get("mode", "potential_linear"))
+        terminal_reward_scale = float(value.get("terminal_reward_scale", 1.0))
+        normalize_total = value.get("normalize_total", False)
         if mode not in REWARD_MODES:
             raise ValueError(f"Unsupported reward mode: {mode}")
         if not isfinite(reward_scale) or not 0.0 <= reward_scale <= 2.0:
@@ -211,6 +227,8 @@ class RewardProgram:
             gamma=gamma,
             version=version,
             mode=mode,
+            terminal_reward_scale=terminal_reward_scale,
+            normalize_total=normalize_total,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -228,6 +246,10 @@ class RewardProgram:
             value["derived_metrics"] = [
                 {"name": item.name, "expression": dict(item.expression)} for item in self.derived_metrics
             ]
+        if self.terminal_reward_scale != 1.0:
+            value["terminal_reward_scale"] = self.terminal_reward_scale
+        if self.normalize_total:
+            value["normalize_total"] = True
         return value
 
     def potential(self, metrics: GameMetrics) -> tuple[float, dict[str, float]]:
@@ -263,17 +285,24 @@ class RewardProgram:
         next_potential, component_values = self.potential(following)
 
         if self.mode == "direct_step":
-            shaping = self.reward_scale * sum(
+            raw_shaping = self.reward_scale * sum(
                 component.weight * (component_values[component.name] - prev_component_values[component.name])
                 for component in self.components
             )
         else:
-            shaping = self.reward_scale * (self.gamma * next_potential - previous_potential)
+            raw_shaping = self.reward_scale * (self.gamma * next_potential - previous_potential)
 
-        total = max(-3.0, min(3.0, terminal_outcome + shaping))
+        if self.normalize_total:
+            terminal = terminal_outcome
+            shaping = raw_shaping / self.terminal_reward_scale
+            total = terminal + shaping
+        else:
+            terminal = terminal_outcome
+            shaping = raw_shaping
+            total = max(-3.0, min(3.0, terminal_outcome * self.terminal_reward_scale + shaping))
         return RewardBreakdown(
             total=total,
-            terminal=terminal_outcome,
+            terminal=terminal,
             shaping=shaping,
             previous_potential=previous_potential,
             next_potential=next_potential,
@@ -425,9 +454,9 @@ def _evaluate_expression(
 
 def default_reward_program(mode: str = "potential_linear") -> RewardProgram:
     # The component L1 envelope grows from 3.0 to 5.2 with the two survival
-    # penalties. A 0.5 scale keeps the scaled envelope at 2.6, below the old
-    # 3.0 envelope, while preserving the component ratios that counter city
-    # expansion. The terminal outcome remains unscaled.
+    # penalties. Potential itself remains clipped to [-5, 5]. Raw win/loss is
+    # +/-10 and the complete reward is divided by 10, so normalized shaping is
+    # below 0.5 and cannot reverse the terminal result.
     return RewardProgram.from_dict(
         {
             "version": REWARD_PROGRAM_VERSION,
@@ -454,6 +483,8 @@ def default_reward_program(mode: str = "potential_linear") -> RewardProgram:
             ],
             "reward_scale": 0.5,
             "gamma": 0.995,
+            "terminal_reward_scale": 10.0,
+            "normalize_total": True,
         }
     )
 
@@ -521,6 +552,9 @@ def calibrate_reward_scale(
         reward_scale=effective,
         gamma=child.gamma,
         version=child.version,
+        mode=child.mode,
+        terminal_reward_scale=child.terminal_reward_scale,
+        normalize_total=child.normalize_total,
     )
     return calibrated, {
         "parent_effective_scale": parent_scale,

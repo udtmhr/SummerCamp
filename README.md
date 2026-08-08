@@ -669,9 +669,11 @@ leaving the terminal win/loss reward unchanged. Use `--curriculum-profile termin
 terminal-only ablation or `legacy` only when reproducing an old run.
 
 The default dense-shaping reward uses linear potential differencing with absolute own-team penalties for next-night
-fuel deficit and cumulative city-tile loss. Its reward scale is 0.5: the six component weights have an L1 envelope of
-5.2, so the scaled envelope is 2.6 instead of growing beyond the previous four-component envelope of 3.0. Terminal
-win/loss remains unscaled. The BC anchor coefficient starts at 0.025 and its curriculum multiplier stays at 1.0 through
+fuel deficit and cumulative city-tile loss. Raw terminal win/loss is +/-10 and the complete reward is divided by 10.
+With reward scale 0.5 and potential clipped to [-5, 5], normalized shaping is strictly below 0.5, so it cannot reverse
+the sign of a terminal result and the total reward remains below 1.5 in magnitude without per-step clipping. Fixed
+normalization is used instead of running return normalization to keep reward meaning and resumes deterministic. The BC
+anchor coefficient starts at 0.025 and its curriculum multiplier stays at 1.0 through
 20% progress (the end of short+medium under the default budgets), then reaches 0.8 at 70% and 0.2 at completion.
 Because candidates and curricula are content-frozen in run artifacts, use a new run directory when adopting these
 defaults; an older run with a different stored curriculum is rejected rather than silently changing its learning rule.
@@ -750,6 +752,11 @@ uv run --locked python examples/evolve_rl.py \
 Fixed-candidate mode forces a one-candidate, zero-generation run and selects that same candidate for medium and final
 training. Its source JSON and digest are frozen in the run manifest, so resume the same command after interruption and
 use a new run directory if the candidate definition changes.
+
+PPO's existing GAE return is the TD(lambda) value target. The fixed survival candidate uses lambda 0.98 instead of
+0.95 to extend credit assignment in 360-turn games. UPGO is intentionally not mixed into the single shaped-reward
+critic: AlphaStar applies it to a separate win/loss baseline, while using it here would self-imitate positive shaping
+trajectories and could reinforce the City-expansion exploit. Add a separate terminal-only critic before enabling UPGO.
 
 `--resattn8-only` disables UNet opponents, probes, training, baselines, and final evaluation. The defaults screen 24
 ResAttn8 candidates for 550,000 sampled decisions, continue the best eight for another

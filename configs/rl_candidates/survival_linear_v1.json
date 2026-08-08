@@ -9,7 +9,7 @@
     "bc_coefficient": 0.025,
     "clip_range": 0.2,
     "entropy_coefficient": 0.005,
-    "gae_lambda": 0.95,
+    "gae_lambda": 0.98,
     "gamma": 0.995,
     "gradient_clip": 1.0,
     "kl_coefficient": 0.0,
@@ -20,7 +20,7 @@
     "value_coefficient": 0.5,
     "weight_decay": 0.00001
   },
-  "rationale": "Linear potential shaping with absolute own-team night-fuel-deficit and cumulative city-loss penalties. It retains the proven city, unit, research, and smooth survival signals while increasing Teacher exposure and keeping the delayed BC anchor.",
+  "rationale": "Linear potential shaping with absolute own-team night-fuel-deficit and cumulative city-loss penalties. Raw terminal reward is +/-10 and the complete reward is divided by 10, so bounded shaping cannot reverse a win or loss. TD(lambda) uses lambda 0.98 for longer credit assignment while avoiding UPGO self-imitation of shaping exploits.",
   "reward_program": {
     "components": [
       {
@@ -75,7 +75,9 @@
     "derived_metrics": [],
     "gamma": 0.995,
     "mode": "potential_linear",
+    "normalize_total": true,
     "reward_scale": 0.5,
+    "terminal_reward_scale": 10.0,
     "version": 2
   }
 }
