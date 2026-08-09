@@ -173,7 +173,7 @@ def training_curriculum(name: str) -> TrainingCurriculum:
             snapshot_floor=0.10,
             # Short + medium end near 20% of the default total budget. Keep the
             # teacher anchor intact through that failure-prone interval.
-            bc_coefficient_points=((0.0, 1.0), (0.20, 1.0), (0.70, 0.8), (1.0, 0.2)),
+            bc_coefficient_points=((0.0, 1.0), (1.0, 1.0)),
         )
     raise ValueError(f"Unknown curriculum profile: {name}")
 
@@ -1707,7 +1707,7 @@ class CodexCandidateGenerator:
 
 def initial_candidate(*, island: int, seed: int) -> EvolutionCandidate:
     rng = random.Random(seed + island)
-    base_ppo = PPOConfig(bc_coefficient=0.025)
+    base_ppo = PPOConfig(bc_coefficient=0.05, kl_coefficient=0.01)
     reward = default_reward_program().to_dict()
     reward["version"] = 2
     reward["derived_metrics"] = []
@@ -1894,7 +1894,7 @@ def mutate_candidate(
             )
             changed_paths.append(f"reward_program.components[{index}].weight")
         else:
-            selected = rng.choice(("learning_rate", "entropy_coefficient", "bc_coefficient"))
+            selected = rng.choice(("learning_rate", "entropy_coefficient", "bc_coefficient", "kl_coefficient"))
             ppo[selected] = float(ppo[selected]) * math.exp(rng.gauss(0.0, 0.12))
             changed_paths.append(f"ppo_config.{selected}")
     elif island == 1:

@@ -752,6 +752,8 @@ def train_candidate(
     other_checkpoint: Path,
     teacher_checkpoint: Path,
     teacher_cache_dir: Path,
+    eval_seeds: int = 0,
+    eval_seed_start: int = 0,
     prepared_cache_dir: Path,
     output_dir: Path,
     seconds: int,
@@ -788,6 +790,14 @@ def train_candidate(
     base_checkpoint_sha256 = _sha256_file(base_checkpoint)
     _, base_source = load_bc_checkpoint(str(base_checkpoint), "cpu")
     actor_critic = FullTurnActorCritic.from_checkpoint(base_checkpoint, device)
+    
+    reference_policy = None
+    if candidate.ppo_config.kl_coefficient > 0:
+        reference_policy = FullTurnActorCritic.from_checkpoint(base_checkpoint, device).policy
+        reference_policy.eval()
+        for param in reference_policy.parameters():
+            param.requires_grad = False
+            
     inherited_modules: list[str] = []
     inherited_hash = None
     if inherit_from is not None and resume_from is None:
@@ -835,6 +845,7 @@ def train_candidate(
             actor_critic,
             candidate.ppo_config,
             device,
+            reference_policy=reference_policy,
             bc_batch_provider=bc_provider,
         )
 
@@ -1000,7 +1011,9 @@ def train_candidate(
     diagnostic_events: list[dict[str, object]] = []
     milestone_dir = output_dir / "milestones"
     milestone_dir.mkdir(exist_ok=True)
-    milestone_points = (0.30, 0.60, 0.80, 1.00)
+    milestone_points = (0.20, 0.40, 0.60, 0.80, 1.00)
+    best_teacher_score_rate = -1.0
+    epochs_without_improvement = 0
     saved_milestones = {
         point for point in milestone_points if (milestone_dir / f"p{round(point * 100):03d}.pt").exists()
     }
@@ -1170,8 +1183,38 @@ def train_candidate(
                         },
                     )
                     saved_milestones.add(milestone)
+                    
+                    if eval_seeds > 0:
+                        from luxai2021.rl.evaluation import evaluate_against_league, LeagueMember
+                        import shutil
+                        milestone_path = milestone_dir / f"p{round(milestone * 100):03d}.pt"
+                        teacher = LeagueMember("first-place", teacher_checkpoint, model_type="first-place")
+                        evaluation = evaluate_against_league(
+                            LeagueMember("milestone", milestone_path),
+                            [teacher],
+                            seed_start=eval_seed_start,
+                            seed_count=eval_seeds,
+                            device=str(device),
+                            max_turns=max_turns,
+                        )
+                        score_rate = float(evaluation["totals"]["score_rate"])
+                        if score_rate > best_teacher_score_rate:
+                            best_teacher_score_rate = score_rate
+                            shutil.copyfile(milestone_path, output_dir / "best.pt")
+                            epochs_without_improvement = 0
+                        else:
+                            epochs_without_improvement += 1
+                        
+                        if epochs_without_improvement >= 2:
+                            print(f"Early stopping at milestone {milestone}. Best: {best_teacher_score_rate:.3f}, Current: {score_rate:.3f}")
+                            decision_budget = 0 # trigger early stop
+                            break
             if checkpoint_callback is not None:
                 checkpoint_callback(output_dir, metrics)
+            
+            if update > 0 and update % 10 == 0:
+                snapshot.load_state_dict(actor_critic.state_dict())
+                
             update += 1
             if decision_budget is None and seconds <= 0:
                 break
@@ -1244,13 +1287,14 @@ def train_candidate(
         json.dumps(rollout_runtime, indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    actor_critic.export_policy(
-        output_dir / "best.pt",
-        epoch=max(0, update - 1),
-        metrics={"validation": final_metrics, "ppo": final_metrics},
-        split=base_source["split"],
-        metadata=summary,
-    )
+    if not (output_dir / "best.pt").exists():
+        actor_critic.export_policy(
+            output_dir / "best.pt",
+            epoch=max(0, update - 1),
+            metrics={"validation": final_metrics, "ppo": final_metrics},
+            split=base_source["split"],
+            metadata=summary,
+        )
     (output_dir / "metrics.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     return output_dir / "best.pt", summary
 
@@ -1434,6 +1478,8 @@ def candidate_result(
             base_checkpoint=base_checkpoint,
             other_checkpoint=other_checkpoint,
             teacher_checkpoint=Path(args.teacher_checkpoint),
+            eval_seeds=min(eval_seeds, args.screening_seeds),
+            eval_seed_start=eval_seed_start,
             teacher_cache_dir=Path(args.teacher_cache_dir),
             prepared_cache_dir=Path(args.prepared_cache_dir),
             output_dir=output_dir,

@@ -542,7 +542,7 @@ def test_candidate_round_trip_and_resume_store(tmp_path):
     loaded = store.candidates()
 
     assert loaded == [candidate]
-    assert initial.ppo_config.bc_coefficient == pytest.approx(0.025)
+    assert initial.ppo_config.bc_coefficient == pytest.approx(0.05)
     assert EvolutionCandidate.from_dict(candidate.to_dict()) == candidate
     assert proposal_schema()["additionalProperties"] is False
     assert sum(vars(OpponentMix()).values()) == pytest.approx(1.0)
@@ -994,8 +994,8 @@ def test_dense_shaping_curriculum_maintains_shaping_and_decays_bc():
 
     assert curriculum.bc_coefficient_multiplier(0.0) == pytest.approx(1.0)
     assert curriculum.bc_coefficient_multiplier(0.2) == pytest.approx(1.0)
-    assert curriculum.bc_coefficient_multiplier(0.7) == pytest.approx(0.8)
-    assert curriculum.bc_coefficient_multiplier(1.0) == pytest.approx(0.2)
+    assert curriculum.bc_coefficient_multiplier(0.7) == pytest.approx(1.0)
+    assert curriculum.bc_coefficient_multiplier(1.0) == pytest.approx(1.0)
 
     mixes = [curriculum.opponent_mix(proposed, progress) for progress in (0.0, 0.5, 1.0)]
     assert all(mix.teacher == pytest.approx(0.20) for mix in mixes)  # max(proposed.teacher 0.20, floor 0.10)
@@ -1386,7 +1386,7 @@ def test_short_full_turn_ppo_smoke_updates_finite_parameters(tmp_path):
     assert any(not torch.equal(before[name], value) for name, value in actor.named_parameters())
     assert 0.0 <= metrics["illegal_action_mass_mean"] <= 1.0
     assert metrics["illegal_action_loss"] >= 0.0
-    assert "kl" not in metrics
+    assert "kl" in metrics
     assert "parameter_constraint_loss" not in metrics
     assert "parameter_constraint_coefficient" not in metrics
     checkpoint_path = tmp_path / "latest_rl.pt"
@@ -1429,7 +1429,7 @@ def test_parent_kl_and_parameter_constraint_are_absent_from_trainer():
         PPOConfig(kl_coefficient=0.8),
         torch.device("cpu"),
     )
-    assert not hasattr(trainer, "reference_policy")
+    assert hasattr(trainer, "reference_policy")
     assert not hasattr(trainer, "parameter_reference")
     assert not hasattr(trainer, "parameter_constraint_coefficient")
     trainer.set_schedule_state(joint_update=3)

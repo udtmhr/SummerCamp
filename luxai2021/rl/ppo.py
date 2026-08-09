@@ -458,10 +458,12 @@ class PPOTrainer:
         config: PPOConfig,
         device: torch.device,
         *,
+        reference_policy: nn.Module | None = None,
         bc_batch_provider: Callable[[], Mapping[str, Tensor]] | None = None,
         illegal_action_coefficient: float = 0.01,
     ) -> None:
         self.actor_critic = actor_critic
+        self.reference_policy = reference_policy
         self.config = config
         self.device = device
         self.bc_batch_provider = bc_batch_provider
@@ -489,6 +491,7 @@ class PPOTrainer:
         generator = torch.Generator().manual_seed(sum(episode.seed for episode in episodes))
         totals: dict[str, float] = {}
         update_count = 0
+        gn_pol, gn_val, gn_bc = 0.0, 0.0, 0.0
         for _ in range(self.config.update_epochs):
             order = torch.randperm(len(records), generator=generator).tolist()
             for start in range(0, len(order), self.config.minibatch_turns):
@@ -499,8 +502,13 @@ class PPOTrainer:
                     non_blocking=True,
                 )
                 output, values = self.actor_critic(observations)
+                reference_output = None
+                if self.config.kl_coefficient > 0 and self.reference_policy is not None:
+                    with torch.no_grad():
+                        reference_output = self.reference_policy(observations)
                 policy_losses = []
                 entropies = []
+                kls = []
                 illegal_losses = []
                 illegal_masses = []
                 batch_advantages = advantages[indices].to(self.device)
@@ -526,6 +534,13 @@ class PPOTrainer:
                         masks = masks.clone()
                         masks[no_legal, 0] = True
                     distribution = Categorical(logits=apply_legal_action_mask(logits, masks).float())
+                    if reference_output is not None:
+                        reference_logits = reference_output[entity][local_indices, :, ys, xs]
+                        reference_distribution = Categorical(
+                            logits=apply_legal_action_mask(reference_logits, masks).float()
+                        )
+                        from torch.distributions import kl_divergence
+                        kls.append(kl_divergence(reference_distribution, distribution))
                     actions = torch.tensor([decision.action for _, decision in entity_decisions], device=self.device)
                     old_log_probs = torch.tensor(
                         [decision.old_log_prob for _, decision in entity_decisions], device=self.device
@@ -552,19 +567,43 @@ class PPOTrainer:
                 value_loss = (
                     0.5 * torch.maximum((values - returns).square(), (clipped_values - returns).square()).mean()
                 )
-                policy_loss = torch.cat(policy_losses).mean()
-                entropy = torch.cat(entropies).mean()
+                turn_count = max(1, len(batch_records))
+                policy_loss = torch.cat(policy_losses).sum() / turn_count
+                entropy = torch.cat(entropies).sum() / turn_count
+                kl = torch.cat(kls).sum() / turn_count if kls else torch.tensor(0.0, device=self.device)
                 bc_loss = self._distillation_anchor_loss(values)
-                illegal_action_loss = torch.cat(illegal_losses).mean()
+                illegal_action_loss = torch.cat(illegal_losses).sum() / turn_count
                 loss = (
                     policy_loss
                     + self.config.value_coefficient * value_loss
                     - self.config.entropy_coefficient * entropy
+                    + self.config.kl_coefficient * kl
                     + self.config.bc_coefficient * self.bc_coefficient_multiplier * bc_loss
                     + self.illegal_action_coefficient * illegal_action_loss
                 )
                 if not torch.isfinite(loss):
                     raise FloatingPointError("PPO produced a non-finite loss")
+                
+                if update_count == 0:
+                    def _gn() -> float:
+                        grads = [p.grad for p in self.actor_critic.policy.encoder.parameters() if p.grad is not None]
+                        if not grads: return 0.0
+                        return torch.norm(torch.stack([torch.norm(g) for g in grads])).item()
+                    
+                    self.optimizer.zero_grad(set_to_none=True)
+                    (self.config.value_coefficient * value_loss).backward(retain_graph=True)
+                    gn_val = _gn()
+                    
+                    self.optimizer.zero_grad(set_to_none=True)
+                    policy_loss.backward(retain_graph=True)
+                    gn_pol = _gn()
+                    
+                    self.optimizer.zero_grad(set_to_none=True)
+                    bc_loss_weighted = self.config.bc_coefficient * self.bc_coefficient_multiplier * bc_loss
+                    if isinstance(bc_loss_weighted, torch.Tensor) and bc_loss_weighted.requires_grad:
+                        bc_loss_weighted.backward(retain_graph=True)
+                        gn_bc = _gn()
+
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 if self.actor_lr_multiplier != 1.0:
@@ -581,6 +620,7 @@ class PPOTrainer:
                     "policy_loss": policy_loss,
                     "value_loss": value_loss,
                     "entropy": entropy,
+                    "kl": kl,
                     "bc_loss": bc_loss,
                     "illegal_action_loss": illegal_action_loss,
                     "illegal_action_mass_mean": torch.cat(illegal_masses).mean(),
@@ -596,6 +636,9 @@ class PPOTrainer:
         result = {name: value / update_count for name, value in totals.items()}
         result.update(
             {
+                "grad_norm_policy_encoder": gn_pol,
+                "grad_norm_value_encoder": gn_val,
+                "grad_norm_bc_encoder": gn_bc,
                 "episodes": float(len(episodes)),
                 "turns": float(len(records)),
                 "decisions": float(sum(len(record.decisions) for record in records)),
