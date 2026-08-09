@@ -19,6 +19,7 @@ METRIC_NAMES = frozenset(
         "turns_until_night",
         "night_turns_remaining",
         "city_tiles",
+        "safe_city_tiles",
         "units",
         "workers",
         "carts",
@@ -35,6 +36,7 @@ METRIC_NAMES = frozenset(
         "stranded_fuel",
         "fuel_delivery_coverage",
         "city_tile_loss",
+        "city_tile_loss_linear",
         "night_fuel_shortage",
         "worker_resource_access",
         "worker_cargo_fullness",
@@ -47,6 +49,7 @@ METRIC_NAMES = frozenset(
         "own_stranded_fuel",
         "own_fuel_delivery_coverage",
         "own_city_tiles_lost",
+        "own_city_tiles_lost_linear",
         "own_night_fuel_shortage",
     }
 )
@@ -57,6 +60,7 @@ LOWER_IS_BETTER_METRIC_NAMES = frozenset(
         "own_night_fuel_deficit",
         "own_stranded_fuel",
         "own_city_tiles_lost",
+        "own_city_tiles_lost_linear",
         "own_night_fuel_shortage",
     }
 )
@@ -124,6 +128,7 @@ class RewardBreakdown:
     previous_potential: float
     next_potential: float
     components: Mapping[str, float]
+    component_shaping: Mapping[str, float]
 
 
 @dataclass(frozen=True)
@@ -292,10 +297,24 @@ class RewardProgram:
         else:
             raw_shaping = self.reward_scale * (self.gamma * next_potential - previous_potential)
 
+        component_shaping = {
+            component.name: self.reward_scale
+            * component.weight
+            * (
+                component_values[component.name] - prev_component_values[component.name]
+                if self.mode == "direct_step"
+                else self.gamma * component_values[component.name] - prev_component_values[component.name]
+            )
+            for component in self.components
+        }
+
         if self.normalize_total:
             terminal = terminal_outcome
             shaping = raw_shaping / self.terminal_reward_scale
             total = terminal + shaping
+            component_shaping = {
+                name: value / self.terminal_reward_scale for name, value in component_shaping.items()
+            }
         else:
             terminal = terminal_outcome
             shaping = raw_shaping
@@ -307,6 +326,7 @@ class RewardProgram:
             previous_potential=previous_potential,
             next_potential=next_potential,
             components=component_values,
+            component_shaping=component_shaping,
         )
 
 
@@ -456,7 +476,7 @@ def default_reward_program(mode: str = "potential_linear") -> RewardProgram:
     # The component L1 envelope grows from 3.0 to 5.2 with the two survival
     # penalties. Potential itself remains clipped to [-5, 5]. Raw win/loss is
     # +/-10 and the complete reward is divided by 10, so normalized shaping is
-    # below 0.5 and cannot reverse the terminal result.
+    # below 0.35 and cannot reverse the terminal result.
     return RewardProgram.from_dict(
         {
             "version": REWARD_PROGRAM_VERSION,
@@ -481,8 +501,8 @@ def default_reward_program(mode: str = "potential_linear") -> RewardProgram:
                     "weight": -1.2,
                 },
             ],
-            "reward_scale": 0.5,
-            "gamma": 0.995,
+            "reward_scale": 0.35,
+            "gamma": 0.999,
             "terminal_reward_scale": 10.0,
             "normalize_total": True,
         }

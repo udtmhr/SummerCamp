@@ -50,6 +50,7 @@ class TurnRecord:
     advantage: float = 0.0
     return_value: float = 0.0
     reward_components: dict[str, float] = field(default_factory=dict)
+    reward_component_shaping: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass

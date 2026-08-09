@@ -44,7 +44,7 @@ from luxai2021.rl.evaluation import (
     LeagueMember,
     acceptance_report,
     evaluate_against_league,
-    paired_seed_deltas,
+    stage_advancement_report,
 )
 from luxai2021.rl.evolution import (
     CandidateResult,
@@ -94,7 +94,7 @@ _FATAL_CUDA_ERROR_MARKERS = (
     "driver shutting down",
 )
 _AUTOMATIC_INFRASTRUCTURE_RETRIES = 2
-_METRIC_SCHEMA_VERSION = 2
+_METRIC_SCHEMA_VERSION = 3
 _RUN_MANIFEST_SCHEMA_VERSION = 4
 _NATIVE_CPU_GATE_MIN_DECISIONS = 40_000
 _NATIVE_CPU_GATE_SHARE = 0.25
@@ -203,17 +203,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--short-decisions", type=int, default=550_000)
     parser.add_argument("--medium-decisions", type=int, default=1_925_000)
     parser.add_argument("--final-decisions", type=int, default=9_900_000)
-    parser.add_argument("--decisions-per-update", type=int, default=40_000)
-    parser.add_argument("--rollout-envs", type=int, default=16)
+    parser.add_argument("--decisions-per-update", type=int, default=80_000)
+    parser.add_argument("--rollout-envs", type=int, default=8)
     parser.add_argument("--rollout-backend", choices=("auto", "lockstep", "threaded"), default="auto")
     parser.add_argument("--rollout-precision", choices=("auto", "fp32", "bf16", "fp16"), default="auto")
-    parser.add_argument("--rollout-compile", choices=("auto", "on", "off"), default="auto")
+    parser.add_argument("--rollout-compile", choices=("auto", "on", "off"), default="off")
     parser.add_argument("--rollout-batch-wait-ms", type=float, default=2.0)
     parser.add_argument("--medium-count", type=int, default=8)
     parser.add_argument("--final-count", type=int, default=2)
     parser.add_argument("--episodes-per-update", type=int, default=2)
     parser.add_argument("--max-turns", type=int, default=360)
-    parser.add_argument("--screening-seeds", type=int, default=12)
+    parser.add_argument("--screening-seeds", type=int, default=24)
     parser.add_argument("--medium-seeds", type=int, default=24)
     parser.add_argument("--final-seeds", type=int, default=100)
     parser.add_argument("--screening-seed-start", type=int, default=100_000)
@@ -250,7 +250,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-codex", action="store_true")
     parser.add_argument(
         "--fixed-candidate",
-        help="Train one immutable candidate proposal through short, medium, and final stages.",
+        action="append",
+        help="Train immutable candidate proposals; repeat to run matched A/B selection.",
     )
     parser.add_argument(
         "--allow-codex-fallback",
@@ -380,7 +381,7 @@ def _candidate_provenance_path(run_dir: Path, candidate_id: str) -> Path:
     return run_dir / "provenance" / f"{candidate_id}.json"
 
 
-def _load_fixed_candidate(path: Path) -> EvolutionCandidate:
+def _load_fixed_candidate(path: Path, *, island: int = 0) -> EvolutionCandidate:
     if not path.is_file():
         message = f"Fixed candidate does not exist: {path}"
         raise FileNotFoundError(message)
@@ -404,7 +405,21 @@ def _load_fixed_candidate(path: Path) -> EvolutionCandidate:
         },
         "parameter_constraint_coefficient": 0.0,
     }
-    return EvolutionCandidate.from_proposal(proposal, generation=0, island=0, parent_ids=())
+    return EvolutionCandidate.from_proposal(proposal, generation=0, island=island, parent_ids=())
+
+
+def _fixed_candidate_paths(value: object) -> list[Path]:
+    if value is None:
+        return []
+    raw_paths = [value] if isinstance(value, str) else list(value)
+    paths = [Path(str(path)) for path in raw_paths]
+    if len(paths) != len(set(paths)):
+        raise ValueError("Fixed candidate paths must be distinct")
+    return paths
+
+
+def _fixed_candidate_descriptor(path: Path) -> dict[str, object]:
+    return {"path": str(path), "size": path.stat().st_size, "sha256": _sha256_file(path)}
 
 
 def _validate_fixed_candidate_descriptor(path: Path, manifest: Mapping[str, object]) -> None:
@@ -413,9 +428,22 @@ def _validate_fixed_candidate_descriptor(path: Path, manifest: Mapping[str, obje
         return
     if not isinstance(expected, dict):
         raise TypeError("Fixed candidate descriptor is invalid")
-    actual = {"path": str(path), "size": path.stat().st_size, "sha256": _sha256_file(path)}
+    actual = _fixed_candidate_descriptor(path)
     if actual != expected:
         raise ValueError("Fixed candidate changed; preserve this run and start a new run directory")
+
+
+def _validate_fixed_candidate_descriptors(paths: list[Path], manifest: Mapping[str, object]) -> None:
+    expected = manifest.get("fixed_candidate_descriptors")
+    if expected is None:
+        if len(paths) == 1:
+            _validate_fixed_candidate_descriptor(paths[0], manifest)
+        return
+    if not isinstance(expected, list) or not all(isinstance(item, dict) for item in expected):
+        raise TypeError("Fixed candidate descriptors are invalid")
+    actual = [_fixed_candidate_descriptor(path) for path in paths]
+    if actual != expected:
+        raise ValueError("Fixed candidates changed; preserve this run and start a new run directory")
 
 
 def _save_candidate_provenance(run_dir: Path, candidate: EvolutionCandidate, value: Mapping[str, object]) -> None:
@@ -790,28 +818,22 @@ def train_candidate(
     base_checkpoint_sha256 = _sha256_file(base_checkpoint)
     _, base_source = load_bc_checkpoint(str(base_checkpoint), "cpu")
     actor_critic = FullTurnActorCritic.from_checkpoint(base_checkpoint, device)
-    
-    reference_policy = None
-    if candidate.ppo_config.kl_coefficient > 0:
-        reference_policy = FullTurnActorCritic.from_checkpoint(base_checkpoint, device).policy
-        reference_policy.eval()
-        for param in reference_policy.parameters():
-            param.requires_grad = False
-            
+
+    # The distilled base remains a diagnostic reference even when its KL is not optimized.
+    reference_policy = FullTurnActorCritic.from_checkpoint(base_checkpoint, device).policy
+    reference_policy.eval()
+    for param in reference_policy.parameters():
+        param.requires_grad = False
+
     inherited_modules: list[str] = []
     inherited_hash = None
     if inherit_from is not None and resume_from is None:
-        inherited = torch.load(inherit_from, map_location=device, weights_only=False)
-        if "policy" in inherited:
-            inherited_policy = inherited["policy"]
-        else:
-            inherited_policy, _ = load_bc_checkpoint(str(inherit_from), str(device))
-            inherited_policy = inherited_policy.state_dict()
-        actor_critic.policy.load_state_dict(inherited_policy)
-        inherited_modules.append("policy")
-        if candidate.inheritance_mode == "policy_value" and "value_head" in inherited:
-            actor_critic.value_head.load_state_dict(inherited["value_head"])
-            inherited_modules.append("value_head")
+        inherited_modules = _load_inherited_modules(
+            actor_critic,
+            inherit_from,
+            device=device,
+            inheritance_mode=candidate.inheritance_mode,
+        )
         digest = hashlib.sha256()
         with inherit_from.open("rb") as checkpoint_input:
             while chunk := checkpoint_input.read(1024 * 1024):
@@ -981,8 +1003,9 @@ def train_candidate(
             )
         for episode in calibration_episodes:
             apply_reward_program(episode, effective_reward_program)
-        needs_warmup = candidate.inheritance_mode != "policy_value"
-        if candidate.inheritance_mode == "policy_value":
+        inherited_value_head = "value_head" in inherited_modules
+        needs_warmup = not inherited_value_head
+        if inherited_value_head:
             critic_calibration = value_head_calibration_loss(
                 actor_critic,
                 calibration_episodes,
@@ -1087,7 +1110,11 @@ def train_candidate(
             trainer.set_schedule_state(joint_update=joint_update, bc_coefficient_multiplier=bc_coefficient_multiplier)
             ppo_update_started = time.monotonic()
             is_first_update = (update == 0)
-            is_last_update = (decision_budget is not None and target_update_decisions is not None and cumulative_decisions + target_update_decisions >= decision_budget)
+            is_last_update = (
+                decision_budget is not None
+                and target_update_decisions is not None
+                and cumulative_decisions + target_update_decisions >= decision_budget
+            )
             record_grad_norms = is_first_update or is_last_update
             metrics = trainer.update(episodes, record_grad_norms=record_grad_norms)
             _synchronize_cuda(device, "PPO update")
@@ -1101,10 +1128,13 @@ def train_candidate(
             reward_values = [record.reward for episode in episodes for record in episode.records]
             terminal_values = [episode.outcome for episode in episodes]
             shaping_values = []
+            component_shaping: dict[str, list[float]] = {}
             for episode in episodes:
                 for record_index, record in enumerate(episode.records):
                     terminal = episode.outcome if record_index + 1 == len(episode.records) else 0.0
                     shaping_values.append(record.reward - terminal)
+                    for name, value in record.reward_component_shaping.items():
+                        component_shaping.setdefault(name, []).append(float(value))
             rollout_stage_seconds = aggregate_episode_timings(episodes)
             native_cpu_stage_seconds = sum(
                 rollout_stage_seconds.get(name, 0.0) for name in ("snapshot", "encode", "game_step", "reward_metrics")
@@ -1149,6 +1179,13 @@ def train_candidate(
                     / max(len(terminal_values), 1),
                     "reward_shaping_abs_mean": sum(abs(value) for value in shaping_values)
                     / max(len(shaping_values), 1),
+                    "reward_component_shaping": {
+                        name: {
+                            "mean": sum(values) / max(len(values), 1),
+                            "abs_mean": sum(abs(value) for value in values) / max(len(values), 1),
+                        }
+                        for name, values in sorted(component_shaping.items())
+                    },
                     "curriculum_progress": curriculum_progress,
                     "effective_opponent_mix": asdict(active_opponent_mix),
                     "opponent_episode_counts": dict(opponent_episode_counts),
@@ -1192,10 +1229,8 @@ def train_candidate(
                         },
                     )
                     saved_milestones.add(milestone)
-                    
+
                     if eval_seeds > 0:
-                        from luxai2021.rl.evaluation import evaluate_against_league, LeagueMember
-                        import shutil
                         milestone_path = milestone_dir / f"p{round(milestone * 100):03d}.pt"
                         teacher = LeagueMember("first-place", teacher_checkpoint, model_type="first-place")
                         evaluation = evaluate_against_league(
@@ -1210,20 +1245,29 @@ def train_candidate(
                         if score_rate > best_teacher_score_rate:
                             best_teacher_score_rate = score_rate
                             shutil.copyfile(milestone_path, output_dir / "best.pt")
+                            _save_stage_inheritance_checkpoint(
+                                actor_critic,
+                                output_dir / "best_rl.pt",
+                                update=update,
+                                metrics=metrics,
+                            )
                             epochs_without_improvement = 0
                         else:
                             epochs_without_improvement += 1
-                        
+
                         if epochs_without_improvement >= 2:
-                            print(f"Early stopping at milestone {milestone}. Best: {best_teacher_score_rate:.3f}, Current: {score_rate:.3f}")
+                            print(
+                                f"Early stopping at milestone {milestone}. "
+                                f"Best: {best_teacher_score_rate:.3f}, Current: {score_rate:.3f}"
+                            )
                             should_early_stop = True
                             break
             if checkpoint_callback is not None:
                 checkpoint_callback(output_dir, metrics)
-            
+
             if update > 0 and update % 10 == 0:
                 snapshot.load_state_dict(actor_critic.state_dict())
-                
+
             update += 1
             if decision_budget is None and seconds <= 0:
                 break
@@ -1262,7 +1306,7 @@ def train_candidate(
         "critic_warmup": critic_warmup,
         "critic_calibration": critic_calibration,
         "inheritance": {
-            "mode": candidate.inheritance_mode,
+            "mode": "policy_value" if "value_head" in inherited_modules else candidate.inheritance_mode,
             "checkpoint": str(inherit_from) if inherit_from is not None else None,
             "checkpoint_sha256": inherited_hash,
             "modules": inherited_modules,
@@ -1304,8 +1348,59 @@ def train_candidate(
             split=base_source["split"],
             metadata=summary,
         )
+        _save_stage_inheritance_checkpoint(
+            actor_critic,
+            output_dir / "best_rl.pt",
+            update=max(0, update - 1),
+            metrics=final_metrics,
+        )
     (output_dir / "metrics.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     return output_dir / "best.pt", summary
+
+
+def _save_stage_inheritance_checkpoint(
+    actor_critic: FullTurnActorCritic,
+    checkpoint_path: Path,
+    *,
+    update: int,
+    metrics: Mapping[str, object],
+) -> None:
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = checkpoint_path.with_suffix(".tmp")
+    torch.save(
+        {
+            "schema_version": 1,
+            "checkpoint_kind": "stage_inheritance",
+            "policy": actor_critic.policy.state_dict(),
+            "value_head": actor_critic.value_head.state_dict(),
+            "update": int(update),
+            "metrics": dict(metrics),
+        },
+        temporary,
+    )
+    temporary.replace(checkpoint_path)
+
+
+def _load_inherited_modules(
+    actor_critic: FullTurnActorCritic,
+    checkpoint_path: Path,
+    *,
+    device: torch.device,
+    inheritance_mode: str,
+) -> list[str]:
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if "policy" in checkpoint:
+        inherited_policy = checkpoint["policy"]
+    else:
+        inherited_model, _ = load_bc_checkpoint(str(checkpoint_path), str(device))
+        inherited_policy = inherited_model.state_dict()
+    actor_critic.policy.load_state_dict(inherited_policy)
+    modules = ["policy"]
+    inherit_stage_value = checkpoint_path.name == "best_rl.pt"
+    if (inheritance_mode == "policy_value" or inherit_stage_value) and "value_head" in checkpoint:
+        actor_critic.value_head.load_state_dict(checkpoint["value_head"])
+        modules.append("value_head")
+    return modules
 
 
 def _artifact_checkpoint(run_dir: Path, candidate_id: str, base_name: str) -> Path | None:
@@ -1425,6 +1520,46 @@ def _select_teacher_milestone(
     return Path(str(selected["checkpoint"])), report
 
 
+def _stage_checkpoint_sources(
+    run_dir: Path,
+    candidate: EvolutionCandidate,
+    candidates: Mapping[str, EvolutionCandidate],
+    *,
+    stage: str,
+    base_name: str,
+) -> tuple[Path | None, Path | None, EvolutionCandidate | None]:
+    """Separate exact optimizer resume from policy/value cross-stage inheritance."""
+    output_dir = run_dir / "artifacts" / candidate.candidate_id / stage / base_name
+    current_checkpoint = output_dir / "latest_rl.pt"
+    resume_from = current_checkpoint if current_checkpoint.exists() else None
+
+    def stage_best(stage_name: str, architecture: str) -> list[Path]:
+        directory = run_dir / "artifacts" / candidate.candidate_id / stage_name / architecture
+        # New runs preserve the value head selected with best.pt. Older runs
+        # remain usable through their inference-only best.pt.
+        return [directory / "best_rl.pt", directory / "best.pt"]
+
+    prior_short_best = stage_best("short-resattn8", "resattn8")
+    predecessor_paths = list(prior_short_best) if stage == "medium-resattn8" else []
+    if stage == "final-resattn8":
+        predecessor_paths.extend(
+            stage_best("medium-resattn8", "resattn8") + prior_short_best
+        )
+    if stage == "final-unet":
+        predecessor_paths.extend(stage_best("probe-unet", "unet"))
+    stage_inherit_from = (
+        None if resume_from is not None else next((path for path in predecessor_paths if path.exists()), None)
+    )
+    inheritance = None
+    if resume_from is None and stage_inherit_from is None:
+        inheritance = _resolve_parent_checkpoint(run_dir, candidate, candidates, base_name)
+    inherit_from = stage_inherit_from if stage_inherit_from is not None else (
+        inheritance[0] if inheritance is not None else None
+    )
+    parent = candidate if stage_inherit_from is not None else (inheritance[1] if inheritance is not None else None)
+    return resume_from, inherit_from, parent
+
+
 def candidate_result(
     candidate: EvolutionCandidate,
     *,
@@ -1442,44 +1577,15 @@ def candidate_result(
     checkpoint_callback: Callable[[Path, Mapping[str, object]], None] | None = None,
 ) -> CandidateResult:
     started_at = time.monotonic()
-    output_dir = Path(args.run_dir) / "artifacts" / candidate.candidate_id / stage / base_name
-    current_checkpoint = output_dir / "latest_rl.pt"
-    prior_short_best = (
-        Path(args.run_dir)
-        / "artifacts"
-        / candidate.candidate_id
-        / "short-resattn8"
-        / "resattn8"
-        / "best.pt"
+    run_dir = Path(args.run_dir)
+    output_dir = run_dir / "artifacts" / candidate.candidate_id / stage / base_name
+    resume_from, inherit_from, parent = _stage_checkpoint_sources(
+        run_dir,
+        candidate,
+        candidates,
+        stage=stage,
+        base_name=base_name,
     )
-    resume_from = current_checkpoint if current_checkpoint.exists() else None
-    predecessor_paths = [prior_short_best] if stage == "medium-resattn8" else []
-    if stage == "final-resattn8":
-        predecessor_paths.extend(
-            [
-                Path(args.run_dir)
-                / "artifacts"
-                / candidate.candidate_id
-                / "medium-resattn8"
-                / "resattn8"
-                / "best.pt",
-                prior_short_best,
-            ]
-        )
-    if stage == "final-unet":
-        predecessor_paths.append(
-            Path(args.run_dir) / "artifacts" / candidate.candidate_id / "probe-unet" / "unet" / "best.pt"
-        )
-    stage_inherit_from = (
-        None if resume_from is not None else next((path for path in predecessor_paths if path.exists()), None)
-    )
-    inheritance = None
-    if resume_from is None and stage_inherit_from is None:
-        inheritance = _resolve_parent_checkpoint(Path(args.run_dir), candidate, candidates, base_name)
-    inherit_from = stage_inherit_from if stage_inherit_from is not None else (
-        inheritance[0] if inheritance is not None else None
-    )
-    parent = candidate if stage_inherit_from is not None else (inheritance[1] if inheritance is not None else None)
     parent_effective_scale = (
         _effective_scale_from_artifact(inherit_from, parent.reward_program.reward_scale)
         if inherit_from is not None and parent is not None
@@ -1521,7 +1627,7 @@ def candidate_result(
             critic_warmup_episodes=args.critic_warmup_episodes,
             reward_mode=args.reward_mode,
             resume_from=resume_from,
-            resume_budget_progress=resume_from == current_checkpoint,
+            resume_budget_progress=resume_from is not None,
             checkpoint_callback=checkpoint_callback,
             rollout_backend=args.rollout_backend,
             rollout_precision=args.rollout_precision,
@@ -2048,27 +2154,51 @@ def _select_completed_stage(
     count: int,
     baseline: Mapping[str, object] | None = None,
 ) -> list[str]:
-    def ranking_key(result: CandidateResult) -> tuple[float, ...]:
+    advancement_reports: dict[str, dict[str, object]] = {}
+
+    def advancement_report(result: CandidateResult) -> dict[str, object] | None:
         if baseline is None or result.status != "completed":
-            return result.fitness
+            return None
         evaluation = result.metrics.get("evaluation", {}) if isinstance(result.metrics, Mapping) else {}
         if not isinstance(evaluation, dict):
-            return result.fitness
-        seed_deltas, anchor_deltas = paired_seed_deltas(evaluation, dict(baseline))
-        teacher_delta = float(anchor_deltas.get("first-place", -1.0))
-        base_delta = max(
-            (float(value) for name, value in anchor_deltas.items() if name != "first-place"),
-            default=-1.0,
+            return None
+        report = stage_advancement_report(
+            evaluation,
+            dict(baseline),
+            score_margin=0.02 if stage.startswith("short-") else 0.0,
         )
-        combined_delta = sum(seed_deltas.values()) / max(len(seed_deltas), 1)
-        valid = float(result.fitness[0] > 0.0)
-        return valid, float(teacher_delta >= 0.0), teacher_delta, combined_delta, base_delta
+        advancement_reports[result.candidate_id] = report
+        return report
 
+    def ranking_key(result: CandidateResult) -> tuple[float, ...]:
+        report = advancement_reports.get(result.candidate_id)
+        if report is None:
+            return result.fitness
+        survival = report.get("survival", {})
+        city_loss_delta = (
+            float(survival.get("normalized_city_tile_loss_delta", float("inf")))
+            if isinstance(survival, Mapping)
+            else float("inf")
+        )
+        return (
+            float(report["teacher_score_delta"]),
+            float(report["overall_score_delta"]),
+            float(report["base_score_delta"]),
+            -city_loss_delta,
+        )
+
+    completed = [
+        result
+        for result in results
+        if result.stage == stage and result.status == "completed" and result.candidate_id in candidates
+    ]
+    for result in completed:
+        advancement_report(result)
     ranked = sorted(
         (
             result
-            for result in results
-            if result.stage == stage and result.status == "completed" and result.candidate_id in candidates
+            for result in completed
+            if baseline is None or bool(advancement_reports[result.candidate_id]["passes"])
         ),
         key=ranking_key,
         reverse=True,
@@ -2127,6 +2257,23 @@ def _load_or_create_stage_selection(
                 "source_stage_verified": not unverified,
                 "unverified_candidate_ids": unverified,
                 "selection_policy": "teacher_guarded_paired" if baseline is not None else "legacy_fitness",
+                "advancement_reports": (
+                    {
+                        result.candidate_id: stage_advancement_report(
+                            dict(result.metrics["evaluation"]),
+                            dict(baseline),
+                            score_margin=0.02 if source_stage.startswith("short-") else 0.0,
+                        )
+                        for result in results
+                        if baseline is not None
+                        and result.stage == source_stage
+                        and result.status == "completed"
+                        and isinstance(result.metrics, Mapping)
+                        and isinstance(result.metrics.get("evaluation"), dict)
+                    }
+                    if baseline is not None
+                    else {}
+                ),
                 "baseline_context": baseline.get("_context") if baseline is not None else None,
                 "created_at": time.time(),
             },
@@ -2419,12 +2566,14 @@ def main(
     if existing_manifest is not None:
         _validate_run_kind(existing_manifest, dry_run=args.dry_run)
         _apply_coordinator_manifest(args, existing_manifest)
-    fixed_candidate_path = Path(args.fixed_candidate) if args.fixed_candidate else None
-    fixed_candidate = _load_fixed_candidate(fixed_candidate_path) if fixed_candidate_path is not None else None
-    if existing_manifest is not None and fixed_candidate_path is not None:
-        _validate_fixed_candidate_descriptor(fixed_candidate_path, existing_manifest)
-    if fixed_candidate is not None:
-        args.islands = 1
+    fixed_candidate_paths = _fixed_candidate_paths(args.fixed_candidate)
+    fixed_candidates = [
+        _load_fixed_candidate(path, island=island) for island, path in enumerate(fixed_candidate_paths)
+    ]
+    if existing_manifest is not None and fixed_candidate_paths:
+        _validate_fixed_candidate_descriptors(fixed_candidate_paths, existing_manifest)
+    if fixed_candidates:
+        args.islands = len(fixed_candidates)
         args.initial_per_island = 1
         args.generations = 0
         args.medium_count = 1
@@ -2452,7 +2601,7 @@ def main(
     if existing_manifest is None:
         generation_mode = (
             "fixed"
-            if fixed_candidate is not None
+            if fixed_candidates
             else "dry_run"
             if args.dry_run
             else "deterministic"
@@ -2502,14 +2651,13 @@ def main(
             "training_curriculum": training_curriculum(args.curriculum_profile).to_dict(),
             "checkpoint_descriptors": {} if args.dry_run else _checkpoint_descriptors(args),
             "fixed_candidate_descriptor": (
-                {
-                    "path": str(fixed_candidate_path),
-                    "size": fixed_candidate_path.stat().st_size,
-                    "sha256": _sha256_file(fixed_candidate_path),
-                }
-                if fixed_candidate_path is not None
+                _fixed_candidate_descriptor(fixed_candidate_paths[0])
+                if len(fixed_candidate_paths) == 1
                 else None
             ),
+            "fixed_candidate_descriptors": [
+                _fixed_candidate_descriptor(path) for path in fixed_candidate_paths
+            ],
         }
         store.save_manifest(manifest)
     else:
@@ -2778,7 +2926,7 @@ def main(
         if existing_initial:
             base = existing_initial[0]
         else:
-            base = fixed_candidate if fixed_candidate is not None else initial_candidate(island=island, seed=args.seed)
+            base = fixed_candidates[island] if fixed_candidates else initial_candidate(island=island, seed=args.seed)
             register(base, candidate_provenance(base, "initial", generation=0, island=island))
         island_parents[island] = base
         base_wave.append(short_job(base))
@@ -3178,6 +3326,17 @@ def main(
                 "mean_score_rate": sum(result.score_rate for result in values) / len(values),
                 "worst_score_rate": min(result.score_rate for result in values),
                 "architectures": {result.stage.removeprefix("final-"): asdict(result) for result in values},
+                "raw_illegal_action_mass": {
+                    result.stage.removeprefix("final-"): {
+                        name: _final_training_metrics(result.metrics).get(name)
+                        for name in (
+                            "illegal_action_mass_mean",
+                            "illegal_action_mass_p95",
+                            "illegal_action_mass_max",
+                        )
+                    }
+                    for result in values
+                },
                 "acceptance": acceptance,
             }
         )

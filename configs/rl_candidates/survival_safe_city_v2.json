@@ -1,0 +1,44 @@
+{
+  "opponent_mix": {
+    "other_base": 0.1,
+    "self_base": 0.45,
+    "snapshot": 0.2,
+    "teacher": 0.25
+  },
+  "ppo_config": {
+    "bc_coefficient": 0.05,
+    "clip_range": 0.2,
+    "entropy_coefficient": 0.005,
+    "gae_lambda": 0.995,
+    "gamma": 0.999,
+    "gradient_clip": 1.0,
+    "illegal_action_coefficient": 0.01,
+    "kl_coefficient": 0.0,
+    "learning_rate": 0.0000075,
+    "minibatch_turns": 64,
+    "target_kl": 0.01,
+    "update_epochs": 2,
+    "value_clip_range": 0.2,
+    "value_coefficient": 0.5,
+    "weight_decay": 0.00001
+  },
+  "rationale": "Rewards only night-survivable City expansion, prioritizes the weakest City, and penalizes deficit, stranded fuel, and linearly normalized cumulative night loss. TD(lambda) is used instead of UPGO.",
+  "reward_program": {
+    "components": [
+      {"expression": {"name": "safe_city_tiles", "op": "metric"}, "name": "safe_city_tiles", "weight": 1.2},
+      {"expression": {"name": "own_min_city_survival", "op": "metric"}, "name": "own_min_city_survival", "weight": 0.8},
+      {"expression": {"name": "units", "op": "metric"}, "name": "units", "weight": 0.4},
+      {"expression": {"name": "research", "op": "metric"}, "name": "research", "weight": 0.1},
+      {"expression": {"name": "own_night_fuel_deficit", "op": "metric"}, "name": "own_night_fuel_deficit", "weight": -1.1},
+      {"expression": {"name": "own_stranded_fuel", "op": "metric"}, "name": "own_stranded_fuel", "weight": -0.8},
+      {"expression": {"name": "own_city_tiles_lost_linear", "op": "metric"}, "name": "own_city_tiles_lost_linear", "weight": -0.8}
+    ],
+    "derived_metrics": [],
+    "gamma": 0.999,
+    "mode": "potential_linear",
+    "normalize_total": true,
+    "reward_scale": 0.35,
+    "terminal_reward_scale": 10.0,
+    "version": 2
+  }
+}

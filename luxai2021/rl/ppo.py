@@ -42,20 +42,21 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class PPOConfig:
-    learning_rate: float = 1e-5
+    learning_rate: float = 7.5e-6
     weight_decay: float = 1e-5
-    gamma: float = 0.995
-    gae_lambda: float = 0.95
+    gamma: float = 0.999
+    gae_lambda: float = 0.995
     clip_range: float = 0.2
     value_clip_range: float = 0.2
     entropy_coefficient: float = 0.005
     value_coefficient: float = 0.5
-    kl_coefficient: float = 0.01
+    kl_coefficient: float = 0.0
     target_kl: float | None = 0.01
     bc_coefficient: float = 0.05
     gradient_clip: float = 1.0
     update_epochs: int = 2
-    minibatch_turns: int = 32
+    minibatch_turns: int = 64
+    illegal_action_coefficient: float = 0.01
 
     def __post_init__(self) -> None:
         bounds = {
@@ -70,6 +71,7 @@ class PPOConfig:
             "kl_coefficient": (0.0, 1.0),
             "bc_coefficient": (0.0, 1.0),
             "gradient_clip": (0.1, 10.0),
+            "illegal_action_coefficient": (0.0, 1.0),
         }
         for name, (low, high) in bounds.items():
             value = float(getattr(self, name))
@@ -126,6 +128,7 @@ def finish_episode(
         breakdown = reward_program.reward(record.metrics, following, terminal_outcome=terminal)
         record.reward = breakdown.total
         record.reward_components = dict(breakdown.components)
+        record.reward_component_shaping = dict(breakdown.component_shaping)
     diagnostic_events = [
         dict(event)
         for event in getattr(game, "diagnostic_events", ())
@@ -168,6 +171,7 @@ def apply_reward_program(episode: EpisodeTrajectory, reward_program: RewardProgr
         breakdown = reward_program.reward(record.metrics, following, terminal_outcome=terminal)
         record.reward = breakdown.total
         record.reward_components = dict(breakdown.components)
+        record.reward_component_shaping = dict(breakdown.component_shaping)
 
 
 def _critic_examples(episodes: list[EpisodeTrajectory], gamma: float) -> tuple[Tensor, Tensor]:
@@ -459,16 +463,20 @@ class PPOTrainer:
         config: PPOConfig,
         device: torch.device,
         *,
-        reference_policy: nn.Module | None = None,
+        reference_policy: torch.nn.Module | None = None,
         bc_batch_provider: Callable[[], Mapping[str, Tensor]] | None = None,
-        illegal_action_coefficient: float = 0.01,
+        illegal_action_coefficient: float | None = None,
     ) -> None:
         self.actor_critic = actor_critic
         self.reference_policy = reference_policy
         self.config = config
         self.device = device
         self.bc_batch_provider = bc_batch_provider
-        self.illegal_action_coefficient = float(illegal_action_coefficient)
+        self.illegal_action_coefficient = float(
+            config.illegal_action_coefficient
+            if illegal_action_coefficient is None
+            else illegal_action_coefficient
+        )
         self.actor_lr_multiplier = 1.0
         self.bc_coefficient_multiplier = 1.0
         self.optimizer = torch.optim.AdamW(
@@ -483,7 +491,7 @@ class PPOTrainer:
         masked = apply_legal_action_mask(logits[None], mask.to(logits.device)[None])[0]
         return Categorical(logits=masked.float())
 
-    def update(self, episodes: list[EpisodeTrajectory], record_grad_norms: bool = False) -> dict[str, float]:
+    def update(self, episodes: list[EpisodeTrajectory], *, record_grad_norms: bool = False) -> dict[str, float]:
         records = calculate_gae(episodes, self.config)
         if not records:
             raise ValueError("Cannot update PPO without rollout turns")
@@ -493,6 +501,8 @@ class PPOTrainer:
         totals: dict[str, float] = {}
         update_count = 0
         gn_pols, gn_vals, gn_bcs = [], [], []
+        gn_illegals = []
+        sampled_reference_kls: list[float] = []
         early_stop = False
         epoch_count = 0
         for _ in range(self.config.update_epochs):
@@ -509,7 +519,10 @@ class PPOTrainer:
                 )
                 output, values = self.actor_critic(observations)
                 reference_output = None
-                if self.config.kl_coefficient > 0 and self.reference_policy is not None:
+                measure_reference_kl = self.reference_policy is not None and (
+                    self.config.kl_coefficient > 0 or not sampled_reference_kls
+                )
+                if measure_reference_kl:
                     with torch.no_grad():
                         reference_output = self.reference_policy(observations)
                 policy_losses = []
@@ -550,7 +563,7 @@ class PPOTrainer:
                         p_logits = reference_distribution.logits
                         q_logits = distribution.logits
                         p_probs = reference_distribution.probs
-                        
+
                         safe_p_logits = p_logits.masked_fill(~masks, 0.0)
                         safe_q_logits = q_logits.masked_fill(~masks, 0.0)
 
@@ -590,27 +603,46 @@ class PPOTrainer:
                 turn_count = max(1, num_turns)
                 flat_indices = torch.cat(turn_indices)
                 turn_action_counts = torch.bincount(flat_indices, minlength=num_turns).clamp_min(1)
-                
+
                 flat_policy = torch.cat(policy_losses)
-                turn_policy_loss = torch.zeros(num_turns, device=self.device).scatter_add_(0, flat_indices, flat_policy) / turn_action_counts
+                turn_policy_loss = (
+                    torch.zeros(num_turns, device=self.device).scatter_add_(0, flat_indices, flat_policy)
+                    / turn_action_counts
+                )
                 policy_loss = turn_policy_loss.sum() / turn_count
-                
+
                 flat_entropy = torch.cat(entropies)
-                turn_entropy = torch.zeros(num_turns, device=self.device).scatter_add_(0, flat_indices, flat_entropy) / turn_action_counts
+                turn_entropy = (
+                    torch.zeros(num_turns, device=self.device).scatter_add_(0, flat_indices, flat_entropy)
+                    / turn_action_counts
+                )
                 entropy = turn_entropy.sum() / turn_count
-                
+
                 if kls:
                     flat_kls = torch.cat(kls)
-                    turn_kl = torch.zeros(num_turns, device=self.device).scatter_add_(0, flat_indices, flat_kls) / turn_action_counts
+                    turn_kl = (
+                        torch.zeros(num_turns, device=self.device).scatter_add_(0, flat_indices, flat_kls)
+                        / turn_action_counts
+                    )
                     kl = turn_kl.sum() / turn_count
                 else:
                     kl = torch.tensor(0.0, device=self.device)
-                    
+
                 bc_loss = self._distillation_anchor_loss(values)
-                
+
                 flat_illegal = torch.cat(illegal_losses)
-                turn_illegal = torch.zeros(num_turns, device=self.device).scatter_add_(0, flat_indices, flat_illegal) / turn_action_counts
+                turn_illegal = (
+                    torch.zeros(num_turns, device=self.device).scatter_add_(0, flat_indices, flat_illegal)
+                    / turn_action_counts
+                )
                 illegal_action_loss = turn_illegal.sum() / turn_count
+                approx_kl = (
+                    torch.stack(approx_kls).mean()
+                    if approx_kls
+                    else torch.tensor(0.0, device=self.device)
+                )
+                if reference_output is not None:
+                    sampled_reference_kls.append(float(kl.detach()))
                 loss = (
                     policy_loss
                     + self.config.value_coefficient * value_loss
@@ -621,21 +653,22 @@ class PPOTrainer:
                 )
                 if not torch.isfinite(loss):
                     raise FloatingPointError("PPO produced a non-finite loss")
-                
+
                 if record_grad_norms:
                     def _gn() -> float:
                         grads = [p.grad for p in self.actor_critic.policy.encoder.parameters() if p.grad is not None]
-                        if not grads: return 0.0
+                        if not grads:
+                            return 0.0
                         return torch.norm(torch.stack([torch.norm(g) for g in grads])).item()
-                    
+
                     self.optimizer.zero_grad(set_to_none=True)
                     (self.config.value_coefficient * value_loss).backward(retain_graph=True)
                     gn_vals.append(_gn())
-                    
+
                     self.optimizer.zero_grad(set_to_none=True)
                     policy_loss.backward(retain_graph=True)
                     gn_pols.append(_gn())
-                    
+
                     self.optimizer.zero_grad(set_to_none=True)
                     bc_loss_weighted = self.config.bc_coefficient * self.bc_coefficient_multiplier * bc_loss
                     if isinstance(bc_loss_weighted, torch.Tensor) and bc_loss_weighted.requires_grad:
@@ -644,10 +677,10 @@ class PPOTrainer:
                     else:
                         gn_bcs.append(0.0)
 
-                if self.config.target_kl is not None and approx_kls:
-                    if torch.stack(approx_kls).mean().item() > 1.5 * self.config.target_kl:
-                        early_stop = True
-                        break
+                    self.optimizer.zero_grad(set_to_none=True)
+                    illegal_weighted = self.illegal_action_coefficient * illegal_action_loss
+                    illegal_weighted.backward(retain_graph=True)
+                    gn_illegals.append(_gn())
 
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -666,6 +699,7 @@ class PPOTrainer:
                     "value_loss": value_loss,
                     "entropy": entropy,
                     "kl": kl,
+                    "approx_kl": approx_kl,
                     "bc_loss": bc_loss,
                     "illegal_action_loss": illegal_action_loss,
                     "illegal_action_mass_mean": torch.cat(illegal_masses).mean(),
@@ -676,19 +710,30 @@ class PPOTrainer:
                 for name, value in batch_metrics.items():
                     totals[name] = totals.get(name, 0.0) + float(value.detach())
                 update_count += 1
+                if (
+                    self.config.target_kl is not None
+                    and approx_kls
+                    and approx_kl.item() > 1.5 * self.config.target_kl
+                ):
+                    early_stop = True
+                    break
         if update_count == 0:
             raise ValueError("PPO rollout contained no actionable entities")
         result = {name: value / update_count for name, value in totals.items() if update_count > 0}
+        reference_kl = sum(sampled_reference_kls) / max(len(sampled_reference_kls), 1)
+        result["reference_kl"] = reference_kl
+        # Preserve the legacy metric name while separating it from PPO's old/current approximate KL.
+        result["kl"] = reference_kl
         result["early_stopped"] = float(early_stop)
         result["epochs_completed"] = float(epoch_count)
-        
+
         updates = {
             "episodes": float(len(episodes)),
             "turns": float(len(records)),
             "decisions": float(sum(len(record.decisions) for record in records)),
             "score_rate": sum((episode.outcome + 1.0) * 0.5 for episode in episodes) / len(episodes),
         }
-        
+
         if record_grad_norms and gn_pols:
             import numpy as np
             updates.update({
@@ -701,8 +746,14 @@ class PPOTrainer:
                 "grad_norm_bc_mean": float(np.mean(gn_bcs)),
                 "grad_norm_bc_max": float(np.max(gn_bcs)),
                 "grad_norm_bc_p95": float(np.percentile(gn_bcs, 95)),
+                "grad_norm_illegal_mean": float(np.mean(gn_illegals)),
+                "grad_norm_illegal_max": float(np.max(gn_illegals)),
+                "grad_norm_illegal_p95": float(np.percentile(gn_illegals, 95)),
+                "grad_norm_policy_to_bc_ratio": float(np.mean(gn_pols)) / max(float(np.mean(gn_bcs)), 1e-12),
+                "grad_norm_policy_to_illegal_ratio": float(np.mean(gn_pols))
+                / max(float(np.mean(gn_illegals)), 1e-12),
             })
-            
+
         result.update(updates)
         return result
 
@@ -793,7 +844,10 @@ class PPOTrainer:
             raise ValueError("RL resume source checkpoint SHA-256 does not match")
         if checkpoint.get("reward_program") != reward_program.to_dict():
             raise ValueError("RL resume reward program does not match")
-        if checkpoint.get("ppo_config") != asdict(self.config):
+        stored_ppo_config = dict(checkpoint.get("ppo_config", {}))
+        # Schema-v3 checkpoints predate the explicit auxiliary-loss field.
+        stored_ppo_config.setdefault("illegal_action_coefficient", 0.01)
+        if stored_ppo_config != asdict(self.config):
             raise ValueError("RL resume PPO configuration does not match")
         self.actor_critic.policy.load_state_dict(checkpoint["policy"])
         self.actor_critic.value_head.load_state_dict(checkpoint["value_head"])

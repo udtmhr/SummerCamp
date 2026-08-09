@@ -27,8 +27,9 @@ from luxai2021.rl.reward import (
     default_reward_program,
 )
 
-EVOLUTION_SCHEMA_VERSION = 2
+EVOLUTION_SCHEMA_VERSION = 3
 LEGACY_EVOLUTION_SCHEMA_VERSION = 1
+SUPPORTED_EVOLUTION_SCHEMA_VERSIONS = frozenset({1, 2, EVOLUTION_SCHEMA_VERSION})
 OPPONENT_KEYS = ("self_base", "other_base", "teacher", "snapshot")
 LUX_S1_RULES_SOURCE_URL = "https://www.lux-ai.org/specs-2021#Background"
 LUX_S1_RULES_PATH = Path(__file__).with_name("lux_s1_rules.md")
@@ -169,11 +170,9 @@ def training_curriculum(name: str) -> TrainingCurriculum:
         return TrainingCurriculum(
             name,
             ((0.0, 0.10), (1.0, 0.10)),
-            ((0.0, 1.0), (1.0, 1.0)),
+            ((0.0, 1.0), (0.20, 1.0), (0.70, 0.50), (1.0, 0.25)),
             snapshot_floor=0.10,
-            # Short + medium end near 20% of the default total budget. Keep the
-            # teacher anchor intact through that failure-prone interval.
-            bc_coefficient_points=((0.0, 1.0), (1.0, 1.0)),
+            bc_coefficient_points=((0.0, 1.0), (0.20, 1.0), (0.70, 0.80), (1.0, 0.20)),
         )
     raise ValueError(f"Unknown curriculum profile: {name}")
 
@@ -194,11 +193,12 @@ class EvolutionCandidate:
     inheritance_mode: str = "base"
     mutation_manifest: Mapping[str, Any] = field(default_factory=dict)
     parameter_constraint_coefficient: float = 0.0
+    schema_version: int = EVOLUTION_SCHEMA_VERSION
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> EvolutionCandidate:
         schema_version = int(value.get("schema_version", 0))
-        if schema_version not in {LEGACY_EVOLUTION_SCHEMA_VERSION, EVOLUTION_SCHEMA_VERSION}:
+        if schema_version not in SUPPORTED_EVOLUTION_SCHEMA_VERSIONS:
             raise ValueError("Unsupported evolution candidate schema")
         candidate = cls.from_proposal(
             value,
@@ -222,7 +222,10 @@ class EvolutionCandidate:
         schema_version: int = EVOLUTION_SCHEMA_VERSION,
     ) -> EvolutionCandidate:
         reward = RewardProgram.from_dict(proposal["reward_program"])
-        ppo = PPOConfig(**proposal["ppo_config"])
+        raw_ppo = dict(proposal["ppo_config"])
+        ppo = PPOConfig(**raw_ppo)
+        if not math.isclose(reward.gamma, ppo.gamma, abs_tol=1e-12):
+            raise ValueError("Reward-program gamma must match PPO gamma")
         opponent = OpponentMix(**proposal["opponent_mix"])
         rationale = str(proposal.get("rationale", ""))[:4000]
         mutation_kind = str(proposal.get("mutation_kind", "legacy" if schema_version == 1 else "parameter"))
@@ -242,12 +245,15 @@ class EvolutionCandidate:
             raise ValueError("primary_parent_id must be one of parent_ids")
         if any(item not in parent_ids or item == primary_parent_id for item in secondary_parent_ids):
             raise ValueError("secondary_parent_ids must be distinct parent_ids")
+        canonical_ppo = asdict(ppo)
+        if schema_version < 3:
+            canonical_ppo.pop("illegal_action_coefficient")
         canonical_value: dict[str, Any] = {
             "generation": generation,
             "island": island,
             "parents": parent_ids,
             "reward": reward.to_dict(),
-            "ppo": asdict(ppo),
+            "ppo": canonical_ppo,
             "opponent": asdict(opponent),
         }
         if schema_version >= 2:
@@ -282,10 +288,14 @@ class EvolutionCandidate:
             inheritance_mode,
             mutation_manifest,
             parameter_constraint_coefficient,
+            schema_version,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        schema_version = LEGACY_EVOLUTION_SCHEMA_VERSION if self.mutation_kind == "legacy" else EVOLUTION_SCHEMA_VERSION
+        schema_version = self.schema_version
+        ppo_config = asdict(self.ppo_config)
+        if schema_version < 3:
+            ppo_config.pop("illegal_action_coefficient")
         value = {
             "schema_version": schema_version,
             "candidate_id": self.candidate_id,
@@ -293,7 +303,7 @@ class EvolutionCandidate:
             "island": self.island,
             "parent_ids": list(self.parent_ids),
             "reward_program": self.reward_program.to_dict(),
-            "ppo_config": asdict(self.ppo_config),
+            "ppo_config": ppo_config,
             "opponent_mix": asdict(self.opponent_mix),
             "rationale": self.rationale,
         }
@@ -765,7 +775,7 @@ Hard constraints:
 - The official first-place Teacher is stronger than the distilled bases. Teacher non-regression is a hard objective;
   a self_base gain cannot compensate for a Teacher regression.
 - PPO uses clipping for update stability and the first-place Teacher distillation anchor; it trains on one GPU.
-- Parent-policy KL loss and L2-SP are disabled. Always set 
+- Parent-policy KL loss and L2-SP are disabled. Always set
   parameter_constraint_coefficient to 0; do not propose mutations of either field.
 - Opponent weights must sum to exactly 1.0.
 {edit_guidance}
@@ -1102,8 +1112,7 @@ def _serialized_counter(items: object) -> Counter[str]:
 
 
 def _active_ppo_settings(config: PPOConfig) -> dict[str, object]:
-    value = asdict(config)
-    return value
+    return asdict(config)
 
 
 def _is_parameter_mutation(primary: EvolutionCandidate, candidate: EvolutionCandidate) -> bool:
@@ -1703,7 +1712,7 @@ class CodexCandidateGenerator:
 
 def initial_candidate(*, island: int, seed: int) -> EvolutionCandidate:
     rng = random.Random(seed + island)
-    base_ppo = PPOConfig(bc_coefficient=0.05, kl_coefficient=0.01)
+    base_ppo = PPOConfig()
     reward = default_reward_program().to_dict()
     reward["version"] = 2
     reward["derived_metrics"] = []
@@ -1872,7 +1881,7 @@ def mutate_candidate(
     reward["version"] = 2
     reward.setdefault("derived_metrics", [])
     ppo = asdict(parent.ppo_config)
-    
+
     opponent = asdict(parent.opponent_mix)
     changed_paths: list[str] = []
     selected_secondary_ids: list[str] = []
@@ -1890,7 +1899,7 @@ def mutate_candidate(
             )
             changed_paths.append(f"reward_program.components[{index}].weight")
         else:
-            selected = rng.choice(("learning_rate", "entropy_coefficient", "bc_coefficient", "kl_coefficient"))
+            selected = rng.choice(("learning_rate", "entropy_coefficient", "bc_coefficient"))
             ppo[selected] = float(ppo[selected]) * math.exp(rng.gauss(0.0, 0.12))
             changed_paths.append(f"ppo_config.{selected}")
     elif island == 1:

@@ -26,15 +26,19 @@ from examples.evolve_rl import (
     _curriculum_start_decisions,
     _evaluation_anchors,
     _final_training_metrics,
+    _fixed_candidate_paths,
     _is_fatal_cuda_error,
     _is_retryable_infrastructure_failure,
     _job_retry_count,
     _load_fixed_candidate,
+    _load_inherited_modules,
     _load_or_create_stage_selection,
     _record_job_retry,
     _record_skipped_job,
     _save_candidate_provenance,
+    _save_stage_inheritance_checkpoint,
     _select_teacher_milestone,
+    _stage_checkpoint_sources,
     _sync_api_claim,
     _validate_candidate_provenance,
     _validate_checkpoint_descriptors,
@@ -56,7 +60,12 @@ from luxai2021.imitation.model import (
     load_bc_checkpoint,
 )
 from luxai2021.rl.batched_rollout import ActorCriticBatcher, InferenceBatcher, _CompiledInference
-from luxai2021.rl.evaluation import _survival_summary, acceptance_report, paired_seed_deltas
+from luxai2021.rl.evaluation import (
+    _survival_summary,
+    acceptance_report,
+    paired_seed_deltas,
+    stage_advancement_report,
+)
 from luxai2021.rl.evolution import (
     CandidateResult,
     CodexCandidateGenerator,
@@ -122,6 +131,7 @@ def _metrics(**updates):
         "turns_until_night": 0.0,
         "night_turns_remaining": 0.0,
         "city_tiles": 0.0,
+        "safe_city_tiles": 0.0,
         "units": 0.0,
         "workers": 0.0,
         "carts": 0.0,
@@ -138,6 +148,7 @@ def _metrics(**updates):
         "stranded_fuel": 0.0,
         "fuel_delivery_coverage": 0.0,
         "city_tile_loss": 0.0,
+        "city_tile_loss_linear": 0.0,
         "night_fuel_shortage": 0.0,
         "worker_resource_access": 0.0,
         "worker_cargo_fullness": 0.0,
@@ -150,6 +161,7 @@ def _metrics(**updates):
         "own_stranded_fuel": 0.0,
         "own_fuel_delivery_coverage": 0.0,
         "own_city_tiles_lost": 0.0,
+        "own_city_tiles_lost_linear": 0.0,
         "own_night_fuel_shortage": 0.0,
     }
     values.update(updates)
@@ -194,7 +206,8 @@ def test_default_reward_penalizes_absolute_fuel_deficit_and_city_loss():
     weights = {component.name: component.weight for component in program.components}
 
     assert program.mode == "potential_linear"
-    assert program.reward_scale == pytest.approx(0.5)
+    assert program.reward_scale == pytest.approx(0.35)
+    assert program.gamma == pytest.approx(0.999)
     assert program.terminal_reward_scale == pytest.approx(10.0)
     assert program.normalize_total is True
     assert sum(abs(weight) for weight in weights.values()) == pytest.approx(5.2)
@@ -203,6 +216,7 @@ def test_default_reward_penalizes_absolute_fuel_deficit_and_city_loss():
     assert "night_fuel_deficit" not in weights
     assert "city_tile_loss" not in weights
     assert breakdown.shaping < 0.0
+    assert set(breakdown.component_shaping) == set(weights)
 
 
 def test_normalized_terminal_reward_cannot_be_reversed_by_potential_shaping():
@@ -258,6 +272,30 @@ def test_survival_linear_fixed_candidate_matches_safe_defaults():
     assert candidate.ppo_config.bc_coefficient == pytest.approx(0.025)
     assert candidate.ppo_config.gae_lambda == pytest.approx(0.98)
     assert candidate.opponent_mix.teacher == pytest.approx(0.25)
+
+
+def test_survival_v2_ab_candidates_share_credit_settings_and_differ_only_in_reward_components():
+    credit = _load_fixed_candidate(Path("configs/rl_candidates/survival_credit_v2.json"), island=0)
+    safe_city = _load_fixed_candidate(Path("configs/rl_candidates/survival_safe_city_v2.json"), island=1)
+    safe_weights = {component.name: component.weight for component in safe_city.reward_program.components}
+
+    assert credit.ppo_config == safe_city.ppo_config
+    assert credit.opponent_mix == safe_city.opponent_mix
+    assert credit.ppo_config.gamma == pytest.approx(0.999)
+    assert credit.ppo_config.gae_lambda == pytest.approx(0.995)
+    assert credit.ppo_config.bc_coefficient == pytest.approx(0.05)
+    assert credit.ppo_config.kl_coefficient == 0.0
+    assert credit.ppo_config.illegal_action_coefficient == pytest.approx(0.01)
+    assert safe_city.reward_program.reward_scale == pytest.approx(0.35)
+    assert safe_weights == {
+        "safe_city_tiles": 1.2,
+        "own_min_city_survival": 0.8,
+        "units": 0.4,
+        "research": 0.1,
+        "own_night_fuel_deficit": -1.1,
+        "own_stranded_fuel": -0.8,
+        "own_city_tiles_lost_linear": -0.8,
+    }
 
 
 def test_fixed_candidate_descriptor_rejects_changed_file(tmp_path):
@@ -492,6 +530,9 @@ def test_city_loss_metric_is_cumulative_for_potential_difference_reward():
 
     assert before.get("own_city_tiles_lost") == 0.0
     assert after.get("own_city_tiles_lost") > 0.0
+    assert after.get("own_city_tiles_lost_linear") == pytest.approx(
+        min(after.context.sums["own_city_tiles_lost"] / 64.0, 1.0)
+    )
     assert after.get("own_night_fuel_shortage") > 0.0
     assert after.get("city_tile_loss") < 0.0
     program = RewardProgram.from_dict(
@@ -511,6 +552,58 @@ def test_city_loss_metric_is_cumulative_for_potential_difference_reward():
     )
     assert program.reward(before, after).shaping < 0.0
     assert program.reward(after, after).shaping == pytest.approx(0.0)
+
+
+def test_safe_city_tiles_rewards_only_cities_funded_for_the_next_night():
+    game = Game({"seed": 17})
+    own_city = next(city for city in game.cities.values() if city.team == 0)
+    opponent_city = next(city for city in game.cities.values() if city.team == 1)
+    game.state["turn"] = 30
+    own_city.fuel = float(own_city.get_light_upkeep()) * 10.0
+    opponent_city.fuel = 0.0
+
+    metrics = metrics_from_game(game, 0)
+
+    assert metrics.get("safe_city_tiles") > 0.0
+    assert metrics.get("own_night_fuel_deficit") == pytest.approx(0.0)
+
+
+def test_reward_and_ppo_gamma_must_match():
+    parent = initial_candidate(island=0, seed=1)
+    proposal = _candidate_proposal(parent, mutation_kind="parameter")
+    proposal["reward_program"]["gamma"] = 0.995
+
+    with pytest.raises(ValueError, match="gamma must match"):
+        EvolutionCandidate.from_proposal(proposal, generation=1, island=0, parent_ids=(parent.candidate_id,))
+
+
+@pytest.mark.parametrize("horizon", [1, 40, 160, 360])
+def test_discounted_terminal_outcome_dominates_extreme_potential_shaping(horizon):
+    program = RewardProgram.from_dict(
+        {
+            "components": [
+                {"name": "signal", "expression": {"op": "metric", "name": "city_tiles"}, "weight": 5.0}
+            ],
+            "reward_scale": 0.35,
+            "gamma": 0.999,
+            "terminal_reward_scale": 10.0,
+            "normalize_total": True,
+        }
+    )
+    low, high = _metrics(city_tiles=-1.0), _metrics(city_tiles=1.0)
+
+    def discounted_total(start, finish, outcome):
+        total = 0.0
+        previous = start
+        for step in range(horizon):
+            following = finish if step + 1 == horizon else start
+            terminal = outcome if step + 1 == horizon else 0.0
+            total += (program.gamma**step) * program.reward(previous, following, terminal_outcome=terminal).total
+            previous = following
+        return total
+
+    assert discounted_total(high, low, 1.0) > 0.0
+    assert discounted_total(low, high, -1.0) < 0.0
 
 
 def test_sparse_component_is_not_used_for_inverse_rms_calibration():
@@ -771,8 +864,10 @@ def test_island3_structural_soft_accepts_small_and_large_ast_changes():
         "reward_scale": 0.4,
         "gamma": 0.91,
     }
+    large_proposal = _candidate_proposal(parent, mutation_kind="structural", reward_program=large_reward)
+    large_proposal["ppo_config"]["gamma"] = 0.91
     _, too_large, large_report = canonicalize_candidate_proposal(
-        _candidate_proposal(parent, mutation_kind="structural", reward_program=large_reward),
+        large_proposal,
         [parent],
         generation=1,
         island=3,
@@ -989,13 +1084,13 @@ def test_dense_shaping_curriculum_maintains_shaping_and_decays_bc():
     proposed = OpponentMix()
 
     assert curriculum.shaping_multiplier(0.0) == pytest.approx(1.0)
-    assert curriculum.shaping_multiplier(0.5) == pytest.approx(1.0)
-    assert curriculum.shaping_multiplier(1.0) == pytest.approx(1.0)
+    assert curriculum.shaping_multiplier(0.5) == pytest.approx(0.7)
+    assert curriculum.shaping_multiplier(1.0) == pytest.approx(0.25)
 
     assert curriculum.bc_coefficient_multiplier(0.0) == pytest.approx(1.0)
     assert curriculum.bc_coefficient_multiplier(0.2) == pytest.approx(1.0)
-    assert curriculum.bc_coefficient_multiplier(0.7) == pytest.approx(1.0)
-    assert curriculum.bc_coefficient_multiplier(1.0) == pytest.approx(1.0)
+    assert curriculum.bc_coefficient_multiplier(0.7) == pytest.approx(0.8)
+    assert curriculum.bc_coefficient_multiplier(1.0) == pytest.approx(0.2)
 
     mixes = [curriculum.opponent_mix(proposed, progress) for progress in (0.0, 0.5, 1.0)]
     assert all(mix.teacher == pytest.approx(0.20) for mix in mixes)  # max(proposed.teacher 0.20, floor 0.10)
@@ -1010,6 +1105,111 @@ def test_curriculum_stage_offsets_keep_final_phase_after_cross_stage_resume():
     assert _curriculum_start_decisions("medium-resattn8", args) == 100
     assert _curriculum_start_decisions("final-resattn8", args) == 400
     assert _curriculum_start_decisions("final-unet", args) == 400
+
+
+def test_stage_checkpoint_sources_separate_inference_inheritance_from_exact_resume(tmp_path):
+    candidate = initial_candidate(island=0, seed=7)
+    candidates = {candidate.candidate_id: candidate}
+    short_best = (
+        tmp_path
+        / "artifacts"
+        / candidate.candidate_id
+        / "short-resattn8"
+        / "resattn8"
+        / "best.pt"
+    )
+    short_best.parent.mkdir(parents=True)
+    short_best.write_bytes(b"inference-only")
+
+    resume, inherit, parent = _stage_checkpoint_sources(
+        tmp_path,
+        candidate,
+        candidates,
+        stage="medium-resattn8",
+        base_name="resattn8",
+    )
+    assert resume is None
+    assert inherit == short_best
+    assert parent == candidate
+
+    short_best_rl = short_best.with_name("best_rl.pt")
+    short_best_rl.write_bytes(b"policy-and-value")
+    resume, inherit, parent = _stage_checkpoint_sources(
+        tmp_path,
+        candidate,
+        candidates,
+        stage="medium-resattn8",
+        base_name="resattn8",
+    )
+    assert resume is None
+    assert inherit == short_best_rl
+    assert parent == candidate
+
+    medium_latest = (
+        tmp_path
+        / "artifacts"
+        / candidate.candidate_id
+        / "medium-resattn8"
+        / "resattn8"
+        / "latest_rl.pt"
+    )
+    medium_latest.parent.mkdir(parents=True)
+    medium_latest.write_bytes(b"optimizer-resume")
+    resume, inherit, parent = _stage_checkpoint_sources(
+        tmp_path,
+        candidate,
+        candidates,
+        stage="medium-resattn8",
+        base_name="resattn8",
+    )
+    assert resume == medium_latest
+    assert inherit is None
+    assert parent is None
+
+
+def test_stage_best_rl_inherits_policy_and_value_without_optimizer_resume(tmp_path):
+    source = FullTurnActorCritic(_small_policy())
+    with torch.no_grad():
+        for parameter in source.policy.parameters():
+            parameter.fill_(0.125)
+        for parameter in source.value_head.parameters():
+            parameter.fill_(0.75)
+    checkpoint_path = tmp_path / "best_rl.pt"
+    _save_stage_inheritance_checkpoint(
+        source,
+        checkpoint_path,
+        update=3,
+        metrics={},
+    )
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    assert checkpoint["checkpoint_kind"] == "stage_inheritance"
+    assert "optimizer" not in checkpoint
+    assert "torch_rng_state" not in checkpoint
+    target = FullTurnActorCritic(_small_policy())
+
+    modules = _load_inherited_modules(
+        target,
+        checkpoint_path,
+        device=torch.device("cpu"),
+        inheritance_mode="base",
+    )
+
+    assert modules == ["policy", "value_head"]
+    assert all(
+        torch.equal(value, target.policy.state_dict()[name])
+        for name, value in source.policy.state_dict().items()
+    )
+    assert all(
+        torch.equal(value, target.value_head.state_dict()[name])
+        for name, value in source.value_head.state_dict().items()
+    )
+
+
+def test_repeated_fixed_candidate_paths_are_distinct_and_ordered():
+    paths = _fixed_candidate_paths(["configs/rl_candidates/survival_credit_v2.json", "safe.json"])
+    assert paths == [Path("configs/rl_candidates/survival_credit_v2.json"), Path("safe.json")]
+    with pytest.raises(ValueError, match="distinct"):
+        _fixed_candidate_paths(["same.json", "same.json"])
 
 
 def test_teacher_milestone_selection_prefers_teacher_score_then_latest(tmp_path, monkeypatch):
@@ -1387,6 +1587,8 @@ def test_short_full_turn_ppo_smoke_updates_finite_parameters(tmp_path):
     assert 0.0 <= metrics["illegal_action_mass_mean"] <= 1.0
     assert metrics["illegal_action_loss"] >= 0.0
     assert "kl" in metrics
+    assert "reference_kl" in metrics
+    assert "approx_kl" in metrics
     assert "parameter_constraint_loss" not in metrics
     assert "parameter_constraint_coefficient" not in metrics
     checkpoint_path = tmp_path / "latest_rl.pt"
@@ -1420,6 +1622,34 @@ def test_short_full_turn_ppo_smoke_updates_finite_parameters(tmp_path):
     assert all(
         torch.equal(value, dict(resumed_actor.named_parameters())[name]) for name, value in actor.named_parameters()
     )
+
+
+def test_ppo_logs_approximate_kl_before_early_stopping():
+    actor = FullTurnActorCritic(_small_policy())
+    snapshot = copy.deepcopy(actor).eval()
+    episode = collect_episode(
+        actor,
+        lambda: RolloutAgent(snapshot, device="cpu", deterministic=True),
+        default_reward_program(),
+        device=torch.device("cpu"),
+        seed=31,
+        opponent_name="small",
+        max_turns=4,
+    )
+    for record in episode.records:
+        for decision in record.decisions:
+            decision.old_log_prob += 0.5
+    trainer = PPOTrainer(
+        actor,
+        PPOConfig(update_epochs=2, minibatch_turns=4, bc_coefficient=0.0, target_kl=1e-6),
+        torch.device("cpu"),
+    )
+
+    metrics = trainer.update([episode])
+
+    assert metrics["approx_kl"] > 0.0
+    assert metrics["early_stopped"] == 1.0
+    assert metrics["epochs_completed"] == 1.0
 
 
 def test_parent_kl_and_parameter_constraint_are_absent_from_trainer():
@@ -1499,6 +1729,7 @@ def test_training_checkpoint_v2_restores_budget_progress_and_legacy_estimate(tmp
     legacy.pop("training_state")
     legacy.pop("torch_rng_state")
     legacy.pop("cuda_rng_state_all")
+    legacy["ppo_config"].pop("illegal_action_coefficient")
     legacy["metrics"] = {"elapsed_seconds": 50.0}
     legacy_path = tmp_path / "legacy_rl.pt"
     torch.save(legacy, legacy_path)
@@ -1759,6 +1990,99 @@ def _league_evaluation(outcomes, p95=0.1):
     return {"games": games, "candidate_inference_p95_seconds": p95}
 
 
+def _guarded_evaluation(outcome, *, normalized_city_loss=0.2, stranded=0.1):
+    survival = {
+        "final_city_zero": False,
+        "last_night_survival": True,
+        "min_night_fuel_margin": 0.1,
+        "night_start_fuel_margin_mean": 0.2,
+        "night_start_fuel_margin_p10": 0.0,
+        "max_night_start_stranded_fuel_fraction": stranded,
+        "normalized_city_tile_loss": normalized_city_loss,
+        "city_destroyed_night_fuel_count": 1,
+        "city_tiles_lost": 2,
+    }
+    games = [
+        {
+            "anchor": anchor,
+            "seed": seed,
+            "orientation": orientation,
+            "outcome": outcome,
+            "survival": survival,
+        }
+        for anchor in ("resattn8-base", "first-place")
+        for seed in (10, 11)
+        for orientation in (0, 1)
+    ]
+    return {"games": games, "candidate_inference_p95_seconds": 0.1}
+
+
+def test_stage_advancement_requires_score_and_survival_non_regression():
+    baseline = _guarded_evaluation(0.0)
+    passing = stage_advancement_report(baseline, baseline, score_margin=0.02)
+    score_failure = stage_advancement_report(_guarded_evaluation(-1.0), baseline, score_margin=0.02)
+    survival_failure = stage_advancement_report(
+        _guarded_evaluation(0.0, normalized_city_loss=0.23),
+        baseline,
+        score_margin=0.02,
+    )
+
+    assert passing["passes"] is True
+    assert score_failure["checks"]["overall_score"] is False
+    assert survival_failure["checks"]["normalized_city_loss"] is False
+
+
+def test_short_selection_excludes_candidates_that_fail_the_advancement_gate(tmp_path):
+    passing_candidate = initial_candidate(island=0, seed=41)
+    failing_candidate = initial_candidate(island=1, seed=42)
+    candidates = {
+        passing_candidate.candidate_id: passing_candidate,
+        failing_candidate.candidate_id: failing_candidate,
+    }
+    store = EvolutionStore(tmp_path)
+    for candidate in candidates.values():
+        store.save_candidate(candidate)
+    baseline = _guarded_evaluation(0.0)
+    results = [
+        CandidateResult(
+            passing_candidate.candidate_id,
+            "short-resattn8",
+            "completed",
+            0.5,
+            0.5,
+            0.0,
+            1.0,
+            {"evaluation": baseline},
+        ),
+        CandidateResult(
+            failing_candidate.candidate_id,
+            "short-resattn8",
+            "completed",
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            {"evaluation": _guarded_evaluation(-1.0)},
+        ),
+    ]
+
+    selected = _load_or_create_stage_selection(
+        store,
+        candidates,
+        results,
+        name="medium",
+        target_stage="medium-resattn8",
+        source_stage="short-resattn8",
+        count=1,
+        baseline=baseline,
+    )
+
+    assert [candidate.candidate_id for candidate in selected] == [passing_candidate.candidate_id]
+    report = json.loads((tmp_path / "selections" / "medium.json").read_text())
+    assert report["advancement_reports"][passing_candidate.candidate_id]["passes"] is True
+    assert report["advancement_reports"][failing_candidate.candidate_id]["passes"] is False
+
+
 def test_paired_acceptance_requires_positive_both_architectures():
     baseline = _league_evaluation([-1.0, 0.0, 0.0])
     improved = _league_evaluation([0.0, 1.0, 1.0])
@@ -1783,6 +2107,7 @@ def test_teacher_guard_rejects_base_gain_that_regresses_teacher():
             "final_city_zero": False,
             "last_night_survival": True,
             "min_night_fuel_margin": 0.1,
+            "night_start_fuel_margin_p10": 0.0,
             "normalized_city_tile_loss": 0.2,
         }
         for anchor, outcomes in (("resattn8-base", base_outcomes), ("first-place", teacher_outcomes)):
@@ -2091,6 +2416,7 @@ def test_job_api_claim_context_and_upload_artifacts(tmp_path):  # noqa: PLR0915
         worker_artifacts = tmp_path / "worker-artifacts"
         worker_artifacts.mkdir()
         (worker_artifacts / "best.pt").write_bytes(b"policy")
+        (worker_artifacts / "best_rl.pt").write_bytes(b"policy-and-value")
         (worker_artifacts / "latest_rl.pt").write_bytes(b"training")
         partial_artifacts = tmp_path / "partial-artifacts"
         partial_artifacts.mkdir()
@@ -2128,6 +2454,7 @@ def test_job_api_claim_context_and_upload_artifacts(tmp_path):  # noqa: PLR0915
         assert medium_claim["input_artifacts"][0]["stage"] == "short-resattn8"
         downloaded = tmp_path / "downloaded-input"
         client.download_artifact(medium_claim["input_artifacts"][0], tmp_path / "cache", downloaded)
+        assert (downloaded / "best_rl.pt").read_bytes() == b"policy-and-value"
         assert (downloaded / "latest_rl.pt").read_bytes() == b"training"
         medium_partial = tmp_path / "medium-partial"
         medium_partial.mkdir()
@@ -2187,6 +2514,7 @@ def test_job_api_claim_context_and_upload_artifacts(tmp_path):  # noqa: PLR0915
 
     coordinator_artifacts = coordinator_dir / "artifacts" / candidate.candidate_id / job.stage / job.base_name
     assert (coordinator_artifacts / "best.pt").read_bytes() == b"policy"
+    assert (coordinator_artifacts / "best_rl.pt").read_bytes() == b"policy-and-value"
     assert (coordinator_artifacts / "latest_rl.pt").read_bytes() == b"training"
     assert queue.outstanding_ids() == set()
     stored = next(item for item in store.results() if item.stage == job.stage)
@@ -2317,7 +2645,7 @@ def test_worker_inherits_resattn8_only_from_coordinator_manifest():
         worker_args,
         {
             "schema_version": 4,
-            "metric_schema_version": 2,
+            "metric_schema_version": 3,
             "arguments": {"resattn8_only": True, "resattn8_checkpoint": "original.pt"},
         },
     )
@@ -2338,7 +2666,7 @@ def test_worker_uses_legacy_rollout_runtime_for_old_manifest():
         worker_args,
         {
             "schema_version": 4,
-            "metric_schema_version": 2,
+            "metric_schema_version": 3,
             "arguments": {},
         },
     )
@@ -2363,7 +2691,7 @@ def test_manifest_rejects_changed_training_curriculum():
             worker_args,
             {
                 "schema_version": 4,
-                "metric_schema_version": 2,
+                "metric_schema_version": 3,
                 "arguments": {"curriculum_profile": "dense_shaping"},
                 "training_curriculum": stale_curriculum,
             },

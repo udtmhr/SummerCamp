@@ -660,7 +660,7 @@ action sampling, a training-only value head, reference-policy KL, and the prepar
 anchor. Exported `best.pt` files remain compatible with `BehaviorCloningAgent`.
 
 New runs embed the official Lux AI Season 1 rules URL and the SHA-256 of the packaged rule summary in the schema-v4
-manifest and every Codex prompt. The manifest fixes reward metric schema v2 so a run cannot mix candidates evaluated
+manifest and every Codex prompt. The manifest fixes reward metric schema v3 so a run cannot mix candidates evaluated
 with different metric sets. The search treats the original first-place Teacher as the strongest anchor: Teacher
 score is ranked before aggregate score, and final promotion requires paired Teacher non-regression as well as a
 non-negative distilled-base delta. The optional `teacher_guarded_near_sparse` curriculum raises the Teacher opponent
@@ -670,11 +670,11 @@ terminal-only ablation or `legacy` only when reproducing an old run.
 
 The default dense-shaping reward uses linear potential differencing with absolute own-team penalties for next-night
 fuel deficit and cumulative city-tile loss. Raw terminal win/loss is +/-10 and the complete reward is divided by 10.
-With reward scale 0.5 and potential clipped to [-5, 5], normalized shaping is strictly below 0.5, so it cannot reverse
-the sign of a terminal result and the total reward remains below 1.5 in magnitude without per-step clipping. Fixed
-normalization is used instead of running return normalization to keep reward meaning and resumes deterministic. The BC
-anchor coefficient starts at 0.025 and its curriculum multiplier stays at 1.0 through
-20% progress (the end of short+medium under the default budgets), then reaches 0.8 at 70% and 0.2 at completion.
+With reward scale 0.35 and potential clipped to [-5, 5], normalized shaping is strictly below 0.35. Fixed normalization
+is used instead of running return normalization to keep reward meaning and resumes deterministic. Reward and PPO gamma
+must match and default to 0.999; TD(lambda) uses lambda 0.995 instead of adding UPGO. The BC anchor coefficient is 0.05
+and its multiplier stays at 1.0 through 20% progress, then reaches 0.8 at 70% and 0.2 at completion. Dense shaping is
+also annealed from 1.0 at 20% to 0.5 at 70% and 0.25 at completion without changing the terminal reward.
 Because candidates and curricula are content-frozen in run artifacts, use a new run directory when adopting these
 defaults; an older run with a different stored curriculum is rejected rather than silently changing its learning rule.
 
@@ -708,7 +708,10 @@ normal short-stage screen. Only unsafe Reward IR, invalid lineage, non-finite va
 mask relaxation are rejected. Without Codex, the normal fallback mix is 50% structural, 30% crossover, and 20% restart. After two stagnant generations it
 becomes 40%, 20%, and 40%, respectively; unavailable crossover probability is reassigned to structural exploration.
 
-The Metric DSL also exposes phase-aware and local survival signals: normalized turns until night/night turns
+Metric schema v3 adds the relative count of Cities funded through the next night (`safe_city_tiles`) and a cumulative
+city-loss signal that remains linear through 64 lost tiles (`own_city_tiles_lost_linear`). Schema-v2 candidate and
+checkpoint files remain readable, but a schema-v2 run cannot be resumed as schema v3. The Metric DSL also exposes
+phase-aware and local survival signals: normalized turns until night/night turns
 remaining, minimum per-city survival, at-risk city-tile fraction, next-night fuel deficit, nearby cargo coverage,
 avoidable stranded fuel across disconnected Cities, cumulative night city loss, worker resource access/cargo
 fullness, unit-capacity utilization, and coal/uranium unlock state. `own_stranded_fuel` is normalized to `[0, 1]` and
@@ -737,6 +740,24 @@ uv run --locked python examples/evolve_rl.py \
   --resattn8-only
 ```
 
+Run the matched Lux Survival v2 A/B experiment and advance only a candidate that passes the paired short-stage gate:
+
+```bash
+uv run --locked python examples/evolve_rl.py \
+  --run-dir shared/lux-survival-v2-ab \
+  --fixed-candidate configs/rl_candidates/survival_credit_v2.json \
+  --fixed-candidate configs/rl_candidates/survival_safe_city_v2.json \
+  --resattn8-checkpoint models/distilled/resnet17x48_s42/best.pt \
+  --device cuda --resattn8-only --curriculum-profile dense_shaping \
+  --rollout-backend threaded \
+  --rollout-envs 8 --decisions-per-update 80000 --rollout-compile off \
+  --screening-seeds 24 --medium-count 1 --final-count 1
+```
+
+Repeated `--fixed-candidate` values are content-frozen together in the manifest. Short selection allows at most a 0.02
+paired score/survival regression; medium selection requires non-negative overall, base, and Teacher deltas. If no
+candidate passes, the run stops before allocating the next-stage training budget.
+
 To train the reviewed survival-focused candidate only, through short, medium, and final stages, use:
 
 ```bash
@@ -749,23 +770,24 @@ uv run --locked python examples/evolve_rl.py \
   --device cuda --resattn8-only
 ```
 
-Fixed-candidate mode forces a one-candidate, zero-generation run and selects that same candidate for medium and final
-training. Its source JSON and digest are frozen in the run manifest, so resume the same command after interruption and
-use a new run directory if the candidate definition changes.
+Fixed-candidate mode forces a zero-generation run. One path preserves the legacy single-candidate behavior; repeated
+paths form a matched candidate set and only candidates passing the stage gate can advance. Source JSON files and
+digests are frozen in the run manifest, so use a new run directory if any candidate definition changes.
 
-PPO's existing GAE return is the TD(lambda) value target. The fixed survival candidate uses lambda 0.98 instead of
-0.95 to extend credit assignment in 360-turn games. UPGO is intentionally not mixed into the single shaped-reward
+PPO's existing GAE return is the TD(lambda) value target. Survival v2 uses lambda 0.995 with gamma 0.999 to extend
+credit assignment in 360-turn games. UPGO is intentionally not mixed into the single shaped-reward
 critic: AlphaStar applies it to a separate win/loss baseline, while using it here would self-imitate positive shaping
 trajectories and could reinforce the City-expansion exploit. Add a separate terminal-only critic before enabling UPGO.
 
 `--resattn8-only` disables UNet opponents, probes, training, baselines, and final evaluation. The defaults screen 24
 ResAttn8 candidates for 550,000 sampled decisions, continue the best eight for another
 1,925,000 decisions, and train the best two with ResAttn8 for 9,900,000 decisions each. A candidate runs
-16 Lux environments concurrently by default. `--rollout-backend lockstep` selects a rendezvous: candidate and opponent
+8 Lux environments concurrently by default. `--rollout-backend lockstep` selects a rendezvous: candidate and opponent
 requests wait for all active games and then run as one fixed-size GPU batch. Games that finish early leave the rendezvous before
 the next turn. The default `auto` currently retains `threaded` because the end-to-end 2x acceptance gate has not been
 met; the effective backend and fallback reason are recorded in artifacts.
-`--rollout-precision auto` uses BF16 on supported CUDA devices and FP32 elsewhere. `--rollout-compile auto` only
+`--rollout-precision auto` uses BF16 on supported CUDA devices and FP32 elsewhere. `--rollout-compile off` is the
+default. `--rollout-compile auto` only
 calibrates `torch.compile` for lockstep's fixed padded batches; the default threaded variable-batch backend stays eager
 because repeated calibration cost did not improve its measured steady-state throughput. `on` still explicitly enables
 compile for either backend. Compile attempts, calibration time, fallback details, and the effective mode are recorded.
@@ -847,12 +869,15 @@ uv run --locked python examples/evolve_rl.py \
 Candidate definitions, failures, training checkpoints, league games, and the promotion report are written under the
 run directory so an interrupted search remains inspectable and resumable. `latest_rl.pt` uses checkpoint schema v3 and
 stores cumulative decisions, turns, episodes, optimizer/RNG state, constraint progress, and the joint-update ramp.
-Re-running a stage resumes its remaining decision budget. Schema-v1/v2 checkpoints remain loadable; a v1 checkpoint's
+Re-running a stage resumes its remaining decision budget. Each Teacher-selected inference `best.pt` has a matching
+`best_rl.pt`; short-to-medium and medium-to-final inheritance loads its policy and value head, resets optimizer/RNG and
+stage counters, then calibrates the critic before deciding whether warm-up is needed. Older runs without `best_rl.pt`
+fall back to policy-only `best.pt`. Schema-v1/v2 checkpoints remain loadable; a v1 checkpoint's
 consumed budget is conservatively estimated from its recorded elapsed-time fraction.
 
 The first coordinator invocation owns the schema-v4 run manifest: later invocations reuse its checkpoint paths,
 SHA-256 descriptors, Codex/deterministic generation mode, model, and training budgets instead of overwriting them with
-new CLI defaults. Runs without metric schema v2 remain untouched but must use a new run directory after this metric
+new CLI defaults. Runs without metric schema v3 remain untouched but must use a new run directory after this metric
 change. Every candidate has a separate immutable record under `provenance/`; accepted Codex outputs retain
 the raw `*.raw.json`, canonical `codex-gXX-iXX.json`, compressed prompt, and `*.meta.json` hashes plus the normalization
 report. Medium and final candidate IDs are frozen under `selections/` when

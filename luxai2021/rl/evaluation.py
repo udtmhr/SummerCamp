@@ -33,6 +33,7 @@ def _survival_summary(game: object, team: int) -> dict[str, float | bool | int |
     last_night = [event for event in snapshots if int(event.get("turn", -1)) >= 350]
     last_night_start = min(last_night, key=lambda event: int(event.get("turn", 0))) if last_night else None
     night_starts = [event for event in snapshots if bool(event.get("night_start", False))]
+    night_start_margins = sorted(float(event.get("min_city_fuel_margin", -1.0)) for event in night_starts)
     max_stranded = (
         max(night_starts, key=lambda event: float(event.get("stranded_fuel_fraction", 0.0)))
         if night_starts
@@ -51,6 +52,14 @@ def _survival_summary(game: object, team: int) -> dict[str, float | bool | int |
             if snapshots
             else None
         ),
+        "night_start_fuel_margin_mean": (
+            sum(night_start_margins) / len(night_start_margins) if night_start_margins else None
+        ),
+        "night_start_fuel_margin_p10": (
+            night_start_margins[int(0.10 * (len(night_start_margins) - 1))]
+            if night_start_margins
+            else None
+        ),
         "max_night_start_stranded_fuel_fraction": (
             float(max_stranded.get("stranded_fuel_fraction", 0.0)) if max_stranded is not None else None
         ),
@@ -59,6 +68,8 @@ def _survival_summary(game: object, team: int) -> dict[str, float | bool | int |
         ),
         "normalized_city_tile_loss": sum(int(event.get("city_tiles_lost", 0)) for event in city_losses)
         / peak_city_tiles,
+        "city_destroyed_night_fuel_count": len(city_losses),
+        "city_tiles_lost": sum(int(event.get("city_tiles_lost", 0)) for event in city_losses),
     }
 
 
@@ -188,6 +199,14 @@ def evaluate_against_league(
     inference_seconds.sort()
     percentile_index = min(len(inference_seconds) - 1, int(len(inference_seconds) * 0.95))
     p95 = inference_seconds[percentile_index] if inference_seconds else float("nan")
+    by_orientation = {}
+    for orientation in (0, 1):
+        orientation_games = [game for game in games if game.get("orientation") == orientation and "outcome" in game]
+        points = sum((float(game["outcome"]) + 1.0) * 0.5 for game in orientation_games)
+        by_orientation[str(orientation)] = {
+            "games": len(orientation_games),
+            "score_rate": points / max(len(orientation_games), 1),
+        }
     return {
         "candidate": candidate.name,
         "anchors": [anchor.name for anchor in anchors],
@@ -195,6 +214,7 @@ def evaluate_against_league(
         "seed_count": seed_count,
         "games": games,
         "totals": {**totals, "games": game_count, "score_rate": totals["points"] / game_count},
+        "by_orientation": by_orientation,
         "duration_seconds": perf_counter() - started_at,
         "candidate_inference_p95_seconds": p95,
     }
@@ -281,8 +301,55 @@ def _paired_survival_deltas(
         "final_city_zero_delta": mean_delta("final_city_zero"),
         "last_night_survival_delta": mean_delta("last_night_survival"),
         "night_fuel_margin_delta": mean_delta("min_night_fuel_margin"),
+        "night_start_fuel_margin_mean_delta": mean_delta("night_start_fuel_margin_mean"),
+        "night_start_fuel_margin_p10_delta": mean_delta("night_start_fuel_margin_p10"),
         "stranded_fuel_delta": mean_delta("max_night_start_stranded_fuel_fraction"),
         "normalized_city_tile_loss_delta": mean_delta("normalized_city_tile_loss"),
+        "city_destroyed_night_fuel_count_delta": mean_delta("city_destroyed_night_fuel_count"),
+        "city_tiles_lost_delta": mean_delta("city_tiles_lost"),
+    }
+
+
+def stage_advancement_report(
+    candidate: dict[str, object],
+    baseline: dict[str, object],
+    *,
+    score_margin: float,
+    survival_margin: float = 0.02,
+) -> dict[str, object]:
+    """Return the paired short/medium non-regression gate used before expensive stages."""
+    if not 0.0 <= score_margin <= 1.0 or not 0.0 <= survival_margin <= 1.0:
+        raise ValueError("Stage advancement margins must be in [0, 1]")
+    seed_deltas, anchor_deltas = paired_seed_deltas(candidate, baseline)
+    overall_delta = sum(seed_deltas.values()) / max(len(seed_deltas), 1)
+    teacher_delta = anchor_deltas.get("first-place")
+    base_deltas = [float(value) for name, value in anchor_deltas.items() if name != "first-place"]
+    base_delta = max(base_deltas, default=None)
+    survival = _paired_survival_deltas(candidate, baseline)
+    extinction_delta = survival.get("final_city_zero_delta")
+    last_night_delta = survival.get("last_night_survival_delta")
+    city_loss_delta = survival.get("normalized_city_tile_loss_delta")
+    stranded_delta = survival.get("stranded_fuel_delta")
+    fuel_p10_delta = survival.get("night_start_fuel_margin_p10_delta")
+    checks = {
+        "overall_score": overall_delta >= -score_margin,
+        "base_score": base_delta is not None and base_delta >= -score_margin,
+        "teacher_score": teacher_delta is not None and teacher_delta >= -score_margin,
+        "extinction": extinction_delta is not None and float(extinction_delta) <= 0.0,
+        "last_night_survival": last_night_delta is not None and float(last_night_delta) >= 0.0,
+        "normalized_city_loss": city_loss_delta is not None and float(city_loss_delta) <= survival_margin,
+        "stranded_fuel": stranded_delta is not None and float(stranded_delta) <= survival_margin,
+        "night_start_fuel_margin_p10": fuel_p10_delta is not None and float(fuel_p10_delta) >= -survival_margin,
+    }
+    return {
+        "passes": all(checks.values()),
+        "checks": checks,
+        "score_margin": score_margin,
+        "survival_margin": survival_margin,
+        "overall_score_delta": overall_delta,
+        "teacher_score_delta": teacher_delta,
+        "base_score_delta": base_delta,
+        "survival": survival,
     }
 
 
@@ -331,7 +398,9 @@ def acceptance_report(
         final_zero_delta = survival.get("final_city_zero_delta")
         last_night_delta = survival.get("last_night_survival_delta")
         fuel_margin_delta = survival.get("night_fuel_margin_delta")
+        fuel_p10_delta = survival.get("night_start_fuel_margin_p10_delta")
         stranded_fuel_delta = survival.get("stranded_fuel_delta")
+        city_loss_delta = survival.get("normalized_city_tile_loss_delta")
         survival_passes = (
             not require_survival
             or (
@@ -342,6 +411,10 @@ def acceptance_report(
                 and float(last_night_delta) >= 0.0
                 and fuel_margin_delta is not None
                 and float(fuel_margin_delta) >= -0.02
+                and fuel_p10_delta is not None
+                and float(fuel_p10_delta) >= -0.02
+                and city_loss_delta is not None
+                and float(city_loss_delta) <= 0.02
             )
         )
         stranded_fuel_passes = (

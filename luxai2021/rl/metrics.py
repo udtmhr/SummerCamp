@@ -201,6 +201,7 @@ def _strategic_team_values(
         "stranded_fuel": min(max(stranded_fraction, 0.0), 1.0),
         "fuel_delivery_coverage": delivery_coverage,
         "city_tiles_lost": city_tiles_lost / (city_tiles_lost + _CITY_LOSS_NORMALIZER),
+        "city_tiles_lost_linear": min(city_tiles_lost / 64.0, 1.0),
         "night_fuel_shortage": len(loss_events) / (len(loss_events) + _SHORTAGE_NORMALIZER),
         "worker_resource_access": min(max(resource_access, 0.0), 1.0),
         "worker_cargo_fullness": min(max(cargo_fullness, 0.0), 1.0),
@@ -261,6 +262,11 @@ def metrics_from_game(game: object, team: int) -> GameMetrics:
         "turns_until_night": turns_until_night / max(day_length, 1),
         "night_turns_remaining": night_turns_remaining / max(night_length, 1),
         "city_tiles": _symmetric_ratio(own["city_tiles"], opponent["city_tiles"], 8.0),
+        "safe_city_tiles": _symmetric_ratio(
+            len(own_strategy_positions["safe_city_tiles"]),
+            len(opponent_strategy_positions["safe_city_tiles"]),
+            8.0,
+        ),
         "units": _symmetric_ratio(own["units"], opponent["units"], 8.0),
         "workers": _symmetric_ratio(own["workers"], opponent["workers"], 8.0),
         "carts": _symmetric_ratio(own["carts"], opponent["carts"], 4.0),
@@ -291,6 +297,9 @@ def metrics_from_game(game: object, team: int) -> GameMetrics:
             own_strategy["fuel_delivery_coverage"] - opponent_strategy["fuel_delivery_coverage"]
         ),
         "city_tile_loss": opponent_strategy["city_tiles_lost"] - own_strategy["city_tiles_lost"],
+        "city_tile_loss_linear": (
+            opponent_strategy["city_tiles_lost_linear"] - own_strategy["city_tiles_lost_linear"]
+        ),
         "night_fuel_shortage": (opponent_strategy["night_fuel_shortage"] - own_strategy["night_fuel_shortage"]),
         "worker_resource_access": (
             own_strategy["worker_resource_access"] - opponent_strategy["worker_resource_access"]
@@ -307,6 +316,7 @@ def metrics_from_game(game: object, team: int) -> GameMetrics:
         "own_stranded_fuel": own_strategy["stranded_fuel"],
         "own_fuel_delivery_coverage": own_strategy["fuel_delivery_coverage"],
         "own_city_tiles_lost": own_strategy["city_tiles_lost"],
+        "own_city_tiles_lost_linear": own_strategy["city_tiles_lost_linear"],
         "own_night_fuel_shortage": own_strategy["night_fuel_shortage"],
     }
     own_units = tuple(game.state["teamStates"][team]["units"].values())
