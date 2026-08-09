@@ -474,25 +474,38 @@ def distillation_loss(
     *,
     temperature: float = 2.0,
     distill_weight: float = 0.75,
-    hard_label_weight: float = 0.25,
+    hard_label_weight: float = 0.0,
+    illegal_weight: float = 0.1,
 ) -> dict[str, Tensor]:
     sample_weight = batch["sample_weight"]
     losses = {}
     for entity in FIRST_PLACE_ACTION_SCHEMA:
         positions = batch[f"{entity}_positions"]
-        student = _entity_logits(output[entity], positions)
+        student_raw = _entity_logits(output[entity], positions)
         legal = batch[f"{entity}_legal_mask"].permute(0, 2, 1)
-        student = apply_legal_action_mask(student, legal, action_dim=1)
+        
+        student_probs = nn_functional.softmax(student_raw, dim=1)
+        p_legal = (student_probs * legal).sum(dim=1)
+        
         labels = batch[f"{entity}_flat"]
         valid = labels != IGNORE_INDEX
         weights = sample_weight[:, None].expand_as(labels) * valid
-        hard = nn_functional.cross_entropy(
-            student,
-            labels,
-            ignore_index=IGNORE_INDEX,
-            reduction="none",
-        )
-        hard = (hard * weights).sum() / weights.sum().clamp_min(1)
+        
+        illegal_loss_tensor = -torch.log(p_legal.clamp_min(1e-8))
+        illegal = (illegal_loss_tensor * weights).sum() / weights.sum().clamp_min(1)
+        losses[f"{entity}_illegal_loss"] = illegal
+
+        student = apply_legal_action_mask(student_raw, legal, action_dim=1)
+        
+        if hard_label_weight > 0:
+            hard = nn_functional.cross_entropy(
+                student,
+                labels,
+                ignore_index=IGNORE_INDEX,
+                reduction="none",
+            )
+            hard = (hard * weights).sum() / weights.sum().clamp_min(1)
+            losses[f"{entity}_hard_loss"] = hard
 
         teacher = batch[f"{entity}_teacher_logits"].permute(0, 2, 1).to(dtype=student.dtype)
         teacher = apply_legal_action_mask(teacher, legal, action_dim=1)
@@ -500,20 +513,34 @@ def distillation_loss(
         teacher_probs = nn_functional.softmax(teacher / temperature, dim=1)
         kl = nn_functional.kl_div(student_log_probs, teacher_probs, reduction="none").sum(dim=1)
         kl = (kl * weights).sum() / weights.sum().clamp_min(1) * temperature**2
-        losses[f"{entity}_hard_loss"] = hard
         losses[f"{entity}_distill_loss"] = kl
-    hard_total = torch.stack([value for name, value in losses.items() if name.endswith("_hard_loss")]).sum()
+        
+    hard_total = torch.stack([value for name, value in losses.items() if name.endswith("_hard_loss")]).sum() if hard_label_weight > 0 else torch.tensor(0.0, device=sample_weight.device)
     distill_total = torch.stack([value for name, value in losses.items() if name.endswith("_distill_loss")]).sum()
-    total = hard_label_weight * hard_total + distill_weight * distill_total
-    return {"loss": total, "hard_loss": hard_total, "distill_loss": distill_total, **losses}
+    illegal_total = torch.stack([value for name, value in losses.items() if name.endswith("_illegal_loss")]).sum()
+    
+    total = hard_label_weight * hard_total + distill_weight * distill_total + illegal_weight * illegal_total
+    
+    result = {"loss": total, "distill_loss": distill_total, "illegal_loss": illegal_total, **losses}
+    if hard_label_weight > 0:
+        result["hard_loss"] = hard_total
+    return result
 
 
 def distillation_metrics(output: Mapping[str, Tensor], batch: Mapping[str, Tensor]) -> dict[str, tuple[Tensor, Tensor]]:
     metrics = {}
     for entity in FIRST_PLACE_ACTION_SCHEMA:
-        student = _entity_logits(output[entity], batch[f"{entity}_positions"])
+        student_raw = _entity_logits(output[entity], batch[f"{entity}_positions"])
         legal = batch[f"{entity}_legal_mask"].permute(0, 2, 1)
-        student = apply_legal_action_mask(student, legal, action_dim=1)
+        
+        student_probs = nn_functional.softmax(student_raw, dim=1)
+        p_illegal = (student_probs * ~legal).sum(dim=1)
+        
+        student_raw_actions = student_raw.argmax(dim=1)
+        is_legal_argmax = legal.gather(1, student_raw_actions.unsqueeze(1)).squeeze(1)
+        is_illegal_argmax = ~is_legal_argmax
+        
+        student = apply_legal_action_mask(student_raw, legal, action_dim=1)
         teacher = batch[f"{entity}_teacher_logits"].permute(0, 2, 1).to(student.dtype)
         teacher = apply_legal_action_mask(teacher, legal, action_dim=1)
         labels = batch[f"{entity}_flat"]
@@ -522,4 +549,6 @@ def distillation_metrics(output: Mapping[str, Tensor], batch: Mapping[str, Tenso
         teacher_actions = teacher.argmax(dim=1)
         metrics[f"{entity}_teacher_agreement"] = ((student_actions == teacher_actions) & valid).sum(), valid.sum()
         metrics[f"{entity}_hard_accuracy"] = ((student_actions == labels) & valid).sum(), valid.sum()
+        metrics[f"{entity}_illegal_top1"] = (is_illegal_argmax & valid).sum(), valid.sum()
+        metrics[f"{entity}_illegal_prob_mass"] = (p_illegal * valid).sum(), valid.sum()
     return metrics

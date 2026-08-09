@@ -86,7 +86,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--temperature", type=float, default=2.0)
     parser.add_argument("--distill-weight", type=float, default=0.75)
-    parser.add_argument("--hard-label-weight", type=float, default=0.25)
+    parser.add_argument("--hard-label-weight", type=float, default=0.0)
+    parser.add_argument("--illegal-weight", type=float, default=0.1)
     parser.add_argument("--winner-weight", type=float, default=1.5)
     parser.add_argument("--gradient-clip", type=float, default=1.0)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
@@ -180,6 +181,7 @@ def run_epoch(
     temperature: float,
     distill_weight: float,
     hard_label_weight: float,
+    illegal_weight: float,
     amp_dtype: torch.dtype,
     optimizer: torch.optim.Optimizer | None = None,
     scaler: torch.amp.GradScaler | None = None,
@@ -217,6 +219,7 @@ def run_epoch(
                 temperature=temperature,
                 distill_weight=distill_weight,
                 hard_label_weight=hard_label_weight,
+                illegal_weight=illegal_weight,
             )
             loss = losses["loss"] / accumulation_steps
         if training:
@@ -248,7 +251,27 @@ def run_epoch(
             pair[0] += numerator
             pair[1] += denominator
         if (batch_index + 1) % 50 == 0 or batch_index + 1 == len(loader):
-            progress.set_postfix(loss=f"{losses['loss'].detach().float().item():.4f}")
+            postfix = {"loss": f"{losses['loss'].detach().float().item():.4f}"}
+            
+            unit_ill_top1_num = metric_totals.get("worker_illegal_top1", [0, 1])[0] + metric_totals.get("cart_illegal_top1", [0, 1])[0]
+            unit_ill_top1_den = metric_totals.get("worker_illegal_top1", [0, 1])[1] + metric_totals.get("cart_illegal_top1", [0, 1])[1]
+            if unit_ill_top1_den > 0:
+                postfix["u_top1"] = f"{float(unit_ill_top1_num) / float(unit_ill_top1_den):.1%}"
+                
+            city_ill_top1_num = metric_totals.get("city_illegal_top1", [0, 1])[0]
+            city_ill_top1_den = metric_totals.get("city_illegal_top1", [0, 1])[1]
+            if city_ill_top1_den > 0:
+                postfix["c_top1"] = f"{float(city_ill_top1_num) / float(city_ill_top1_den):.1%}"
+                
+            unit_ill_prob_num = metric_totals.get("worker_illegal_prob_mass", [0, 1])[0] + metric_totals.get("cart_illegal_prob_mass", [0, 1])[0]
+            if unit_ill_top1_den > 0:
+                postfix["u_prob"] = f"{float(unit_ill_prob_num) / float(unit_ill_top1_den):.3f}"
+                
+            city_ill_prob_num = metric_totals.get("city_illegal_prob_mass", [0, 1])[0]
+            if city_ill_top1_den > 0:
+                postfix["c_prob"] = f"{float(city_ill_prob_num) / float(city_ill_top1_den):.3f}"
+                
+            progress.set_postfix(**postfix)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     duration = time.perf_counter() - started
@@ -304,9 +327,9 @@ def main() -> None:
         raise ValueError("Batch size and gradient accumulation must be positive")
     if args.temperature <= 0:
         raise ValueError("Temperature must be positive")
-    if args.distill_weight < 0 or args.hard_label_weight < 0:
+    if args.distill_weight < 0 or args.hard_label_weight < 0 or args.illegal_weight < 0:
         raise ValueError("Loss weights must be non-negative")
-    if args.distill_weight + args.hard_label_weight <= 0:
+    if args.distill_weight + args.hard_label_weight + args.illegal_weight <= 0:
         raise ValueError("At least one loss weight must be positive")
     if args.learning_rate <= 0 or args.min_learning_rate <= 0:
         raise ValueError("Learning rates must be positive")
@@ -454,6 +477,7 @@ def main() -> None:
             "temperature": args.temperature,
             "distill_weight": args.distill_weight,
             "hard_label_weight": args.hard_label_weight,
+            "illegal_weight": args.illegal_weight,
         },
         "lr_scheduler_config": scheduler_config,
     }
@@ -473,6 +497,7 @@ def main() -> None:
             temperature=args.temperature,
             distill_weight=args.distill_weight,
             hard_label_weight=args.hard_label_weight,
+            illegal_weight=args.illegal_weight,
             amp_dtype=amp_dtype,
             optimizer=optimizer,
             scaler=scaler,
@@ -489,6 +514,7 @@ def main() -> None:
                 temperature=args.temperature,
                 distill_weight=args.distill_weight,
                 hard_label_weight=args.hard_label_weight,
+                illegal_weight=args.illegal_weight,
                 amp_dtype=amp_dtype,
                 description=f"Validation {epoch + 1}/{args.epochs}",
                 show_progress=not args.no_progress,
@@ -540,6 +566,7 @@ def main() -> None:
             temperature=args.temperature,
             distill_weight=args.distill_weight,
             hard_label_weight=args.hard_label_weight,
+            illegal_weight=args.illegal_weight,
             amp_dtype=amp_dtype,
             description="Test",
             show_progress=not args.no_progress,
