@@ -238,13 +238,23 @@ def test_prepared_distillation_cache_loads_compact_samples(tmp_path):
         [replay_path],
         tmp_path / "unused-teacher",
         prepared_cache_dir=prepared_dir,
+        prepared_cache_size=7,
     )
 
     assert len(dataset) == 2
+    assert dataset.prepared_cache.max_size == 7
     assert dataset[0]["observation"].dtype == torch.float16
     assert dataset[0]["worker_positions"].tolist() == [[1, 2]]
     assert dataset[0]["sample_weight"].item() == 1.5
     assert dataset[1]["sample_weight"].item() == 1.0
+
+    with pytest.raises(ValueError, match="cache size"):
+        LuxDistillationDataset(
+            [replay_path],
+            tmp_path / "unused-teacher",
+            prepared_cache_dir=prepared_dir,
+            prepared_cache_size=0,
+        )
 
 
 @pytest.mark.parametrize("transform_id", range(8))

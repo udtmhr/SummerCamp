@@ -388,14 +388,28 @@ class RolloutAgent(BehaviorCloningAgent):
         observation_cpu = torch.from_numpy(encode_snapshot(snapshot, team))
         self.timing_seconds["encode"] += perf_counter() - encode_started
         inference_started = perf_counter()
-        if self.inference_backend is None:
+        candidate_future = None
+        if self.inference_backend is not None:
+            candidate_owner = getattr(self.inference_backend, "__self__", None)
+            submit_async = getattr(candidate_owner, "submit_async", None)
+            if submit_async is not None:
+                candidate_future = submit_async(observation_cpu)
+        teacher_future = None
+        if self.teacher_inference_backend is not None:
+            teacher_owner = getattr(self.teacher_inference_backend, "__self__", None)
+            submit_teacher_async = getattr(teacher_owner, "submit_team_async", None)
+            if submit_teacher_async is not None:
+                teacher_future = submit_teacher_async(snapshot, team)
+        if candidate_future is not None:
+            output, value = candidate_future.result()
+        elif self.inference_backend is None:
             observation = observation_cpu[None].to(self.device)
             with torch.inference_mode():
                 output, value = self.actor_critic.forward_tta(observation)
         else:
             output, value = self.inference_backend(observation_cpu)
         teacher_output = None
-        if self.teacher_inference_backend is not None:
+        if self.teacher_inference_backend is not None and teacher_future is None:
             teacher_output = self.teacher_inference_backend(snapshot, team)
         self.timing_seconds["inference_wait"] += perf_counter() - inference_started
         decode_started = perf_counter()
@@ -407,8 +421,21 @@ class RolloutAgent(BehaviorCloningAgent):
             output,
             x_offset,
             y_offset,
-            teacher_output=teacher_output,
+            teacher_output=None,
         )
+        if teacher_future is not None:
+            teacher_wait_started = perf_counter()
+            teacher_output = teacher_future.result()
+            self.timing_seconds["inference_wait"] += perf_counter() - teacher_wait_started
+        if teacher_output is not None:
+            for decision in joint_decisions:
+                y, x = decision.position
+                decision.teacher_logits = teacher_output[decision.entity][
+                    0,
+                    :,
+                    y - y_offset,
+                    x - x_offset,
+                ].detach().cpu()
         decisions = [
             ActionDecision(
                 entity=decision.entity,

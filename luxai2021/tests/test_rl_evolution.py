@@ -55,6 +55,7 @@ from luxai2021.game.game import Game
 from luxai2021.game.game_constants import GAME_CONSTANTS
 from luxai2021.game.match_controller import MatchController
 from luxai2021.game.position import Position
+from luxai2021.imitation.actions import FIRST_PLACE_ACTION_SCHEMA
 from luxai2021.imitation.agent import BehaviorCloningAgent
 from luxai2021.imitation.masking import monotonically_tighten_legal_mask
 from luxai2021.imitation.model import (
@@ -1954,6 +1955,91 @@ def test_inference_batcher_and_parallel_rollout_batch_requests():
     assert rollout_metrics["samples"] == sum(len(episode.records) for episode in episodes)
     assert rollout_metrics["mean_batch_fill_ratio"] == 1.0
     assert rollout_metrics["mean_batch_size"] == 2.0
+
+
+def test_inference_batcher_async_submissions_batch_from_one_thread():
+    batcher = InferenceBatcher(
+        lambda values: [value * 3 for value in values],
+        max_batch_size=2,
+        wait_seconds=0.05,
+        name="test-async-inference",
+    )
+    try:
+        first = batcher.submit_async(2)
+        second = batcher.submit_async(4)
+        assert first.result() == 6
+        assert second.result() == 12
+        assert batcher.metrics()["max_batch_size"] == 2
+    finally:
+        batcher.close()
+
+
+def test_rollout_overlaps_teacher_and_candidate_without_changing_stored_logits():
+    class ImmediateFuture:
+        def __init__(self, value) -> None:
+            self.value = value
+
+        def result(self):
+            return self.value
+
+    class AsyncTeacher:
+        def __init__(self) -> None:
+            self.async_calls = 0
+            self.sync_calls = 0
+
+        def submit_team(self, _snapshot, _team):
+            self.sync_calls += 1
+            raise AssertionError("synchronous teacher path should not run")
+
+        def submit_team_async(self, _snapshot, _team):
+            self.async_calls += 1
+            return ImmediateFuture(
+                {
+                    entity: torch.zeros(1, len(actions), 32, 32)
+                    for entity, actions in FIRST_PLACE_ACTION_SCHEMA.items()
+                }
+            )
+
+    actor = FullTurnActorCritic(_small_policy()).eval()
+    snapshot = copy.deepcopy(actor).eval()
+    candidate = ActorCriticBatcher(actor, torch.device("cpu"), 1, name="test-async-candidate")
+    teacher = AsyncTeacher()
+    try:
+        episode = collect_episode(
+            actor,
+            lambda: RolloutAgent(snapshot, device="cpu", deterministic=True),
+            default_reward_program(),
+            device=torch.device("cpu"),
+            seed=71,
+            opponent_name="snapshot",
+            max_turns=4,
+            inference_backend=candidate.submit,
+            teacher_inference_backend=teacher.submit_team,
+        )
+    finally:
+        candidate.close()
+    assert teacher.async_calls == len(episode.records)
+    assert teacher.sync_calls == 0
+    assert all(
+        decision.teacher_logits is not None
+        for record in episode.records
+        for decision in record.decisions
+    )
+
+
+def test_batched_joint_margins_match_scalar_reference():
+    logits = torch.tensor([[0.2, -0.3, 1.1], [2.0, -1.0, 0.5]])
+    masks = torch.tensor([[True, False, True], [True, False, False]])
+
+    actual = BehaviorCloningAgent._joint_margins(logits, masks)
+    expected = torch.tensor(
+        [
+            BehaviorCloningAgent._joint_margin(row, mask)
+            for row, mask in zip(logits, masks)
+        ]
+    )
+
+    assert torch.equal(actual, expected)
 
 
 def test_auto_compile_skips_variable_batches_without_calling_torch_compile(monkeypatch):

@@ -34,8 +34,28 @@ class _Pending(Generic[RequestT, ResponseT]):
     error: BaseException | None = None
 
 
+class InferenceFuture(Generic[ResponseT]):
+    def __init__(self, pending: _Pending[Any, ResponseT]) -> None:
+        self.pending = pending
+
+    def result(self) -> ResponseT:
+        self.pending.ready.wait()
+        if self.pending.error is not None:
+            raise RuntimeError("Batched inference failed") from self.pending.error
+        return self.pending.result  # type: ignore[return-value]
+
+
+class _MappedInferenceFuture(Generic[RequestT, ResponseT]):
+    def __init__(self, source: InferenceFuture[RequestT], transform: Callable[[RequestT], ResponseT]) -> None:
+        self.source = source
+        self.transform = transform
+
+    def result(self) -> ResponseT:
+        return self.transform(self.source.result())
+
+
 class InferenceBatcher(Generic[RequestT, ResponseT]):
-    """Collect synchronous requests from environment threads into GPU batches."""
+    """Collect blocking or future-backed requests from environment threads into GPU batches."""
 
     def __init__(
         self,
@@ -61,17 +81,17 @@ class InferenceBatcher(Generic[RequestT, ResponseT]):
         self.thread = threading.Thread(target=self._run, name=name, daemon=True)
         self.thread.start()
 
-    def submit(self, payload: RequestT) -> ResponseT:
+    def submit_async(self, payload: RequestT) -> InferenceFuture[ResponseT]:
         pending: _Pending[RequestT, ResponseT] = _Pending(payload, threading.Event(), time.monotonic())
         with self.condition:
             if self.closed:
                 raise RuntimeError("Inference batcher is closed")
             self.pending.append(pending)
             self.condition.notify_all()
-        pending.ready.wait()
-        if pending.error is not None:
-            raise RuntimeError("Batched inference failed") from pending.error
-        return pending.result  # type: ignore[return-value]
+        return InferenceFuture(pending)
+
+    def submit(self, payload: RequestT) -> ResponseT:
+        return self.submit_async(payload).result()
 
     @staticmethod
     def _validate_results(results: list[ResponseT], expected: int) -> None:
@@ -388,6 +408,9 @@ class ActorCriticBatcher:
     def submit(self, observation: Tensor) -> tuple[dict[str, Tensor], Tensor]:
         return self.batcher.submit(observation)
 
+    def submit_async(self, observation: Tensor) -> InferenceFuture[tuple[dict[str, Tensor], Tensor]]:
+        return self.batcher.submit_async(observation)
+
     def batch_scope(self, participants: int):
         return self.batcher.batch_scope(participants)
 
@@ -597,6 +620,16 @@ class FirstPlaceBatcher:
     def submit_team(self, snapshot: object, team: int) -> dict[str, Tensor]:
         output = self.batcher.submit(snapshot)
         return FirstPlaceAgent._select_team_output(output, team)  # noqa: SLF001
+
+    def submit_team_async(
+        self,
+        snapshot: object,
+        team: int,
+    ) -> _MappedInferenceFuture[dict[str, Tensor], dict[str, Tensor]]:
+        return _MappedInferenceFuture(
+            self.batcher.submit_async(snapshot),
+            lambda output: FirstPlaceAgent._select_team_output(output, team),  # noqa: SLF001
+        )
 
     def batch_scope(self, participants: int):
         return self.batcher.batch_scope(participants)

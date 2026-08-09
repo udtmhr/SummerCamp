@@ -769,6 +769,7 @@ class PPOTrainer:
         gn_pols, gn_vals, gn_bcs, gn_teachers = [], [], [], []
         gn_illegals = []
         sampled_reference_kls: list[float] = []
+        bc_anchor_seconds = 0.0
         early_stop = False
         epoch_count = 0
         for _ in range(self.config.update_epochs):
@@ -841,7 +842,9 @@ class PPOTrainer:
                 value_loss = (
                     0.5 * torch.maximum((values - returns).square(), (clipped_values - returns).square()).mean()
                 )
+                bc_started = perf_counter()
                 bc_loss = self._distillation_anchor_loss(values)
+                bc_anchor_seconds += perf_counter() - bc_started
                 if reference_output is not None:
                     sampled_reference_kls.append(float(kl.detach()))
                 if self.config.online_teacher_kl and any(
@@ -948,6 +951,7 @@ class PPOTrainer:
         result["kl"] = reference_kl
         result["early_stopped"] = float(early_stop)
         result["epochs_completed"] = float(epoch_count)
+        result["bc_anchor_seconds"] = bc_anchor_seconds
 
         updates = {
             "episodes": float(len(episodes)),

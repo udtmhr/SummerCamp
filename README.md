@@ -798,7 +798,10 @@ PPO evaluates one joint action ratio per Lux turn. Tune `--rollout-envs` for eac
 `--episodes-per-update` for the rollout/update balance. Metrics record batch fill, queue wait, tensor staging,
 forward/copy time, game step, observation encoding,
 action decoding, reward metrics, rollout throughput, PPO update time, precision, compilation, fallback reason, and
-peak CUDA allocation. Each candidate artifact also stores the calibrated backend, precision, compile state, and
+peak CUDA allocation. PPO metrics also report `bc_anchor_seconds`. Phase-balanced BC retains the decompressed
+prepared caches for all selected anchor replays; the default 128-replay run uses about 10 GiB of additional host
+memory to avoid repeatedly decompressing an entire replay for each minibatch. Each candidate artifact also stores
+the calibrated backend, precision, compile state, and
 fallback reason in `rollout_runtime.json`. In ResAttn8-only mode, screening/medium/final evaluation uses 12/24/100
 fixed seeds, both player orientations, the distilled ResAttn8 base plus the original first-place policy, no replay
 output, paired bootstrap reporting, and an inference-latency guard. Re-running the same command resumes completed

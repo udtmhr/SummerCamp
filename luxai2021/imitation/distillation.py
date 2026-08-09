@@ -257,6 +257,7 @@ class LuxDistillationDataset(Dataset):
         replay_cache_dir: Path | None = None,
         prepared_cache_dir: Path | None = None,
         prepared_observation_dtype: str = "float16",
+        prepared_cache_size: int = 2,
     ) -> None:
         self.winner_weight = winner_weight
         self.samples: list[tuple[Path, int, int]] = []
@@ -265,9 +266,12 @@ class LuxDistillationDataset(Dataset):
         self.base = None
         self.teacher_cache = None
         if prepared_cache_dir is not None:
+            if prepared_cache_size < 1:
+                raise ValueError("Prepared distillation cache size must be positive")
             self.prepared_cache = _PreparedDistillationCache(
                 prepared_cache_dir,
                 prepared_observation_dtype,
+                max_size=prepared_cache_size,
             )
             for replay_path in replay_paths:
                 path = self.prepared_cache.path_for(replay_path)

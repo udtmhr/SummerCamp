@@ -140,6 +140,14 @@ class BehaviorCloningAgent(Agent):
         top = torch.topk(probabilities, 2).values
         return float(top[0] - top[1])
 
+    @staticmethod
+    def _joint_margins(logits: torch.Tensor, legal_masks: torch.Tensor) -> torch.Tensor:
+        masked = apply_legal_action_mask(logits, legal_masks).float()
+        probabilities = torch.softmax(masked, dim=-1)
+        top = torch.topk(probabilities, min(2, probabilities.shape[-1]), dim=-1).values
+        margins = top[:, 0] - top[:, 1] if top.shape[-1] > 1 else top[:, 0]
+        return torch.where(legal_masks.sum(dim=-1) <= 1, margins.new_full((), 20.0), margins)
+
     def _decode_joint_sequential(  # noqa: PLR0915
         self,
         game: object,
@@ -161,7 +169,6 @@ class BehaviorCloningAgent(Agent):
             entity = "worker" if unit.is_worker() else "cart"
             y, x = unit.pos.y + y_offset, unit.pos.x + x_offset
             base_legal = first_place_unit_legal_mask(snapshot, snapshot.units[unit.id])
-            logits = output[entity][0, :, y, x]
             unit_entries.append(
                 {
                     "identity": unit.id,
@@ -169,9 +176,23 @@ class BehaviorCloningAgent(Agent):
                     "entity": entity,
                     "position": (y, x),
                     "base_legal": base_legal,
-                    "margin": self._joint_margin(logits, base_legal),
+                    "margin": 0.0,
                 }
             )
+
+        for entity in ("worker", "cart"):
+            entity_entries = [entry for entry in unit_entries if entry["entity"] == entity]
+            if not entity_entries:
+                continue
+            logits = torch.stack(
+                [output[entity][0, :, entry["position"][0], entry["position"][1]] for entry in entity_entries]
+            )
+            legal_masks = torch.from_numpy(
+                np.stack([np.asarray(entry["base_legal"], dtype=bool) for entry in entity_entries])
+            ).to(logits.device)
+            margins = self._joint_margins(logits, legal_masks)
+            for entry, margin in zip(entity_entries, margins):
+                entry["margin"] = float(margin)
 
         reserved_destinations: set[tuple[int, int]] = set()
         reserved_capacity: dict[str, int] = {}
@@ -272,16 +293,28 @@ class BehaviorCloningAgent(Agent):
                 if not tile.can_act():
                     continue
                 y, x = tile.pos.y + y_offset, tile.pos.x + x_offset
-                logits = output["city_tile"][0, :, y, x]
                 city_entries.append(
                     {
                         "identity": tile.get_tile_id(),
                         "tile": tile,
                         "position": (y, x),
                         "base_legal": base_city_legal.copy(),
-                        "margin": self._joint_margin(logits, base_city_legal),
+                        "margin": 0.0,
                     }
                 )
+        if city_entries:
+            logits = torch.stack(
+                [
+                    output["city_tile"][0, :, entry["position"][0], entry["position"][1]]
+                    for entry in city_entries
+                ]
+            )
+            legal_masks = torch.from_numpy(
+                np.stack([np.asarray(entry["base_legal"], dtype=bool) for entry in city_entries])
+            ).to(logits.device)
+            margins = self._joint_margins(logits, legal_masks)
+            for entry, margin in zip(city_entries, margins):
+                entry["margin"] = float(margin)
         city_actions: list[object] = []
         for priority_index, (entry, priority_log_prob) in enumerate(self._joint_priority_order(city_entries)):
             tile = entry["tile"]

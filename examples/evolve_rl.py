@@ -653,6 +653,10 @@ def build_anchor_provider(
         seed=seed,
         max_turns=max_turns,
         prepared_cache_dir=prepared_cache_dir,
+        # Phase-balanced sampling deliberately mixes all selected replays.
+        # Retaining only the default two decompressed NPZ archives reloads an
+        # entire ~78 MiB replay for almost every PPO minibatch.
+        prepared_cache_size=replay_count,
     )
     if sampling == "phase-balanced":
         batch_sampler: Sampler[list[int]] = PhaseBalancedBatchSampler(dataset, batch_size, seed=seed)
