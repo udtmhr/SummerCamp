@@ -50,7 +50,7 @@ class PPOConfig:
     value_clip_range: float = 0.2
     entropy_coefficient: float = 0.005
     value_coefficient: float = 0.5
-    kl_coefficient: float = 0.0
+    kl_coefficient: float = 0.01
     target_kl: float | None = 0.01
     bc_coefficient: float = 0.05
     gradient_clip: float = 1.0
@@ -550,7 +550,13 @@ class PPOTrainer:
                         p_logits = reference_distribution.logits
                         q_logits = distribution.logits
                         p_probs = reference_distribution.probs
-                        kl_div = torch.where(masks, p_probs * (p_logits - q_logits), torch.zeros_like(p_logits)).sum(dim=-1)
+                        
+                        safe_p_logits = p_logits.masked_fill(~masks, 0.0)
+                        safe_q_logits = q_logits.masked_fill(~masks, 0.0)
+
+                        kl_div = (
+                            p_probs * (safe_p_logits - safe_q_logits)
+                        ).sum(dim=-1)
                         kls.append(kl_div)
                     actions = torch.tensor([decision.action for _, decision in entity_decisions], device=self.device)
                     old_log_probs = torch.tensor(

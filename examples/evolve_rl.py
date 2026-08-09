@@ -802,9 +802,14 @@ def train_candidate(
     inherited_hash = None
     if inherit_from is not None and resume_from is None:
         inherited = torch.load(inherit_from, map_location=device, weights_only=False)
-        actor_critic.policy.load_state_dict(inherited["policy"])
+        if "policy" in inherited:
+            inherited_policy = inherited["policy"]
+        else:
+            inherited_policy, _ = load_bc_checkpoint(str(inherit_from), str(device))
+            inherited_policy = inherited_policy.state_dict()
+        actor_critic.policy.load_state_dict(inherited_policy)
         inherited_modules.append("policy")
-        if candidate.inheritance_mode == "policy_value":
+        if candidate.inheritance_mode == "policy_value" and "value_head" in inherited:
             actor_critic.value_head.load_state_dict(inherited["value_head"])
             inherited_modules.append("value_head")
         digest = hashlib.sha256()
@@ -1439,11 +1444,16 @@ def candidate_result(
     started_at = time.monotonic()
     output_dir = Path(args.run_dir) / "artifacts" / candidate.candidate_id / stage / base_name
     current_checkpoint = output_dir / "latest_rl.pt"
-    prior_short_checkpoint = (
-        Path(args.run_dir) / "artifacts" / candidate.candidate_id / "short-resattn8" / "resattn8" / "best.pt"
+    prior_short_best = (
+        Path(args.run_dir)
+        / "artifacts"
+        / candidate.candidate_id
+        / "short-resattn8"
+        / "resattn8"
+        / "best.pt"
     )
     resume_from = current_checkpoint if current_checkpoint.exists() else None
-    predecessor_paths = [prior_short_checkpoint] if stage == "medium-resattn8" else []
+    predecessor_paths = [prior_short_best] if stage == "medium-resattn8" else []
     if stage == "final-resattn8":
         predecessor_paths.extend(
             [
@@ -1452,23 +1462,24 @@ def candidate_result(
                 / candidate.candidate_id
                 / "medium-resattn8"
                 / "resattn8"
-                / "latest_rl.pt",
-                prior_short_checkpoint,
+                / "best.pt",
+                prior_short_best,
             ]
         )
     if stage == "final-unet":
         predecessor_paths.append(
             Path(args.run_dir) / "artifacts" / candidate.candidate_id / "probe-unet" / "unet" / "best.pt"
         )
-    if resume_from is None:
-        resume_from = next((path for path in predecessor_paths if path.exists()), None)
-    inheritance = (
-        None
-        if resume_from is not None
-        else _resolve_parent_checkpoint(Path(args.run_dir), candidate, candidates, base_name)
+    stage_inherit_from = (
+        None if resume_from is not None else next((path for path in predecessor_paths if path.exists()), None)
     )
-    inherit_from = inheritance[0] if inheritance is not None else None
-    parent = inheritance[1] if inheritance is not None else None
+    inheritance = None
+    if resume_from is None and stage_inherit_from is None:
+        inheritance = _resolve_parent_checkpoint(Path(args.run_dir), candidate, candidates, base_name)
+    inherit_from = stage_inherit_from if stage_inherit_from is not None else (
+        inheritance[0] if inheritance is not None else None
+    )
+    parent = candidate if stage_inherit_from is not None else (inheritance[1] if inheritance is not None else None)
     parent_effective_scale = (
         _effective_scale_from_artifact(inherit_from, parent.reward_program.reward_scale)
         if inherit_from is not None and parent is not None
