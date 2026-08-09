@@ -56,10 +56,10 @@ def lux_s1_rules_context() -> dict[str, str]:
 
 @dataclass(frozen=True)
 class OpponentMix:
-    self_base: float = 0.45
-    other_base: float = 0.25
-    teacher: float = 0.20
-    snapshot: float = 0.10
+    self_base: float = 0.20
+    other_base: float = 0.05
+    teacher: float = 0.25
+    snapshot: float = 0.50
 
     def __post_init__(self) -> None:
         values = asdict(self)
@@ -122,12 +122,12 @@ class TrainingCurriculum:
     def opponent_mix(self, proposed: OpponentMix, progress: float) -> OpponentMix:
         if self.name == "legacy":
             return proposed
+        snapshot = max(proposed.snapshot, self.snapshot_floor)
         teacher = min(
             max(proposed.teacher, _piecewise_linear(self.teacher_floor_points, progress)),
-            1.0 - self.snapshot_floor,
+            1.0 - snapshot,
         )
-        snapshot = max(proposed.snapshot, self.snapshot_floor)
-        if teacher + snapshot >= 1.0:
+        if teacher + snapshot > 1.0 + 1e-9:
             snapshot = self.snapshot_floor
             teacher = 1.0 - snapshot
         remaining = max(0.0, 1.0 - teacher - snapshot)
@@ -602,7 +602,13 @@ def proposal_schema() -> dict[str, Any]:
         field: (
             {"type": "number", "const": 0.0}
             if field == "kl_coefficient"
-            else {"type": "integer" if field in {"update_epochs", "minibatch_turns"} else "number"}
+            else {"type": "boolean"}
+            if field in {"joint_action_policy", "online_teacher_kl"}
+            else {
+                "type": "integer"
+                if field in {"update_epochs", "minibatch_turns", "joint_loss_reference_actions"}
+                else "number"
+            }
         )
         for field in asdict(PPOConfig())
     }
@@ -614,7 +620,7 @@ def proposal_schema() -> dict[str, Any]:
             "reward_program": {
                 "type": "object",
                 "properties": {
-                    "version": {"type": "integer", "const": 2},
+                    "version": {"type": "integer", "const": 3},
                     "mode": {"type": "string", "enum": list(REWARD_MODES)},
                     "derived_metrics": {
                         "type": "array",
@@ -645,6 +651,7 @@ def proposal_schema() -> dict[str, Any]:
                     "gamma": {"type": "number"},
                     "terminal_reward_scale": {"type": "number"},
                     "normalize_total": {"type": "boolean"},
+                    "terminal_potential_zero": {"type": "boolean", "const": True},
                 },
                 "required": [
                     "version",
@@ -655,6 +662,7 @@ def proposal_schema() -> dict[str, Any]:
                     "gamma",
                     "terminal_reward_scale",
                     "normalize_total",
+                    "terminal_potential_zero",
                 ],
                 "additionalProperties": False,
             },
@@ -782,7 +790,8 @@ Hard constraints:
 - Illegal-action events identify hard action-mask defects. Do not trade them against reward and never weaken an
   existing illegal-action mask; runtime masks may only become stricter.
 - Use the reported city-loss/night-fuel turns and parent deltas to explain the proposed change.
-- Emit reward_program version 2. Derived metrics must use only safe Reward IR expressions in the schema.
+- Emit reward_program version 3 with terminal_potential_zero=true.
+  Derived metrics must use only safe Reward IR expressions in the schema.
 - turn/night/cycle/turns_until_night/night_turns_remaining describe phase and should be used as gate conditions,
   not standalone objectives. Relative city-risk/loss/deficit metrics are oriented so larger is better. Absolute
   own_city_tiles_at_risk, own_night_fuel_deficit, own_stranded_fuel, own_city_tiles_lost, and
@@ -1714,14 +1723,12 @@ def initial_candidate(*, island: int, seed: int) -> EvolutionCandidate:
     rng = random.Random(seed + island)
     base_ppo = PPOConfig()
     reward = default_reward_program().to_dict()
-    reward["version"] = 2
-    reward["derived_metrics"] = []
     for component in reward["components"]:
         component["weight"] *= rng.uniform(0.85, 1.15)
     proposal = {
         "reward_program": reward,
         "ppo_config": asdict(base_ppo),
-        "opponent_mix": asdict(OpponentMix(self_base=0.40, other_base=0.10, teacher=0.10, snapshot=0.40)),
+        "opponent_mix": asdict(OpponentMix()),
         "mutation_kind": "initial",
         "primary_parent_id": None,
         "secondary_parent_ids": [],
@@ -1757,7 +1764,7 @@ def _replace_random_expression_leaf(expression: Mapping[str, Any], rng: random.R
 def _mutate_large_structural_reward(parent: EvolutionCandidate, rng: random.Random) -> dict[str, Any] | None:
     for attempt in range(_I03_STRUCTURAL_ATTEMPTS):
         reward = copy.deepcopy(parent.reward_program.to_dict())
-        reward.update({"version": 2})
+        reward.update({"version": 3, "terminal_potential_zero": True})
         reward.setdefault("derived_metrics", [])
         for _ in range(rng.randint(2, 4)):
             index = rng.randrange(len(reward["components"]))
@@ -1809,7 +1816,7 @@ def _crossover_reward(
     rng: random.Random,
 ) -> tuple[dict[str, Any], str] | None:
     reward = copy.deepcopy(parent.reward_program.to_dict())
-    reward.update({"version": 2})
+    reward.update({"version": 3, "terminal_potential_zero": True})
     reward.setdefault("derived_metrics", [])
     primary_components = {
         json.dumps(component, sort_keys=True, separators=(",", ":")) for component in reward["components"]
@@ -1861,7 +1868,7 @@ def _crossover_reward(
 
 def _restart_reward(rng: random.Random) -> dict[str, Any]:
     reward = default_reward_program().to_dict()
-    reward.update({"version": 2, "derived_metrics": []})
+    reward.update({"version": 3, "derived_metrics": [], "terminal_potential_zero": True})
     for component in reward["components"]:
         component["weight"] *= rng.uniform(0.5, 2.0)
     return reward
@@ -1878,7 +1885,8 @@ def mutate_candidate(
 ) -> EvolutionCandidate:
     rng = random.Random(seed)
     reward = parent.reward_program.to_dict()
-    reward["version"] = 2
+    reward["version"] = 3
+    reward["terminal_potential_zero"] = True
     reward.setdefault("derived_metrics", [])
     ppo = asdict(parent.ppo_config)
 

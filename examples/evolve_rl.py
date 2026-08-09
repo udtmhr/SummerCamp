@@ -95,7 +95,7 @@ _FATAL_CUDA_ERROR_MARKERS = (
 )
 _AUTOMATIC_INFRASTRUCTURE_RETRIES = 2
 _METRIC_SCHEMA_VERSION = 3
-_RUN_MANIFEST_SCHEMA_VERSION = 4
+_RUN_MANIFEST_SCHEMA_VERSION = 5
 _NATIVE_CPU_GATE_MIN_DECISIONS = 40_000
 _NATIVE_CPU_GATE_SHARE = 0.25
 _RETRYABLE_INFRASTRUCTURE_ERROR_MARKERS = (
@@ -126,6 +126,10 @@ _RUN_MANIFEST_ARGUMENTS = (
     "short_decisions",
     "medium_decisions",
     "final_decisions",
+    "budget_unit",
+    "short_games",
+    "medium_games",
+    "final_games",
     "decisions_per_update",
     "rollout_envs",
     "rollout_backend",
@@ -203,6 +207,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--short-decisions", type=int, default=550_000)
     parser.add_argument("--medium-decisions", type=int, default=1_925_000)
     parser.add_argument("--final-decisions", type=int, default=9_900_000)
+    parser.add_argument("--budget-unit", choices=("games", "decisions"), default="games")
+    parser.add_argument("--short-games", type=int, default=384)
+    parser.add_argument("--medium-games", type=int, default=1536)
+    parser.add_argument("--final-games", type=int, default=6144)
     parser.add_argument("--decisions-per-update", type=int, default=80_000)
     parser.add_argument("--rollout-envs", type=int, default=8)
     parser.add_argument("--rollout-backend", choices=("auto", "lockstep", "threaded"), default="auto")
@@ -211,7 +219,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout-batch-wait-ms", type=float, default=2.0)
     parser.add_argument("--medium-count", type=int, default=8)
     parser.add_argument("--final-count", type=int, default=2)
-    parser.add_argument("--episodes-per-update", type=int, default=2)
+    parser.add_argument("--episodes-per-update", type=int, default=64)
     parser.add_argument("--max-turns", type=int, default=360)
     parser.add_argument("--screening-seeds", type=int, default=24)
     parser.add_argument("--medium-seeds", type=int, default=24)
@@ -685,15 +693,15 @@ def opponent_factories(
     return {
         "self_base": (
             base_checkpoint.parent.name,
-            lambda: BehaviorCloningAgent(str(base_checkpoint), device=device_name, tta="none"),
+            lambda: BehaviorCloningAgent(str(base_checkpoint), device=device_name, tta="rot180"),
         ),
         "other_base": (
             other_checkpoint.parent.name,
-            lambda: BehaviorCloningAgent(str(other_checkpoint), device=device_name, tta="none"),
+            lambda: BehaviorCloningAgent(str(other_checkpoint), device=device_name, tta="rot180"),
         ),
         "teacher": (
             "first-place",
-            lambda: FirstPlaceAgent(str(teacher_checkpoint), device=device_name, tta="none"),
+            lambda: FirstPlaceAgent(str(teacher_checkpoint), device=device_name, tta="rot180"),
         ),
         "snapshot": (
             "initial-snapshot",
@@ -714,12 +722,16 @@ def batched_opponent_pool(
     rollout_precision: str = "auto",
     rollout_compile: str = "auto",
     rollout_batch_wait_ms: float = 2.0,
-) -> tuple[BatchedOpponentPool, dict[str, tuple[str, Callable[[], Agent]]]]:
+) -> tuple[
+    BatchedOpponentPool,
+    dict[str, tuple[str, Callable[[], Agent]]],
+    Callable[[object, int], dict[str, torch.Tensor]],
+]:
     device_name = str(device)
     wait_seconds = rollout_batch_wait_ms / 1000.0
     pad_batches = resolve_rollout_backend(rollout_backend) == "lockstep"
     self_base = BehaviorCloningBatcher(
-        BehaviorCloningAgent(str(base_checkpoint), device=device_name, tta="none"),
+        BehaviorCloningAgent(str(base_checkpoint), device=device_name, tta="rot180"),
         rollout_envs,
         name="lux-self-base-inference",
         wait_seconds=wait_seconds,
@@ -728,7 +740,7 @@ def batched_opponent_pool(
         pad_batches=pad_batches,
     )
     other_base = BehaviorCloningBatcher(
-        BehaviorCloningAgent(str(other_checkpoint), device=device_name, tta="none"),
+        BehaviorCloningAgent(str(other_checkpoint), device=device_name, tta="rot180"),
         rollout_envs,
         name="lux-other-base-inference",
         wait_seconds=wait_seconds,
@@ -737,9 +749,21 @@ def batched_opponent_pool(
         pad_batches=pad_batches,
     )
     teacher = FirstPlaceBatcher(
-        FirstPlaceAgent(str(teacher_checkpoint), device=device_name, tta="none"),
+        FirstPlaceAgent(str(teacher_checkpoint), device=device_name, tta="rot180"),
         rollout_envs,
         name="lux-teacher-inference",
+        wait_seconds=wait_seconds,
+        precision=rollout_precision,
+        compile_mode=rollout_compile,
+        pad_batches=pad_batches,
+    )
+    # Keep the on-policy anchor on a separate request queue. A teacher opponent
+    # is decoded later in the same environment thread, so sharing one lockstep
+    # queue would wait for a request that cannot be submitted yet.
+    online_teacher = FirstPlaceBatcher(
+        teacher.prototype,
+        rollout_envs,
+        name="lux-online-teacher-inference",
         wait_seconds=wait_seconds,
         precision=rollout_precision,
         compile_mode=rollout_compile,
@@ -760,6 +784,7 @@ def batched_opponent_pool(
             "self_base": self_base,
             "other_base": other_base,
             "teacher": teacher,
+            "online_teacher": online_teacher,
             "snapshot": snapshot_backend,
         }
     )
@@ -767,9 +792,9 @@ def batched_opponent_pool(
         "self_base": (base_checkpoint.parent.name, resources.factory("self_base")),
         "other_base": (other_checkpoint.parent.name, resources.factory("other_base")),
         "teacher": ("first-place", resources.factory("teacher")),
-        "snapshot": ("initial-snapshot", resources.factory("snapshot")),
+        "snapshot": ("recent-snapshot", resources.factory("snapshot")),
     }
-    return resources, factories
+    return resources, factories, online_teacher.submit_team
 
 
 def train_candidate(
@@ -786,6 +811,8 @@ def train_candidate(
     output_dir: Path,
     seconds: int,
     decision_budget: int | None,
+    game_budget: int | None = None,
+    budget_unit: str = "decisions",
     decisions_per_update: int,
     rollout_envs: int,
     episodes_per_update: int,
@@ -801,6 +828,8 @@ def train_candidate(
     curriculum_profile: str = "legacy",
     curriculum_total_decisions: int | None = None,
     curriculum_start_decisions: int = 0,
+    curriculum_total_games: int | None = None,
+    curriculum_start_games: int = 0,
     inherit_from: Path | None = None,
     parent_reward_program: RewardProgram | None = None,
     parent_effective_scale: float | None = None,
@@ -813,14 +842,37 @@ def train_candidate(
     rollout_compile: str = "auto",
     rollout_batch_wait_ms: float = 2.0,
     reward_mode: str | None = None,
+    require_reward_v3: bool = True,
 ) -> tuple[Path, dict[str, object]]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    progress_started_at = time.time()
+
+    def write_training_progress(phase: str, **values: object) -> None:
+        payload = {
+            "schema_version": 1,
+            "status": "running",
+            "phase": phase,
+            "pid": os.getpid(),
+            "updated_at_unix": time.time(),
+            "elapsed_seconds": time.time() - progress_started_at,
+            **values,
+        }
+        EvolutionStore.write_json(output_dir / "training_progress.json", payload)
+        detail = ""
+        if "games_collected" in values:
+            detail = f" games={values['games_collected']}/{values.get('games_target', '?')}"
+        print(f"[train] phase={phase} update={values.get('update', 0)}{detail}", flush=True)
+
+    write_training_progress("initializing", update=0)
     base_checkpoint_sha256 = _sha256_file(base_checkpoint)
+    teacher_checkpoint_sha256 = _sha256_file(teacher_checkpoint)
+    if require_reward_v3 and candidate.reward_program.version < 3:
+        raise ValueError("New joint-sequential runs require Reward Program v3")
     _, base_source = load_bc_checkpoint(str(base_checkpoint), "cpu")
     actor_critic = FullTurnActorCritic.from_checkpoint(base_checkpoint, device)
 
     # The distilled base remains a diagnostic reference even when its KL is not optimized.
-    reference_policy = FullTurnActorCritic.from_checkpoint(base_checkpoint, device).policy
+    reference_policy = FullTurnActorCritic.from_checkpoint(base_checkpoint, device)
     reference_policy.eval()
     for param in reference_policy.parameters():
         param.requires_grad = False
@@ -854,7 +906,17 @@ def train_candidate(
             sampling=bc_anchor_sampling,
         )
     curriculum = training_curriculum(curriculum_profile)
-    curriculum_total = max(1, int(curriculum_total_decisions or decision_budget or decisions_per_update))
+    if budget_unit not in {"games", "decisions"}:
+        message = f"Unsupported budget unit: {budget_unit}"
+        raise ValueError(message)
+    curriculum_total = max(
+        1,
+        int(
+            (curriculum_total_games or game_budget or episodes_per_update)
+            if budget_unit == "games"
+            else (curriculum_total_decisions or decision_budget or decisions_per_update)
+        ),
+    )
     actor_critic.eval()
     start_update = 0
     cumulative_decisions = 0
@@ -864,6 +926,7 @@ def train_candidate(
     resumed_metrics: dict[str, object] | None = None
     rng = random.Random(seed)
     curriculum_progress_decisions = max(0, int(curriculum_start_decisions))
+    curriculum_progress_games = max(0, int(curriculum_start_games))
     joint_update = 0
     resume_metadata: dict[str, object] | None = None
 
@@ -886,6 +949,7 @@ def train_candidate(
             legacy_target_decisions=decision_budget,
             legacy_stage_seconds=seconds,
             allow_compatible_source_checkpoint=True,
+            budget_unit=budget_unit,
         )
         resume_metadata = {
             "checkpoint": str(resume_from),
@@ -903,6 +967,10 @@ def train_candidate(
             resume_state.curriculum_progress_decisions,
             int(curriculum_start_decisions),
         )
+        curriculum_progress_games = max(
+            resume_state.curriculum_progress_games,
+            int(curriculum_start_games),
+        )
         joint_update = resume_state.joint_update
         if resume_budget_progress:
             cumulative_decisions = resume_state.cumulative_decisions
@@ -912,6 +980,9 @@ def train_candidate(
         if resume_budget_progress and resume_state.python_random_state is not None:
             rng.setstate(resume_state.python_random_state)
     snapshot = copy.deepcopy(actor_critic).eval().requires_grad_(requires_grad=False)
+    snapshot_states = [
+        {name: value.detach().cpu().clone() for name, value in actor_critic.state_dict().items()}
+    ]
     candidate_batcher = ActorCriticBatcher(
         actor_critic,
         device,
@@ -922,7 +993,7 @@ def train_candidate(
         compile_mode=rollout_compile,
         pad_batches=resolve_rollout_backend(rollout_backend) == "lockstep",
     )
-    opponent_resources, pool = batched_opponent_pool(
+    opponent_resources, pool, online_teacher_backend = batched_opponent_pool(
         base_checkpoint=base_checkpoint,
         other_checkpoint=other_checkpoint,
         teacher_checkpoint=teacher_checkpoint,
@@ -944,6 +1015,7 @@ def train_candidate(
             mode=reward_mode,
             terminal_reward_scale=candidate.reward_program.terminal_reward_scale,
             normalize_total=candidate.reward_program.normalize_total,
+            terminal_potential_zero=candidate.reward_program.terminal_potential_zero,
         )
         candidate = replace(candidate, reward_program=candidate_reward)
     effective_reward_program = candidate.reward_program
@@ -971,8 +1043,10 @@ def train_candidate(
             mode=candidate.reward_program.mode,
             terminal_reward_scale=candidate.reward_program.terminal_reward_scale,
             normalize_total=candidate.reward_program.normalize_total,
+            terminal_potential_zero=candidate.reward_program.terminal_potential_zero,
         )
     elif resume_from is None:
+        write_training_progress("reward_calibration", update=start_update)
         calibration_specs = []
         for offset, opponent_key in enumerate(("self_base", "other_base", "teacher", "snapshot")):
             opponent_name, factory = pool[opponent_key]
@@ -983,6 +1057,7 @@ def train_candidate(
             candidate.reward_program,
             device=device,
             inference_backend=candidate_batcher.submit,
+            teacher_inference_backend=online_teacher_backend,
             max_turns=max_turns,
             rollout_backend=rollout_backend,
         )
@@ -1014,6 +1089,7 @@ def train_candidate(
             )
             needs_warmup = bool(critic_calibration["requires_warmup"])
         if needs_warmup:
+            write_training_progress("critic_warmup", update=start_update)
             warmup_episodes = list(calibration_episodes)
             warmup_turns = sum(len(episode.records) for episode in warmup_episodes)
             next_key = 0
@@ -1026,6 +1102,7 @@ def train_candidate(
                     effective_reward_program,
                     device=device,
                     inference_backend=candidate_batcher.submit,
+                    teacher_inference_backend=online_teacher_backend,
                     max_turns=max_turns,
                     rollout_backend=rollout_backend,
                 )
@@ -1051,8 +1128,10 @@ def train_candidate(
     should_early_stop = False
     try:
         while not should_early_stop and (
-            cumulative_decisions < decision_budget
-            if decision_budget is not None
+            episode_index < game_budget
+            if budget_unit == "games" and game_budget is not None
+            else cumulative_decisions < decision_budget
+            if budget_unit == "decisions" and decision_budget is not None
             else time.monotonic() < deadline or update == 0
         ):
             candidate_batcher.reset_metrics()
@@ -1062,17 +1141,35 @@ def train_candidate(
             rollout_started = time.monotonic()
             episodes = []
             update_decisions = 0
-            target_update_decisions = decisions_per_update if decision_budget is not None else None
+            target_update_decisions = (
+                decisions_per_update
+                if budget_unit == "decisions" and decision_budget is not None
+                else None
+            )
+            target_update_games = (
+                min(episodes_per_update, game_budget - episode_index)
+                if budget_unit == "games" and game_budget is not None
+                else None
+            )
+            write_training_progress(
+                "rollout",
+                update=update,
+                games_collected=0,
+                games_target=target_update_games or episodes_per_update,
+                decisions_collected=0,
+                cumulative_games=episode_index,
+            )
             while (
                 update_decisions < target_update_decisions
                 if target_update_decisions is not None
-                else len(episodes) < episodes_per_update
+                else len(episodes) < (target_update_games or episodes_per_update)
             ):
                 wave_size = rollout_envs
                 if target_update_decisions is None:
-                    wave_size = min(wave_size, episodes_per_update - len(episodes))
+                    wave_size = min(wave_size, (target_update_games or episodes_per_update) - len(episodes))
                 specs = []
-                curriculum_progress = min(max(curriculum_progress_decisions / curriculum_total, 0.0), 1.0)
+                progress_units = curriculum_progress_games if budget_unit == "games" else curriculum_progress_decisions
+                curriculum_progress = min(max(progress_units / curriculum_total, 0.0), 1.0)
                 active_opponent_mix = curriculum.opponent_mix(candidate.opponent_mix, curriculum_progress)
                 shaping_multiplier = curriculum.shaping_multiplier(curriculum_progress)
                 bc_coefficient_multiplier = curriculum.bc_coefficient_multiplier(curriculum_progress)
@@ -1085,8 +1182,11 @@ def train_candidate(
                     mode=effective_reward_program.mode,
                     terminal_reward_scale=effective_reward_program.terminal_reward_scale,
                     normalize_total=effective_reward_program.normalize_total,
+                    terminal_potential_zero=effective_reward_program.terminal_potential_zero,
                 )
                 allocated_opponents = active_opponent_mix.allocate(wave_size, rng)
+                if "snapshot" in allocated_opponents:
+                    snapshot.load_state_dict(rng.choice(snapshot_states))
                 for opponent_key in allocated_opponents:
                     opponent_name, factory = pool[opponent_key]
                     episode_seed = seed + episode_index
@@ -1099,11 +1199,20 @@ def train_candidate(
                     scheduled_reward_program,
                     device=device,
                     inference_backend=candidate_batcher.submit,
+                    teacher_inference_backend=online_teacher_backend,
                     max_turns=max_turns,
                     rollout_backend=rollout_backend,
                 )
                 episodes.extend(wave)
                 update_decisions += sum(len(record.decisions) for episode in wave for record in episode.records)
+                write_training_progress(
+                    "rollout",
+                    update=update,
+                    games_collected=len(episodes),
+                    games_target=target_update_games or episodes_per_update,
+                    decisions_collected=update_decisions,
+                    cumulative_games=episode_index,
+                )
             _synchronize_cuda(device, "rollout collection")
             rollout_seconds = time.monotonic() - rollout_started
             actor_critic.train()
@@ -1111,17 +1220,29 @@ def train_candidate(
             ppo_update_started = time.monotonic()
             is_first_update = (update == 0)
             is_last_update = (
-                decision_budget is not None
-                and target_update_decisions is not None
-                and cumulative_decisions + target_update_decisions >= decision_budget
+                (game_budget is not None and target_update_games is not None and episode_index >= game_budget)
+                or (
+                    decision_budget is not None
+                    and target_update_decisions is not None
+                    and cumulative_decisions + target_update_decisions >= decision_budget
+                )
             )
             record_grad_norms = is_first_update or is_last_update
+            write_training_progress(
+                "ppo_update",
+                update=update,
+                games_collected=len(episodes),
+                games_target=target_update_games or episodes_per_update,
+                decisions_collected=update_decisions,
+                cumulative_games=episode_index,
+            )
             metrics = trainer.update(episodes, record_grad_norms=record_grad_norms)
             _synchronize_cuda(device, "PPO update")
             ppo_update_seconds = time.monotonic() - ppo_update_started
             actor_critic.eval()
             cumulative_decisions += int(metrics["decisions"])
             curriculum_progress_decisions += int(metrics["decisions"])
+            curriculum_progress_games += len(episodes)
             joint_update += 1
             cumulative_turns += int(metrics["turns"])
             diagnostic_events.extend(event for episode in episodes for event in episode.diagnostic_events)
@@ -1190,12 +1311,18 @@ def train_candidate(
                     "effective_opponent_mix": asdict(active_opponent_mix),
                     "opponent_episode_counts": dict(opponent_episode_counts),
                     "curriculum_progress_decisions": curriculum_progress_decisions,
+                    "curriculum_progress_games": curriculum_progress_games,
+                    "budget_unit": budget_unit,
                     "joint_update": joint_update,
                     "actor_lr_multiplier": trainer.actor_lr_multiplier,
                     "bc_coefficient_multiplier": bc_coefficient_multiplier,
                 }
             )
             history.append(metrics)
+            snapshot_states.append(
+                {name: value.detach().cpu().clone() for name, value in actor_critic.state_dict().items()}
+            )
+            snapshot_states = snapshot_states[-4:]
             trainer.save_training_checkpoint(
                 output_dir / "latest_rl.pt",
                 source_checkpoint=str(base_checkpoint),
@@ -1210,10 +1337,58 @@ def train_candidate(
                     "elapsed_seconds": metrics["elapsed_seconds"],
                     "python_random_state": rng.getstate(),
                     "curriculum_progress_decisions": curriculum_progress_decisions,
+                    "curriculum_progress_games": curriculum_progress_games,
+                    "budget_unit": budget_unit,
                     "joint_update": joint_update,
                 },
             )
-            completed_progress = min(max(curriculum_progress_decisions / curriculum_total, 0.0), 1.0)
+            write_training_progress(
+                "checkpoint_saved",
+                update=update,
+                games_collected=len(episodes),
+                games_target=target_update_games or episodes_per_update,
+                decisions_collected=update_decisions,
+                cumulative_games=episode_index,
+                checkpoint=str(output_dir / "latest_rl.pt"),
+            )
+            update_dir = output_dir / "updates"
+            update_dir.mkdir(exist_ok=True)
+            actor_critic.export_policy(
+                update_dir / f"u{update:04d}.pt",
+                epoch=update,
+                metrics={"validation": metrics, "ppo": metrics},
+                split=base_source["split"],
+                metadata={
+                    "candidate_id": candidate.candidate_id,
+                    "update": update,
+                    "budget_unit": budget_unit,
+                },
+            )
+            _save_stage_inheritance_checkpoint(
+                actor_critic,
+                update_dir / f"u{update:04d}_pv.pt",
+                update=update,
+                metrics=metrics,
+            )
+            if (update + 1) % 4 == 0:
+                shutil.copyfile(output_dir / "latest_rl.pt", update_dir / f"u{update:04d}_rl.pt")
+            if budget_unit == "games" and (update + 1) % 2 == 0:
+                diagnostic_dir = output_dir / "diagnostic_evaluations"
+                diagnostic_dir.mkdir(exist_ok=True)
+                diagnostic = evaluate_against_league(
+                    LeagueMember("candidate", update_dir / f"u{update:04d}.pt"),
+                    [
+                        LeagueMember("base", base_checkpoint),
+                        LeagueMember("first-place", teacher_checkpoint, model_type="first-place"),
+                    ],
+                    seed_start=eval_seed_start,
+                    seed_count=8,
+                    device=str(device),
+                    max_turns=max_turns,
+                )
+                EvolutionStore.write_json(diagnostic_dir / f"u{update:04d}.json", diagnostic)
+            completed_units = curriculum_progress_games if budget_unit == "games" else curriculum_progress_decisions
+            completed_progress = min(max(completed_units / curriculum_total, 0.0), 1.0)
             for milestone in milestone_points:
                 if milestone not in saved_milestones and completed_progress >= milestone:
                     actor_critic.export_policy(
@@ -1230,7 +1405,7 @@ def train_candidate(
                     )
                     saved_milestones.add(milestone)
 
-                    if eval_seeds > 0:
+                    if eval_seeds > 0 and budget_unit == "decisions":
                         milestone_path = milestone_dir / f"p{round(milestone * 100):03d}.pt"
                         teacher = LeagueMember("first-place", teacher_checkpoint, model_type="first-place")
                         evaluation = evaluate_against_league(
@@ -1265,12 +1440,17 @@ def train_candidate(
             if checkpoint_callback is not None:
                 checkpoint_callback(output_dir, metrics)
 
-            if update > 0 and update % 10 == 0:
-                snapshot.load_state_dict(actor_critic.state_dict())
-
             update += 1
-            if decision_budget is None and seconds <= 0:
+            if decision_budget is None and game_budget is None and seconds <= 0:
                 break
+    except BaseException as error:
+        write_training_progress(
+            "failed",
+            status="failed",
+            update=update,
+            error=f"{type(error).__name__}: {error}",
+        )
+        raise
     finally:
         candidate_batcher.close()
         opponent_resources.close()
@@ -1300,6 +1480,12 @@ def train_candidate(
         "base_name": base_name,
         "base_checkpoint": str(base_checkpoint),
         "base_checkpoint_sha256": base_checkpoint_sha256,
+        "training_contract": {
+            "decoder_schema": "joint_sequential_v2",
+            "inference_augmentation": "rot180",
+            "budget_unit": budget_unit,
+            "teacher_checkpoint_sha256": teacher_checkpoint_sha256,
+        },
         "reward_program": candidate.reward_program.to_dict(),
         "effective_reward_program": effective_reward_program.to_dict(),
         "reward_calibration": reward_calibration,
@@ -1315,8 +1501,11 @@ def train_candidate(
         "ppo_config": asdict(candidate.ppo_config),
         "opponent_mix": asdict(candidate.opponent_mix),
         "training_curriculum": curriculum.to_dict(),
-        "curriculum_total_decisions": curriculum_total,
+        "curriculum_total_decisions": curriculum_total_decisions,
         "curriculum_start_decisions": max(0, int(curriculum_start_decisions)),
+        "curriculum_total_games": curriculum_total_games,
+        "curriculum_start_games": max(0, int(curriculum_start_games)),
+        "budget_unit": budget_unit,
         "curriculum_milestones": [f"p{round(point * 100):03d}.pt" for point in sorted(saved_milestones)],
         "bc_anchor": {
             "replays": bc_replays,
@@ -1325,6 +1514,7 @@ def train_candidate(
             "seed": seed if bc_anchor_seed is None else bc_anchor_seed,
         },
         "decision_budget": decision_budget,
+        "game_budget": game_budget,
         "decisions_per_update": decisions_per_update,
         "rollout_envs": rollout_envs,
         "rollout_backend": resolve_rollout_backend(rollout_backend),
@@ -1336,6 +1526,16 @@ def train_candidate(
         "final_metrics": final_metrics,
         "diagnostic_events": diagnostic_events,
     }
+    summary["training_contract_hash"] = hashlib.sha256(
+        json.dumps(
+            {
+                "candidate": candidate.to_dict(),
+                "training_contract": summary["training_contract"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
     (output_dir / "rollout_runtime.json").write_text(
         json.dumps(rollout_runtime, indent=2, sort_keys=True),
         encoding="utf-8",
@@ -1355,6 +1555,13 @@ def train_candidate(
             metrics=final_metrics,
         )
     (output_dir / "metrics.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    write_training_progress(
+        "completed",
+        status="completed",
+        update=max(0, update - 1),
+        cumulative_games=episode_index,
+        checkpoint=str(output_dir / "latest_rl.pt"),
+    )
     return output_dir / "best.pt", summary
 
 
@@ -1369,8 +1576,10 @@ def _save_stage_inheritance_checkpoint(
     temporary = checkpoint_path.with_suffix(".tmp")
     torch.save(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "checkpoint_kind": "stage_inheritance",
+            "decoder_schema": "joint_sequential_v2",
+            "inference_augmentation": "rot180",
             "policy": actor_critic.policy.state_dict(),
             "value_head": actor_critic.value_head.state_dict(),
             "update": int(update),
@@ -1471,6 +1680,26 @@ def _curriculum_start_decisions(stage: str, args: argparse.Namespace) -> int:
     if stage.startswith("final-"):
         return int(args.short_decisions) + int(args.medium_decisions)
     return 0
+
+
+def _curriculum_start_games(stage: str, args: argparse.Namespace) -> int:
+    if stage.startswith("medium-"):
+        return int(args.short_games)
+    if stage.startswith("final-"):
+        return int(args.short_games) + int(args.medium_games)
+    return 0
+
+
+def _stage_budget(args: argparse.Namespace, stage: str) -> int:
+    suffix = "games" if getattr(args, "budget_unit", "decisions") == "games" else "decisions"
+    if stage.startswith(("short-", "probe-")):
+        return int(getattr(args, f"short_{suffix}"))
+    if stage.startswith("medium-"):
+        return int(getattr(args, f"medium_{suffix}"))
+    if stage.startswith("final-"):
+        return int(getattr(args, f"final_{suffix}"))
+    message = f"Unknown training stage: {stage}"
+    raise ValueError(message)
 
 
 def _select_teacher_milestone(
@@ -1592,6 +1821,7 @@ def candidate_result(
         else None
     )
     curriculum_total_decisions = args.short_decisions + args.medium_decisions + args.final_decisions
+    curriculum_total_games = args.short_games + args.medium_games + args.final_games
     try:
         checkpoint, training = train_candidate(
             candidate,
@@ -1605,7 +1835,9 @@ def candidate_result(
             prepared_cache_dir=Path(args.prepared_cache_dir),
             output_dir=output_dir,
             seconds=seconds,
-            decision_budget=decision_budget,
+            decision_budget=decision_budget if args.budget_unit == "decisions" else None,
+            game_budget=decision_budget if args.budget_unit == "games" else None,
+            budget_unit=args.budget_unit,
             decisions_per_update=args.decisions_per_update,
             rollout_envs=args.rollout_envs,
             episodes_per_update=args.episodes_per_update,
@@ -1621,6 +1853,8 @@ def candidate_result(
             curriculum_profile=args.curriculum_profile,
             curriculum_total_decisions=curriculum_total_decisions,
             curriculum_start_decisions=_curriculum_start_decisions(stage, args),
+            curriculum_total_games=curriculum_total_games,
+            curriculum_start_games=_curriculum_start_games(stage, args),
             inherit_from=inherit_from,
             parent_reward_program=parent.reward_program if parent is not None else None,
             parent_effective_scale=parent_effective_scale,
@@ -1633,6 +1867,7 @@ def candidate_result(
             rollout_precision=args.rollout_precision,
             rollout_compile=args.rollout_compile,
             rollout_batch_wait_ms=args.rollout_batch_wait_ms,
+            require_reward_v3=not getattr(args, "allow_legacy_reward", False),
         )
         milestone_selection: dict[str, object] = {"enabled": False}
         if args.curriculum_profile != "legacy" and stage.startswith("final-"):
@@ -1742,12 +1977,8 @@ def execute_evolution_job(
     if decision_budget is None:
         if job.seconds <= 0:
             decision_budget = 1
-        elif job.stage.startswith("short-"):
-            decision_budget = args.short_decisions
-        elif job.stage.startswith("medium-"):
-            decision_budget = args.medium_decisions
-        elif job.stage.startswith("final-"):
-            decision_budget = args.final_decisions
+        elif job.stage.startswith(("short-", "medium-", "final-")):
+            decision_budget = _stage_budget(args, job.stage)
     result = candidate_result(
         candidate,
         stage=job.stage,
@@ -1774,6 +2005,9 @@ def _apply_coordinator_manifest(args: argparse.Namespace, manifest: Mapping[str,
     coordinator_args = manifest.get("arguments", {})
     if not isinstance(coordinator_args, dict):
         raise TypeError("Coordinator manifest arguments are invalid")
+    if int(manifest.get("schema_version", 1)) < 5:
+        args.budget_unit = "decisions"
+        args.allow_legacy_reward = True
     for name in _RUN_MANIFEST_ARGUMENTS:
         if name in coordinator_args:
             setattr(args, name, coordinator_args[name])
@@ -2167,6 +2401,33 @@ def _select_completed_stage(
             dict(baseline),
             score_margin=0.02 if stage.startswith("short-") else 0.0,
         )
+        training = result.metrics.get("training", {}) if isinstance(result.metrics, Mapping) else {}
+        history = training.get("history", []) if isinstance(training, Mapping) else []
+        if (
+            stage.startswith("short-")
+            and isinstance(training, Mapping)
+            and training.get("budget_unit") == "games"
+            and isinstance(history, list)
+            and history
+        ):
+            first = history[0] if isinstance(history[0], Mapping) else {}
+            last = history[-1] if isinstance(history[-1], Mapping) else {}
+            initial_teacher_kl = float(first.get("online_teacher_kl", float("inf")))
+            final_teacher_kl = float(last.get("online_teacher_kl", float("inf")))
+            initial_entropy = float(first.get("entropy", 0.0))
+            final_entropy = float(last.get("entropy", float("inf")))
+            stability_checks = {
+                "teacher_kl": final_teacher_kl <= initial_teacher_kl + 0.01,
+                "entropy": final_entropy <= initial_entropy * 1.10 + 1e-12,
+            }
+            report["training_stability"] = {
+                "checks": stability_checks,
+                "initial_teacher_kl": initial_teacher_kl,
+                "final_teacher_kl": final_teacher_kl,
+                "initial_entropy": initial_entropy,
+                "final_entropy": final_entropy,
+            }
+            report["passes"] = bool(report["passes"]) and all(stability_checks.values())
         advancement_reports[result.candidate_id] = report
         return report
 
@@ -2619,6 +2880,16 @@ def main(
             "created_at": time.time(),
             "git_revision": git_revision(repository),
             "arguments": vars(args),
+            "training_contract": {
+                "decoder_schema": "joint_sequential_v2",
+                "inference_augmentation": "rot180",
+                "budget_unit": args.budget_unit,
+                "teacher_checkpoint_sha256": (
+                    _sha256_file(Path(args.teacher_checkpoint))
+                    if not args.dry_run and Path(args.teacher_checkpoint).exists()
+                    else None
+                ),
+            },
             "device": str(device),
             "rollout_runtime": {
                 "backend_requested": args.rollout_backend,
@@ -2659,6 +2930,9 @@ def main(
                 _fixed_candidate_descriptor(path) for path in fixed_candidate_paths
             ],
         }
+        manifest["training_contract_hash"] = hashlib.sha256(
+            json.dumps(manifest["training_contract"], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
         store.save_manifest(manifest)
     else:
         manifest = existing_manifest
@@ -2907,7 +3181,7 @@ def main(
             args.short_seconds,
             args.screening_seeds,
             args.screening_seed_start,
-            1 if args.short_seconds <= 0 else args.short_decisions,
+            1 if args.short_seconds <= 0 else _stage_budget(args, "short-resattn8"),
         )
 
     island_parents: dict[int, EvolutionCandidate] = {}
@@ -3090,7 +3364,7 @@ def main(
                         args.short_seconds,
                         args.screening_seeds,
                         args.screening_seed_start + 50_000 + generation * 100,
-                        args.short_decisions,
+                        _stage_budget(args, "probe-unet"),
                     )
                 ]
                 generation_progress = jobs_are_pending(probe_jobs) or generation_progress
@@ -3154,7 +3428,7 @@ def main(
             max(0, args.medium_seconds - args.short_seconds),
             args.medium_seeds,
             args.screening_seed_start + 10_000,
-            args.medium_decisions,
+            _stage_budget(args, "medium-resattn8"),
         )
         for candidate in medium
     ]
@@ -3216,7 +3490,7 @@ def main(
             args.final_seconds,
             args.final_seeds,
             args.final_seed_start,
-            args.final_decisions,
+            _stage_budget(args, f"final-{base_name}"),
         )
         for candidate in finalists
         for base_name in _active_base_names(args)

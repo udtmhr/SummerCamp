@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from torch.nn import functional as nn_functional
 
@@ -37,6 +38,7 @@ from luxai2021.imitation.masking import (
     LEGAL_MASK_SUFFIX,
     apply_legal_action_mask,
     city_legal_mask,
+    monotonically_tighten_legal_mask,
     unit_legal_masks,
 )
 from luxai2021.imitation.model import POLICY_SCHEMA_FIRST_PLACE_FLAT, load_bc_checkpoint
@@ -73,6 +75,22 @@ class _Choice:
     transfer_amount: int = 0
 
 
+@dataclass
+class _JointDecision:
+    entity: str
+    position: tuple[int, int]
+    action: int
+    legal_mask: torch.Tensor
+    priority_legal_mask: torch.Tensor
+    log_prob: float
+    entropy: float
+    identity: str
+    priority_group: str
+    priority_index: int
+    priority_log_prob: float
+    teacher_logits: torch.Tensor | None = None
+
+
 class BehaviorCloningAgent(Agent):
     def __init__(self, checkpoint_path: str, device: str = "auto", tta: str = "auto") -> None:
         super().__init__()
@@ -90,6 +108,224 @@ class BehaviorCloningAgent(Agent):
 
     def _uses_first_place_actions(self) -> bool:
         return self.model.config.policy_schema == POLICY_SCHEMA_FIRST_PLACE_FLAT
+
+    def _uses_joint_sequential_decoder(self) -> bool:
+        return self.checkpoint.get("decoder_schema") == "joint_sequential_v2"
+
+    def _joint_action_index(self, probabilities: torch.Tensor) -> int:
+        return int(probabilities.argmax())
+
+    def _joint_priority_order(self, entries: list[dict[str, object]]) -> list[tuple[dict[str, object], float]]:
+        ordered = sorted(entries, key=lambda item: (-float(item["margin"]), str(item["identity"])))
+        return [(entry, 0.0) for entry in ordered]
+
+    @staticmethod
+    def _joint_action_statistics(
+        logits: torch.Tensor,
+        legal_mask: np.ndarray | torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mask = torch.as_tensor(legal_mask, dtype=torch.bool, device=logits.device)
+        masked = apply_legal_action_mask(logits[None], mask[None])[0].float()
+        log_probabilities = torch.log_softmax(masked, dim=-1)
+        probabilities = torch.softmax(masked, dim=-1)
+        entropy = -(probabilities * log_probabilities).sum()
+        return log_probabilities, probabilities, entropy
+
+    @classmethod
+    def _joint_margin(cls, logits: torch.Tensor, legal_mask: np.ndarray | torch.Tensor) -> float:
+        _, probabilities, _ = cls._joint_action_statistics(logits, legal_mask)
+        legal_count = int(torch.as_tensor(legal_mask).sum())
+        if legal_count <= 1:
+            return 20.0
+        top = torch.topk(probabilities, 2).values
+        return float(top[0] - top[1])
+
+    def _decode_joint_sequential(  # noqa: PLR0915
+        self,
+        game: object,
+        team: int,
+        snapshot: BoardSnapshot,
+        output: dict[str, torch.Tensor],
+        x_offset: int,
+        y_offset: int,
+        *,
+        teacher_output: dict[str, torch.Tensor] | None = None,
+    ) -> tuple[list[_Choice], list[object], list[_JointDecision]]:
+        """Decode one Lux turn and return the exact commands whose probabilities were recorded."""
+        if not self._uses_first_place_actions():
+            raise ValueError("joint_sequential_v2 requires first_place_flat_v1")
+        unit_entries: list[dict[str, object]] = []
+        for unit in game.state["teamStates"][team]["units"].values():
+            if not unit.can_act():
+                continue
+            entity = "worker" if unit.is_worker() else "cart"
+            y, x = unit.pos.y + y_offset, unit.pos.x + x_offset
+            base_legal = first_place_unit_legal_mask(snapshot, snapshot.units[unit.id])
+            logits = output[entity][0, :, y, x]
+            unit_entries.append(
+                {
+                    "identity": unit.id,
+                    "unit": unit,
+                    "entity": entity,
+                    "position": (y, x),
+                    "base_legal": base_legal,
+                    "margin": self._joint_margin(logits, base_legal),
+                }
+            )
+
+        reserved_destinations: set[tuple[int, int]] = set()
+        reserved_capacity: dict[str, int] = {}
+        choices: list[_Choice] = []
+        decisions: list[_JointDecision] = []
+        for priority_index, (entry, priority_log_prob) in enumerate(self._joint_priority_order(unit_entries)):
+            unit = entry["unit"]
+            entity = str(entry["entity"])
+            y, x = entry["position"]
+            base_legal = np.asarray(entry["base_legal"], dtype=bool)
+            action_names = FIRST_PLACE_ACTION_SCHEMA[entity]
+            additional_allow = np.ones_like(base_legal)
+            for index, action_name in enumerate(action_names):
+                if not base_legal[index]:
+                    continue
+                if action_name.startswith("move_"):
+                    dx, dy = _DIRECTION_DELTAS[action_name[-1]]
+                    destination = (unit.pos.x + dx, unit.pos.y + dy)
+                    if not game.map.get_cell(*destination).is_city_tile() and destination in reserved_destinations:
+                        additional_allow[index] = False
+                elif action_name.startswith("transfer_"):
+                    _, _, direction = action_name.split("_")
+                    if not self._transfer_targets(game, unit, direction, reserved_capacity):
+                        additional_allow[index] = False
+            legal = monotonically_tighten_legal_mask(base_legal, additional_allow)
+            logits = output[entity][0, :, y, x]
+            log_probabilities, probabilities, entropy = self._joint_action_statistics(logits, legal)
+            action_index = self._joint_action_index(probabilities)
+            action_name = action_names[action_index]
+            selected_log_probability = float(log_probabilities[action_index])
+            candidate = _Candidate("stay", selected_log_probability)
+            destination = None
+            transfer_target = None
+            transfer_amount = 0
+            if action_name.startswith("move_"):
+                direction = action_name[-1]
+                dx, dy = _DIRECTION_DELTAS[direction]
+                destination = (unit.pos.x + dx, unit.pos.y + dy)
+                candidate = _Candidate("move", selected_log_probability, direction)
+                if not game.map.get_cell(*destination).is_city_tile():
+                    reserved_destinations.add(destination)
+            elif action_name.startswith("transfer_"):
+                _, resource, direction = action_name.split("_")
+                targets = self._transfer_targets(game, unit, direction, reserved_capacity)
+                targets.sort(
+                    key=lambda target: (
+                        target.get_cargo_space_left() - reserved_capacity.get(target.id, 0),
+                        int(target.is_cart()),
+                        target.id,
+                    ),
+                    reverse=True,
+                )
+                if targets:
+                    transfer_target = targets[0]
+                    available = transfer_target.get_cargo_space_left() - reserved_capacity.get(transfer_target.id, 0)
+                    transfer_amount = min(unit.cargo[resource], available)
+                    reserved_capacity[transfer_target.id] = (
+                        reserved_capacity.get(transfer_target.id, 0) + transfer_amount
+                    )
+                    candidate = _Candidate("transfer", selected_log_probability, direction, resource)
+            elif action_name in {"build_city", "pillage"}:
+                candidate = _Candidate(action_name, selected_log_probability)
+            choices.append(_Choice(unit, candidate, destination, transfer_target, transfer_amount))
+            decisions.append(
+                _JointDecision(
+                    entity=entity,
+                    position=(y, x),
+                    action=action_index,
+                    legal_mask=torch.from_numpy(legal.copy()),
+                    priority_legal_mask=torch.from_numpy(base_legal.copy()),
+                    log_prob=selected_log_probability,
+                    entropy=float(entropy),
+                    identity=unit.id,
+                    priority_group="unit",
+                    priority_index=priority_index,
+                    priority_log_prob=priority_log_prob,
+                    teacher_logits=(
+                        teacher_output[entity][0, :, unit.pos.y, unit.pos.x].detach().cpu()
+                        if teacher_output is not None
+                        else None
+                    ),
+                )
+            )
+
+        available_units = sum(len(city.city_cells) for city in game.cities.values() if city.team == team) - len(
+            game.state["teamStates"][team]["units"]
+        )
+        available_research = max(0, _MAX_RESEARCH - snapshot.research_points[team])
+        base_city_legal = first_place_city_legal_mask(snapshot, team).copy()
+        # The distilled flat schema intentionally never emits carts.
+        base_city_legal[CITY_ACTIONS.index("build_cart")] = False
+        city_entries: list[dict[str, object]] = []
+        for city in game.cities.values():
+            if city.team != team:
+                continue
+            for cell in city.city_cells:
+                tile = cell.city_tile
+                if not tile.can_act():
+                    continue
+                y, x = tile.pos.y + y_offset, tile.pos.x + x_offset
+                logits = output["city_tile"][0, :, y, x]
+                city_entries.append(
+                    {
+                        "identity": tile.get_tile_id(),
+                        "tile": tile,
+                        "position": (y, x),
+                        "base_legal": base_city_legal.copy(),
+                        "margin": self._joint_margin(logits, base_city_legal),
+                    }
+                )
+        city_actions: list[object] = []
+        for priority_index, (entry, priority_log_prob) in enumerate(self._joint_priority_order(city_entries)):
+            tile = entry["tile"]
+            y, x = entry["position"]
+            base_legal = np.asarray(entry["base_legal"], dtype=bool)
+            additional_allow = np.ones_like(base_legal)
+            if available_units <= 0:
+                additional_allow[1:3] = False
+            if available_research <= 0:
+                additional_allow[3] = False
+            if snapshot.turn >= CYCLE_LENGTH and available_research > 0:
+                additional_allow[0] = False
+            legal = monotonically_tighten_legal_mask(base_legal, additional_allow)
+            logits = output["city_tile"][0, :, y, x]
+            log_probabilities, probabilities, entropy = self._joint_action_statistics(logits, legal)
+            action_index = self._joint_action_index(probabilities)
+            action_name = CITY_ACTIONS[action_index]
+            if action_name == "build_worker":
+                city_actions.append(SpawnWorkerAction(team, None, tile.pos.x, tile.pos.y))
+                available_units -= 1
+            elif action_name == "research":
+                city_actions.append(ResearchAction(team, tile.pos.x, tile.pos.y, None))
+                available_research -= 1
+            decisions.append(
+                _JointDecision(
+                    entity="city_tile",
+                    position=(y, x),
+                    action=action_index,
+                    legal_mask=torch.from_numpy(legal.copy()),
+                    priority_legal_mask=torch.from_numpy(base_legal.copy()),
+                    log_prob=float(log_probabilities[action_index]),
+                    entropy=float(entropy),
+                    identity=str(entry["identity"]),
+                    priority_group="city",
+                    priority_index=priority_index,
+                    priority_log_prob=priority_log_prob,
+                    teacher_logits=(
+                        teacher_output["city_tile"][0, :, tile.pos.y, tile.pos.x].detach().cpu()
+                        if teacher_output is not None
+                        else None
+                    ),
+                )
+            )
+        return choices, city_actions, decisions
 
     def _restore_rot180(self, output: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         restored = {}
@@ -472,6 +708,11 @@ class BehaviorCloningAgent(Agent):
         with torch.inference_mode():
             output = self._predict(observation)
         x_offset, y_offset = snapshot.padding
+        if self._uses_joint_sequential_decoder():
+            unit_choices, city_actions, _ = self._decode_joint_sequential(
+                game, team, snapshot, output, x_offset, y_offset
+            )
+            return [*self._choices_to_actions(unit_choices, team), *city_actions]
         unit_choices = self._choose_units(game, team, snapshot, output, x_offset, y_offset)
         actions = self._choices_to_actions(unit_choices, team)
         actions.extend(self._city_actions(game, team, snapshot, output, x_offset, y_offset))

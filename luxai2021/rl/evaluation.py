@@ -108,7 +108,7 @@ class TimedAgent(Agent):
 def create_league_agent(member: LeagueMember, device: str) -> BehaviorCloningAgent:
     if member.model_type == "first-place":
         return FirstPlaceAgent(str(member.checkpoint), device=device, tta="rot180")
-    return BehaviorCloningAgent(str(member.checkpoint), device=device, tta="auto")
+    return BehaviorCloningAgent(str(member.checkpoint), device=device, tta="rot180")
 
 
 def evaluate_against_league(

@@ -332,17 +332,25 @@ class ActorCriticBatcher:
         precision: str = "auto",
         compile_mode: str = "off",
         pad_batches: bool = False,
+        tta: str = "rot180",
     ) -> None:
+        if tta not in {"none", "rot180"}:
+            message = f"Unsupported actor-critic TTA: {tta}"
+            raise ValueError(message)
         self.actor_critic = actor_critic
         self.device = device
+        self.tta = tta
         self.precision, self.autocast_dtype = resolve_rollout_precision(precision, device)
         self.stager = _ObservationStager(device, max_batch_size, pad_batches=pad_batches)
+        effective_compile_mode = compile_mode if tta == "none" else "off"
         self.inference_model = _CompiledInference(
             actor_critic,
             device,
-            compile_mode,
+            effective_compile_mode,
             auto_eligible=pad_batches,
         )
+        self.compile_requested = compile_mode
+        self.compile_fallback_reason = "compile_requires_tta_none" if tta != "none" and compile_mode != "off" else None
         self.stage_seconds = {"host_stage_and_h2d_submit": 0.0, "forward": 0.0, "device_to_host": 0.0}
 
         def infer(observations: list[Tensor]) -> list[tuple[dict[str, Tensor], Tensor]]:
@@ -359,7 +367,9 @@ class ActorCriticBatcher:
                     enabled=autocast_enabled,
                 ),
             ):
-                output, values = self.inference_model(batch)
+                output, values = (
+                    self.inference_model(batch) if tta == "none" else actor_critic.forward_tta(batch)
+                )
             self.stage_seconds["forward"] += time.perf_counter() - forward_started
             copy_started = time.perf_counter()
             cpu_output = _cpu_output_batch(output)
@@ -389,9 +399,9 @@ class ActorCriticBatcher:
         metrics.update(
             {
                 "precision": self.precision,
-                "compile_requested": self.inference_model.requested,
+                "compile_requested": self.compile_requested,
                 "compile_effective": self.inference_model.effective,
-                "compile_fallback_reason": self.inference_model.fallback_reason,
+                "compile_fallback_reason": self.compile_fallback_reason or self.inference_model.fallback_reason,
                 "compile_error_detail": self.inference_model.error_detail,
                 "compile_attempts": self.inference_model.compile_attempts,
                 "compile_seconds": self.inference_model.compile_seconds,
@@ -583,6 +593,10 @@ class FirstPlaceBatcher:
 
         self_outer = self
         return BrokeredFirstPlaceAgent()
+
+    def submit_team(self, snapshot: object, team: int) -> dict[str, Tensor]:
+        output = self.batcher.submit(snapshot)
+        return FirstPlaceAgent._select_team_output(output, team)  # noqa: SLF001
 
     def batch_scope(self, participants: int):
         return self.batcher.batch_scope(participants)

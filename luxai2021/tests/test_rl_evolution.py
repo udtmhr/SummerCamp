@@ -24,6 +24,7 @@ from examples.evolve_rl import (
     _checkpoint_descriptors,
     _checkpoint_pair,
     _curriculum_start_decisions,
+    _curriculum_start_games,
     _evaluation_anchors,
     _final_training_metrics,
     _fixed_candidate_paths,
@@ -37,7 +38,9 @@ from examples.evolve_rl import (
     _record_skipped_job,
     _save_candidate_provenance,
     _save_stage_inheritance_checkpoint,
+    _select_completed_stage,
     _select_teacher_milestone,
+    _stage_budget,
     _stage_checkpoint_sources,
     _sync_api_claim,
     _validate_candidate_provenance,
@@ -52,6 +55,7 @@ from luxai2021.game.game import Game
 from luxai2021.game.game_constants import GAME_CONSTANTS
 from luxai2021.game.match_controller import MatchController
 from luxai2021.game.position import Position
+from luxai2021.imitation.agent import BehaviorCloningAgent
 from luxai2021.imitation.masking import monotonically_tighten_legal_mask
 from luxai2021.imitation.model import (
     POLICY_SCHEMA_FIRST_PLACE_FLAT,
@@ -59,6 +63,7 @@ from luxai2021.imitation.model import (
     ModelConfig,
     load_bc_checkpoint,
 )
+from luxai2021.imitation.schema import FEATURE_INDEX
 from luxai2021.rl.batched_rollout import ActorCriticBatcher, InferenceBatcher, _CompiledInference
 from luxai2021.rl.evaluation import (
     _survival_summary,
@@ -606,6 +611,26 @@ def test_discounted_terminal_outcome_dominates_extreme_potential_shaping(horizon
     assert discounted_total(low, high, -1.0) < 0.0
 
 
+@pytest.mark.parametrize("horizon", [1, 360])
+def test_v3_terminal_zero_potential_telescopes_to_initial_potential(horizon):
+    program = default_reward_program()
+    states = [_metrics(city_tiles=(-1.0 if step % 2 else 1.0)) for step in range(horizon + 1)]
+    initial_potential = program.potential(states[0])[0]
+    discounted_shaping = 0.0
+    for step in range(horizon):
+        breakdown = program.reward(
+            states[step],
+            states[step + 1],
+            terminal_outcome=0.0,
+            terminal=step + 1 == horizon,
+        )
+        discounted_shaping += (program.gamma**step) * breakdown.shaping
+    assert discounted_shaping == pytest.approx(
+        -program.reward_scale * initial_potential / program.terminal_reward_scale,
+        abs=1e-6,
+    )
+
+
 def test_sparse_component_is_not_used_for_inverse_rms_calibration():
     parent = default_reward_program()
     value = parent.to_dict()
@@ -1093,7 +1118,7 @@ def test_dense_shaping_curriculum_maintains_shaping_and_decays_bc():
     assert curriculum.bc_coefficient_multiplier(1.0) == pytest.approx(0.2)
 
     mixes = [curriculum.opponent_mix(proposed, progress) for progress in (0.0, 0.5, 1.0)]
-    assert all(mix.teacher == pytest.approx(0.20) for mix in mixes)  # max(proposed.teacher 0.20, floor 0.10)
+    assert all(mix.teacher == pytest.approx(0.25) for mix in mixes)
     assert all(sum(vars(mix).values()) == pytest.approx(1.0) for mix in mixes)
 
 
@@ -1105,6 +1130,22 @@ def test_curriculum_stage_offsets_keep_final_phase_after_cross_stage_resume():
     assert _curriculum_start_decisions("medium-resattn8", args) == 100
     assert _curriculum_start_decisions("final-resattn8", args) == 400
     assert _curriculum_start_decisions("final-unet", args) == 400
+
+
+def test_game_budget_stage_offsets_and_budgets():
+    args = SimpleNamespace(
+        budget_unit="games",
+        short_games=384,
+        medium_games=1536,
+        final_games=6144,
+    )
+
+    assert _curriculum_start_games("short-resattn8", args) == 0
+    assert _curriculum_start_games("medium-resattn8", args) == 384
+    assert _curriculum_start_games("final-resattn8", args) == 1920
+    assert _stage_budget(args, "short-resattn8") == 384
+    assert _stage_budget(args, "medium-resattn8") == 1536
+    assert _stage_budget(args, "final-resattn8") == 6144
 
 
 def test_stage_checkpoint_sources_separate_inference_inheritance_from_exact_resume(tmp_path):
@@ -1589,6 +1630,8 @@ def test_short_full_turn_ppo_smoke_updates_finite_parameters(tmp_path):
     assert "kl" in metrics
     assert "reference_kl" in metrics
     assert "approx_kl" in metrics
+    assert abs(metrics["approx_kl"]) <= 1e-6
+    assert metrics["joint_clip_fraction"] == pytest.approx(0.0)
     assert "parameter_constraint_loss" not in metrics
     assert "parameter_constraint_coefficient" not in metrics
     checkpoint_path = tmp_path / "latest_rl.pt"
@@ -1639,6 +1682,7 @@ def test_ppo_logs_approximate_kl_before_early_stopping():
     for record in episode.records:
         for decision in record.decisions:
             decision.old_log_prob += 0.5
+        record.old_joint_log_prob += 0.5 * len(record.decisions)
     trainer = PPOTrainer(
         actor,
         PPOConfig(update_epochs=2, minibatch_turns=4, bc_coefficient=0.0, target_kl=1e-6),
@@ -1650,6 +1694,33 @@ def test_ppo_logs_approximate_kl_before_early_stopping():
     assert metrics["approx_kl"] > 0.0
     assert metrics["early_stopped"] == 1.0
     assert metrics["epochs_completed"] == 1.0
+
+
+def test_online_teacher_kl_calibrates_once_and_stays_in_bounds():
+    actor = FullTurnActorCritic(_small_policy())
+    snapshot = copy.deepcopy(actor).eval()
+    episode = collect_episode(
+        actor,
+        lambda: RolloutAgent(snapshot, device="cpu", deterministic=True),
+        default_reward_program(),
+        device=torch.device("cpu"),
+        seed=37,
+        opponent_name="small",
+        max_turns=4,
+    )
+    for record in episode.records:
+        for decision in record.decisions:
+            decision.teacher_logits = torch.zeros(len(decision.legal_mask))
+    config = PPOConfig(update_epochs=1, minibatch_turns=4, bc_coefficient=0.0)
+    trainer = PPOTrainer(actor, config, torch.device("cpu"))
+
+    metrics = trainer.update([episode], record_grad_norms=True)
+    calibrated = trainer.effective_teacher_kl_coefficient
+
+    assert calibrated is not None
+    assert config.teacher_kl_coefficient_min <= calibrated <= config.teacher_kl_coefficient_max
+    assert torch.isfinite(torch.tensor(metrics["online_teacher_kl"]))
+    assert metrics["grad_norm_samples"] == 1.0
 
 
 def test_parent_kl_and_parameter_constraint_are_absent_from_trainer():
@@ -1733,14 +1804,14 @@ def test_training_checkpoint_v2_restores_budget_progress_and_legacy_estimate(tmp
     legacy["metrics"] = {"elapsed_seconds": 50.0}
     legacy_path = tmp_path / "legacy_rl.pt"
     torch.save(legacy, legacy_path)
-    restored_legacy = trainer.load_training_state(
-        legacy_path,
-        source_checkpoint="base.pt",
-        reward_program=default_reward_program(),
-        legacy_target_decisions=1000,
-        legacy_stage_seconds=100,
-    )
-    assert restored_legacy.cumulative_decisions == 500
+    with pytest.raises(ValueError, match="cannot resume optimizer state"):
+        trainer.load_training_state(
+            legacy_path,
+            source_checkpoint="base.pt",
+            reward_program=default_reward_program(),
+            legacy_target_decisions=1000,
+            legacy_stage_seconds=100,
+        )
 
 
 def test_training_checkpoint_can_resume_compatible_weights_from_an_older_base_path(tmp_path):
@@ -1779,6 +1850,39 @@ def test_training_checkpoint_can_resume_compatible_weights_from_an_older_base_pa
             source_checkpoint_sha256="new-sha256",
             reward_program=default_reward_program(),
             allow_compatible_source_checkpoint=True,
+        )
+
+
+def test_training_checkpoint_rejects_mixed_budget_units_and_restores_teacher_coefficient(tmp_path):
+    actor = FullTurnActorCritic(_small_policy())
+    trainer = PPOTrainer(actor, PPOConfig(), torch.device("cpu"))
+    trainer.effective_teacher_kl_coefficient = 0.0125
+    checkpoint_path = tmp_path / "latest_rl.pt"
+    trainer.save_training_checkpoint(
+        checkpoint_path,
+        source_checkpoint="base.pt",
+        reward_program=default_reward_program(),
+        update=0,
+        metrics={},
+        training_state={"budget_unit": "games", "curriculum_progress_games": 64},
+    )
+
+    resumed = PPOTrainer(FullTurnActorCritic(_small_policy()), PPOConfig(), torch.device("cpu"))
+    state = resumed.load_training_state(
+        checkpoint_path,
+        source_checkpoint="base.pt",
+        reward_program=default_reward_program(),
+        budget_unit="games",
+    )
+
+    assert state.curriculum_progress_games == 64
+    assert resumed.effective_teacher_kl_coefficient == pytest.approx(0.0125)
+    with pytest.raises(ValueError, match="Cannot mix game and decision budgets"):
+        resumed.load_training_state(
+            checkpoint_path,
+            source_checkpoint="base.pt",
+            reward_program=default_reward_program(),
+            budget_unit="decisions",
         )
 
 
@@ -1895,6 +1999,29 @@ def test_rollout_action_statistics_match_categorical_reference():
     assert torch.equal(log_probabilities, reference.logits)
     assert torch.equal(probabilities, reference.probs)
     assert torch.equal(entropy, reference.entropy())
+
+
+def test_sampled_plackett_luce_priority_log_probability_matches_manual_sum():
+    agent = RolloutAgent(FullTurnActorCritic(_small_policy()), device="cpu")
+    agent.generator.manual_seed(123)
+    entries = [
+        {"identity": "a", "margin": 0.2},
+        {"identity": "b", "margin": 0.8},
+        {"identity": "c", "margin": -0.1},
+    ]
+
+    ordered = agent._joint_priority_order(entries)
+    remaining = list(entries)
+    manual = 0.0
+    for selected, _ in ordered:
+        margins = torch.tensor([float(entry["margin"]) for entry in remaining])
+        selected_index = next(
+            index for index, entry in enumerate(remaining) if entry["identity"] == selected["identity"]
+        )
+        manual += float(torch.log_softmax(margins, dim=0)[selected_index])
+        remaining.pop(selected_index)
+
+    assert sum(log_probability for _, log_probability in ordered) == pytest.approx(manual)
 
 
 def test_lockstep_inference_drops_finished_participants_without_partial_batches():
@@ -2083,6 +2210,40 @@ def test_short_selection_excludes_candidates_that_fail_the_advancement_gate(tmp_
     assert report["advancement_reports"][failing_candidate.candidate_id]["passes"] is False
 
 
+def test_short_game_budget_selection_enforces_teacher_kl_and_entropy_guards():
+    candidate = initial_candidate(island=0, seed=43)
+    baseline = _guarded_evaluation(0.0)
+    result = CandidateResult(
+        candidate.candidate_id,
+        "short-resattn8",
+        "completed",
+        0.5,
+        0.5,
+        0.0,
+        1.0,
+        {
+            "evaluation": baseline,
+            "training": {
+                "budget_unit": "games",
+                "history": [
+                    {"online_teacher_kl": 0.02, "entropy": 0.10},
+                    {"online_teacher_kl": 0.031, "entropy": 0.10},
+                ],
+            },
+        },
+    )
+
+    selected = _select_completed_stage(
+        {candidate.candidate_id: candidate},
+        [result],
+        stage="short-resattn8",
+        count=1,
+        baseline=baseline,
+    )
+
+    assert selected == []
+
+
 def test_paired_acceptance_requires_positive_both_architectures():
     baseline = _league_evaluation([-1.0, 0.0, 0.0])
     improved = _league_evaluation([0.0, 1.0, 1.0])
@@ -2198,6 +2359,41 @@ def test_rollout_mask_does_not_inspect_offboard_actions():
     agent.process_turn(game, 0)
 
     assert agent.records
+
+
+def test_joint_decoder_deterministic_rollout_matches_exported_evaluation_agent(tmp_path):
+    actor = FullTurnActorCritic(_small_policy()).eval()
+    checkpoint = tmp_path / "joint.pt"
+    actor.export_policy(checkpoint, epoch=0, metrics={}, split={}, metadata={})
+    game = Game({"seed": 23})
+    rollout = RolloutAgent(actor, device="cpu", deterministic=True)
+    rollout.set_team(0)
+    rollout.game_start(game)
+    evaluation = BehaviorCloningAgent(str(checkpoint), device="cpu", tta="auto")
+    evaluation.set_team(0)
+
+    rollout_actions = [action.to_message(game) for action in rollout.process_turn(game, 0)]
+    evaluation_actions = [action.to_message(game) for action in evaluation.process_turn(game, 0)]
+
+    assert rollout_actions == evaluation_actions
+    saved = torch.load(checkpoint, weights_only=False)
+    assert saved["decoder_schema"] == "joint_sequential_v2"
+    assert saved["inference_augmentation"] == "rot180"
+
+
+def test_actor_critic_rot180_tta_is_equivariant():
+    actor = FullTurnActorCritic(_small_policy()).eval()
+    observation = torch.randn(1, actor.policy.config.input_channels, 32, 32)
+    rotated = torch.rot90(observation, 2, dims=(-2, -1)).clone()
+    rotated[:, FEATURE_INDEX["x_coordinate"]].neg_()
+    rotated[:, FEATURE_INDEX["y_coordinate"]].neg_()
+
+    output, value = actor.forward_tta(observation)
+    rotated_output, rotated_value = actor.forward_tta(rotated)
+    restored = actor._restore_rot180(rotated_output)
+
+    assert torch.allclose(value, rotated_value, atol=1e-6, rtol=1e-6)
+    assert all(torch.allclose(output[name], restored[name], atol=1e-6, rtol=1e-6) for name in output)
 
 
 def test_engine_records_night_city_loss_and_invalid_action_turns():

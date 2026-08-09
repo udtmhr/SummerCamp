@@ -12,7 +12,7 @@ from torch import Tensor, nn
 
 from luxai2021.env.agent import Agent
 from luxai2021.game.actions import ResearchAction, SpawnCartAction, SpawnWorkerAction
-from luxai2021.imitation.actions import CITY_ACTIONS, FIRST_PLACE_ACTION_SCHEMA
+from luxai2021.imitation.actions import CITY_ACTIONS, FIRST_PLACE_ACTION_SCHEMA, first_place_action_remap
 from luxai2021.imitation.agent import BehaviorCloningAgent, _Candidate, _Choice
 from luxai2021.imitation.first_place import first_place_city_legal_mask, first_place_unit_legal_mask
 from luxai2021.imitation.masking import apply_legal_action_mask, monotonically_tighten_legal_mask
@@ -22,7 +22,7 @@ from luxai2021.imitation.model import (
     load_bc_checkpoint,
     save_bc_checkpoint,
 )
-from luxai2021.imitation.schema import encode_snapshot, snapshot_from_game
+from luxai2021.imitation.schema import FEATURE_INDEX, encode_snapshot, snapshot_from_game
 from luxai2021.rl.metrics import GameMetrics, metrics_from_game
 
 if TYPE_CHECKING:
@@ -38,6 +38,11 @@ class ActionDecision:
     old_log_prob: float
     entropy: float
     identity: str
+    priority_legal_mask: Tensor | None = None
+    priority_group: str = ""
+    priority_index: int = 0
+    priority_log_prob: float = 0.0
+    teacher_logits: Tensor | None = None
 
 
 @dataclass
@@ -51,6 +56,7 @@ class TurnRecord:
     return_value: float = 0.0
     reward_components: dict[str, float] = field(default_factory=dict)
     reward_component_shaping: dict[str, float] = field(default_factory=dict)
+    old_joint_log_prob: float = 0.0
 
 
 @dataclass
@@ -93,6 +99,27 @@ class FullTurnActorCritic(nn.Module):
         output.pop("features")
         return output, self.value_head(global_features).squeeze(-1)
 
+    @staticmethod
+    def _restore_rot180(output: dict[str, Tensor]) -> dict[str, Tensor]:
+        restored = {}
+        for name, source_logits in output.items():
+            restored_logits = torch.rot90(source_logits, 2, dims=(-2, -1))
+            remap = first_place_action_remap(name, 2)
+            restored[name] = restored_logits[:, [remap[index] for index in range(len(remap))]]
+        return restored
+
+    def forward_tta(self, observation: Tensor) -> tuple[dict[str, Tensor], Tensor]:
+        """Average policy logits and value over identity and restored 180-degree views."""
+        batch_size = observation.shape[0]
+        rotated = torch.rot90(observation, 2, dims=(-2, -1)).clone()
+        rotated[:, FEATURE_INDEX["x_coordinate"]].neg_()
+        rotated[:, FEATURE_INDEX["y_coordinate"]].neg_()
+        paired_output, paired_value = self.forward(torch.cat((observation, rotated), dim=0))
+        restored = self._restore_rot180({name: logits[batch_size:] for name, logits in paired_output.items()})
+        output = {name: (logits[:batch_size] + restored[name]) * 0.5 for name, logits in paired_output.items()}
+        value = (paired_value[:batch_size] + paired_value[batch_size:]) * 0.5
+        return output, value
+
     def export_policy(
         self,
         path: Path,
@@ -109,7 +136,11 @@ class FullTurnActorCritic(nn.Module):
             epoch,
             metrics,
             split,
-            extra_metadata={"inference_augmentation": "rot180", "rl_training": dict(metadata)},
+            extra_metadata={
+                "inference_augmentation": "rot180",
+                "decoder_schema": "joint_sequential_v2",
+                "rl_training": dict(metadata),
+            },
         )
 
 
@@ -133,6 +164,7 @@ class RolloutAgent(BehaviorCloningAgent):
         device: str | torch.device,
         deterministic: bool = False,
         inference_backend: Callable[[Tensor], tuple[dict[str, Tensor], Tensor]] | None = None,
+        teacher_inference_backend: Callable[[object, int], dict[str, Tensor]] | None = None,
         record_trajectory: bool = True,
     ) -> None:
         Agent.__init__(self)
@@ -141,9 +173,13 @@ class RolloutAgent(BehaviorCloningAgent):
         self.device = torch.device(device)
         self.deterministic = deterministic
         self.inference_backend = inference_backend
+        self.teacher_inference_backend = teacher_inference_backend
         self.record_trajectory = record_trajectory
-        self.checkpoint = {"inference_augmentation": "none"}
-        self.tta = "none"
+        self.checkpoint = {
+            "inference_augmentation": "rot180",
+            "decoder_schema": "joint_sequential_v2",
+        }
+        self.tta = "rot180"
         self.records: list[TurnRecord] = []
         self.generator = torch.Generator(device="cpu")
         self.timing_seconds: dict[str, float] = {}
@@ -164,6 +200,22 @@ class RolloutAgent(BehaviorCloningAgent):
         if self.deterministic:
             return probabilities.argmax()
         return torch.multinomial(probabilities.cpu(), 1, generator=self.generator).squeeze(0)
+
+    def _joint_action_index(self, probabilities: Tensor) -> int:
+        return int(self._choose_action(probabilities))
+
+    def _joint_priority_order(self, entries: list[dict[str, object]]) -> list[tuple[dict[str, object], float]]:
+        if self.deterministic:
+            return super()._joint_priority_order(entries)
+        remaining = list(entries)
+        ordered: list[tuple[dict[str, object], float]] = []
+        while remaining:
+            margins = torch.tensor([float(entry["margin"]) for entry in remaining], dtype=torch.float32)
+            log_probabilities = torch.log_softmax(margins, dim=0)
+            probabilities = torch.softmax(margins, dim=0)
+            selected = int(torch.multinomial(probabilities, 1, generator=self.generator))
+            ordered.append((remaining.pop(selected), float(log_probabilities[selected])))
+        return ordered
 
     def _sample_units(
         self,
@@ -339,28 +391,41 @@ class RolloutAgent(BehaviorCloningAgent):
         if self.inference_backend is None:
             observation = observation_cpu[None].to(self.device)
             with torch.inference_mode():
-                output, value = self.actor_critic(observation)
+                output, value = self.actor_critic.forward_tta(observation)
         else:
             output, value = self.inference_backend(observation_cpu)
+        teacher_output = None
+        if self.teacher_inference_backend is not None:
+            teacher_output = self.teacher_inference_backend(snapshot, team)
         self.timing_seconds["inference_wait"] += perf_counter() - inference_started
         decode_started = perf_counter()
         x_offset, y_offset = snapshot.padding
-        unit_choices, unit_decisions = self._sample_units(
+        unit_choices, city_actions, joint_decisions = self._decode_joint_sequential(
             game,
             team,
             snapshot,
             output,
             x_offset,
             y_offset,
+            teacher_output=teacher_output,
         )
-        city_actions, city_decisions = self._sample_cities(
-            game,
-            team,
-            snapshot,
-            output,
-            x_offset,
-            y_offset,
-        )
+        decisions = [
+            ActionDecision(
+                entity=decision.entity,
+                position=decision.position,
+                action=decision.action,
+                legal_mask=decision.legal_mask,
+                old_log_prob=decision.log_prob,
+                entropy=decision.entropy,
+                identity=decision.identity,
+                priority_legal_mask=decision.priority_legal_mask,
+                priority_group=decision.priority_group,
+                priority_index=decision.priority_index,
+                priority_log_prob=decision.priority_log_prob,
+                teacher_logits=decision.teacher_logits,
+            )
+            for decision in joint_decisions
+        ]
         self.timing_seconds["action_decode"] += perf_counter() - decode_started
         if self.record_trajectory:
             metrics_started = perf_counter()
@@ -370,8 +435,11 @@ class RolloutAgent(BehaviorCloningAgent):
                 TurnRecord(
                     observation=observation_cpu,
                     metrics=metrics,
-                    decisions=unit_decisions + city_decisions,
+                    decisions=decisions,
                     value=float(value.reshape(-1)[0]),
+                    old_joint_log_prob=sum(
+                        decision.old_log_prob + decision.priority_log_prob for decision in decisions
+                    ),
                 )
             )
         return [*self._choices_to_actions(unit_choices, team), *city_actions]

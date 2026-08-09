@@ -9,8 +9,8 @@ from typing import Any
 
 from luxai2021.rl.metrics import GameMetrics
 
-REWARD_PROGRAM_VERSION = 2
-SUPPORTED_REWARD_PROGRAM_VERSIONS = frozenset({1, REWARD_PROGRAM_VERSION})
+REWARD_PROGRAM_VERSION = 3
+SUPPORTED_REWARD_PROGRAM_VERSIONS = frozenset({1, 2, REWARD_PROGRAM_VERSION})
 METRIC_NAMES = frozenset(
     {
         "turn",
@@ -157,6 +157,7 @@ class RewardProgram:
     mode: str = "potential_linear"
     terminal_reward_scale: float = 1.0
     normalize_total: bool = False
+    terminal_potential_zero: bool = False
 
     def __post_init__(self) -> None:
         if self.mode not in REWARD_MODES:
@@ -165,6 +166,10 @@ class RewardProgram:
             raise ValueError("terminal_reward_scale must be in [1, 100]")
         if not isinstance(self.normalize_total, bool):
             raise TypeError("normalize_total must be a boolean")
+        if not isinstance(self.terminal_potential_zero, bool):
+            raise TypeError("terminal_potential_zero must be a boolean")
+        if self.version < 3 and self.terminal_potential_zero:
+            raise ValueError("terminal_potential_zero requires reward program v3")
         if self.mode == "direct_step":
             maximum_shaping = self.reward_scale * 2.0 * sum(abs(component.weight) for component in self.components)
         elif self.mode == "potential_tanh":
@@ -219,6 +224,7 @@ class RewardProgram:
         mode = str(value.get("mode", "potential_linear"))
         terminal_reward_scale = float(value.get("terminal_reward_scale", 1.0))
         normalize_total = value.get("normalize_total", False)
+        terminal_potential_zero = value.get("terminal_potential_zero", False) if version >= 3 else False
         if mode not in REWARD_MODES:
             raise ValueError(f"Unsupported reward mode: {mode}")
         if not isfinite(reward_scale) or not 0.0 <= reward_scale <= 2.0:
@@ -234,6 +240,7 @@ class RewardProgram:
             mode=mode,
             terminal_reward_scale=terminal_reward_scale,
             normalize_total=normalize_total,
+            terminal_potential_zero=terminal_potential_zero,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -255,6 +262,8 @@ class RewardProgram:
             value["terminal_reward_scale"] = self.terminal_reward_scale
         if self.normalize_total:
             value["normalize_total"] = True
+        if self.version >= 3:
+            value["terminal_potential_zero"] = self.terminal_potential_zero
         return value
 
     def potential(self, metrics: GameMetrics) -> tuple[float, dict[str, float]]:
@@ -283,11 +292,15 @@ class RewardProgram:
         following: GameMetrics,
         *,
         terminal_outcome: float = 0.0,
+        terminal: bool = False,
     ) -> RewardBreakdown:
         if terminal_outcome not in {-1.0, 0.0, 1.0}:
             raise ValueError("Terminal outcome must be -1, 0, or 1")
         previous_potential, prev_component_values = self.potential(previous)
         next_potential, component_values = self.potential(following)
+        if terminal and self.terminal_potential_zero and self.mode != "direct_step":
+            next_potential = 0.0
+            component_values = {component.name: 0.0 for component in self.components}
 
         if self.mode == "direct_step":
             raw_shaping = self.reward_scale * sum(
@@ -505,6 +518,7 @@ def default_reward_program(mode: str = "potential_linear") -> RewardProgram:
             "gamma": 0.999,
             "terminal_reward_scale": 10.0,
             "normalize_total": True,
+            "terminal_potential_zero": True,
         }
     )
 
@@ -575,6 +589,7 @@ def calibrate_reward_scale(
         mode=child.mode,
         terminal_reward_scale=child.terminal_reward_scale,
         normalize_total=child.normalize_total,
+        terminal_potential_zero=child.terminal_potential_zero,
     )
     return calibrated, {
         "parent_effective_scale": parent_scale,

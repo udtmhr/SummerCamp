@@ -655,11 +655,12 @@ The teacher adapter is pinned to upstream commit `973a6c6c63211b6c7ab6fdf50e026e
 
 `examples/evolve_rl.py` evolves bounded reward programs, PPO parameters, and opponent mixtures while keeping the
 distilled UNet/ResAttn8 architectures and `first_place_flat_v1` action schema fixed. Codex proposes structured JSON
-only; proposals are validated before training and cannot execute arbitrary reward code. PPO uses full-turn legal
-action sampling, a training-only value head, reference-policy KL, and the prepared teacher cache as a distillation
-anchor. Exported `best.pt` files remain compatible with `BehaviorCloningAgent`.
+only; proposals are validated before training and cannot execute arbitrary reward code. New runs use a shared
+`joint_sequential_v2` decoder for rollout and evaluation, rot180 policy/value TTA, turn-level joint PPO ratios,
+online first-place Teacher KL, and the prepared replay cache as an auxiliary BC anchor. Exported `best.pt` files
+remain compatible with `BehaviorCloningAgent`.
 
-New runs embed the official Lux AI Season 1 rules URL and the SHA-256 of the packaged rule summary in the schema-v4
+New runs embed the official Lux AI Season 1 rules URL and the SHA-256 of the packaged rule summary in the schema-v5
 manifest and every Codex prompt. The manifest fixes reward metric schema v3 so a run cannot mix candidates evaluated
 with different metric sets. The search treats the original first-place Teacher as the strongest anchor: Teacher
 score is ranked before aggregate score, and final promotion requires paired Teacher non-regression as well as a
@@ -675,6 +676,8 @@ is used instead of running return normalization to keep reward meaning and resum
 must match and default to 0.999; TD(lambda) uses lambda 0.995 instead of adding UPGO. The BC anchor coefficient is 0.05
 and its multiplier stays at 1.0 through 20% progress, then reaches 0.8 at 70% and 0.2 at completion. Dense shaping is
 also annealed from 1.0 at 20% to 0.5 at 70% and 0.25 at completion without changing the terminal reward.
+Reward Program v3 sets terminal-state potential to zero, including draws, so discounted shaping leaves no terminal
+optimization target besides match outcome.
 Because candidates and curricula are content-frozen in run artifacts, use a new run directory when adopting these
 defaults; an older run with a different stored curriculum is rejected rather than silently changing its learning rule.
 
@@ -750,7 +753,9 @@ uv run --locked python examples/evolve_rl.py \
   --resattn8-checkpoint models/distilled/resnet17x48_s42/best.pt \
   --device cuda --resattn8-only --curriculum-profile dense_shaping \
   --rollout-backend threaded \
-  --rollout-envs 8 --decisions-per-update 80000 --rollout-compile off \
+  --rollout-envs 8 --budget-unit games \
+  --short-games 384 --medium-games 1536 --final-games 6144 \
+  --episodes-per-update 64 --rollout-compile off \
   --screening-seeds 24 --medium-count 1 --final-count 1
 ```
 
@@ -779,21 +784,18 @@ credit assignment in 360-turn games. UPGO is intentionally not mixed into the si
 critic: AlphaStar applies it to a separate win/loss baseline, while using it here would self-imitate positive shaping
 trajectories and could reinforce the City-expansion exploit. Add a separate terminal-only critic before enabling UPGO.
 
-`--resattn8-only` disables UNet opponents, probes, training, baselines, and final evaluation. The defaults screen 24
-ResAttn8 candidates for 550,000 sampled decisions, continue the best eight for another
-1,925,000 decisions, and train the best two with ResAttn8 for 9,900,000 decisions each. A candidate runs
+`--resattn8-only` disables UNet opponents, probes, training, baselines, and final evaluation. New runs default to
+384/1,536/6,144 completed games for short/medium/final, with exactly 64 games per PPO update. Use
+`--budget-unit decisions` with the legacy decision flags only for old manifests. A candidate runs
 8 Lux environments concurrently by default. `--rollout-backend lockstep` selects a rendezvous: candidate and opponent
 requests wait for all active games and then run as one fixed-size GPU batch. Games that finish early leave the rendezvous before
 the next turn. The default `auto` currently retains `threaded` because the end-to-end 2x acceptance gate has not been
 met; the effective backend and fallback reason are recorded in artifacts.
 `--rollout-precision auto` uses BF16 on supported CUDA devices and FP32 elsewhere. `--rollout-compile off` is the
-default. `--rollout-compile auto` only
-calibrates `torch.compile` for lockstep's fixed padded batches; the default threaded variable-batch backend stays eager
-because repeated calibration cost did not improve its measured steady-state throughput. `on` still explicitly enables
-compile for either backend. Compile attempts, calibration time, fallback details, and the effective mode are recorded.
-Inductor compiler workers are forced away from unsafe fork startup before rollout compilation. PPO also evaluates all
-decisions of each entity type as tensors instead of one Python operation per unit. Tune `--rollout-envs` for each GPU
-and `--decisions-per-update` for the rollout/update balance. Metrics record batch fill, queue wait, tensor staging,
+default. Joint runs require rot180 TTA, so actor, base, Teacher, and snapshot inference remain eager even if compile
+is requested. Compile attempts, fallback details, and the effective mode are recorded and should remain zero/off.
+PPO evaluates one joint action ratio per Lux turn. Tune `--rollout-envs` for each GPU and
+`--episodes-per-update` for the rollout/update balance. Metrics record batch fill, queue wait, tensor staging,
 forward/copy time, game step, observation encoding,
 action decoding, reward metrics, rollout throughput, PPO update time, precision, compilation, fallback reason, and
 peak CUDA allocation. Each candidate artifact also stores the calibrated backend, precision, compile state, and
@@ -867,7 +869,9 @@ uv run --locked python examples/evolve_rl.py \
 ```
 
 Candidate definitions, failures, training checkpoints, league games, and the promotion report are written under the
-run directory so an interrupted search remains inspectable and resumable. `latest_rl.pt` uses checkpoint schema v3 and
+run directory so an interrupted search remains inspectable and resumable. Before the first checkpoint,
+`training_progress.json` reports initialization, reward calibration, critic warm-up, rollout waves, and PPO update
+phases; the same heartbeat is printed to the terminal. `latest_rl.pt` uses checkpoint schema v4 and
 stores cumulative decisions, turns, episodes, optimizer/RNG state, constraint progress, and the joint-update ramp.
 Re-running a stage resumes its remaining decision budget. Each Teacher-selected inference `best.pt` has a matching
 `best_rl.pt`; short-to-medium and medium-to-final inheritance loads its policy and value head, resets optimizer/RNG and
@@ -875,7 +879,7 @@ stage counters, then calibrates the critic before deciding whether warm-up is ne
 fall back to policy-only `best.pt`. Schema-v1/v2 checkpoints remain loadable; a v1 checkpoint's
 consumed budget is conservatively estimated from its recorded elapsed-time fraction.
 
-The first coordinator invocation owns the schema-v4 run manifest: later invocations reuse its checkpoint paths,
+The first coordinator invocation owns the schema-v5 run manifest: later invocations reuse its checkpoint paths,
 SHA-256 descriptors, Codex/deterministic generation mode, model, and training budgets instead of overwriting them with
 new CLI defaults. Runs without metric schema v3 remain untouched but must use a new run directory after this metric
 change. Every candidate has a separate immutable record under `provenance/`; accepted Codex outputs retain

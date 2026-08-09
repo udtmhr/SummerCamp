@@ -1,20 +1,20 @@
 {
   "opponent_mix": {
-    "other_base": 0.1,
-    "self_base": 0.45,
-    "snapshot": 0.2,
+    "other_base": 0.05,
+    "self_base": 0.2,
+    "snapshot": 0.5,
     "teacher": 0.25
   },
   "ppo_config": {
     "bc_coefficient": 0.05,
     "clip_range": 0.2,
-    "entropy_coefficient": 0.005,
+    "entropy_coefficient": 0.001,
     "gae_lambda": 0.995,
     "gamma": 0.999,
     "gradient_clip": 1.0,
     "illegal_action_coefficient": 0.01,
     "kl_coefficient": 0.0,
-    "learning_rate": 0.0000075,
+    "learning_rate": 0.000005,
     "minibatch_turns": 64,
     "target_kl": 0.01,
     "update_epochs": 2,
@@ -38,6 +38,7 @@
     "normalize_total": true,
     "reward_scale": 0.35,
     "terminal_reward_scale": 10.0,
-    "version": 2
+    "terminal_potential_zero": true,
+    "version": 3
   }
 }
