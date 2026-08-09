@@ -51,6 +51,7 @@ class PPOConfig:
     entropy_coefficient: float = 0.005
     value_coefficient: float = 0.5
     kl_coefficient: float = 0.0
+    target_kl: float | None = 0.01
     bc_coefficient: float = 0.05
     gradient_clip: float = 1.0
     update_epochs: int = 2
@@ -482,7 +483,7 @@ class PPOTrainer:
         masked = apply_legal_action_mask(logits[None], mask.to(logits.device)[None])[0]
         return Categorical(logits=masked.float())
 
-    def update(self, episodes: list[EpisodeTrajectory]) -> dict[str, float]:
+    def update(self, episodes: list[EpisodeTrajectory], record_grad_norms: bool = False) -> dict[str, float]:
         records = calculate_gae(episodes, self.config)
         if not records:
             raise ValueError("Cannot update PPO without rollout turns")
@@ -491,8 +492,13 @@ class PPOTrainer:
         generator = torch.Generator().manual_seed(sum(episode.seed for episode in episodes))
         totals: dict[str, float] = {}
         update_count = 0
-        gn_pol, gn_val, gn_bc = 0.0, 0.0, 0.0
+        gn_pols, gn_vals, gn_bcs = [], [], []
+        early_stop = False
+        epoch_count = 0
         for _ in range(self.config.update_epochs):
+            if early_stop:
+                break
+            epoch_count += 1
             order = torch.randperm(len(records), generator=generator).tolist()
             for start in range(0, len(order), self.config.minibatch_turns):
                 indices = order[start : start + self.config.minibatch_turns]
@@ -509,8 +515,10 @@ class PPOTrainer:
                 policy_losses = []
                 entropies = []
                 kls = []
+                approx_kls = []
                 illegal_losses = []
                 illegal_masses = []
+                turn_indices = []
                 batch_advantages = advantages[indices].to(self.device)
                 for entity in output:
                     entity_decisions = [
@@ -539,14 +547,18 @@ class PPOTrainer:
                         reference_distribution = Categorical(
                             logits=apply_legal_action_mask(reference_logits, masks).float()
                         )
-                        from torch.distributions import kl_divergence
-                        kls.append(kl_divergence(reference_distribution, distribution))
+                        p_logits = reference_distribution.logits
+                        q_logits = distribution.logits
+                        p_probs = reference_distribution.probs
+                        kl_div = torch.where(masks, p_probs * (p_logits - q_logits), torch.zeros_like(p_logits)).sum(dim=-1)
+                        kls.append(kl_div)
                     actions = torch.tensor([decision.action for _, decision in entity_decisions], device=self.device)
                     old_log_probs = torch.tensor(
                         [decision.old_log_prob for _, decision in entity_decisions], device=self.device
                     )
                     selected_advantages = batch_advantages[local_indices]
                     ratios = torch.exp(distribution.log_prob(actions) - old_log_probs)
+                    approx_kls.append((old_log_probs - distribution.log_prob(actions)).mean())
                     unclipped = ratios * selected_advantages
                     clipped = ratios.clamp(1 - self.config.clip_range, 1 + self.config.clip_range) * selected_advantages
                     policy_losses.append(-torch.minimum(unclipped, clipped))
@@ -556,6 +568,7 @@ class PPOTrainer:
                     illegal_loss = all_log_mass - legal_log_mass
                     illegal_losses.append(illegal_loss)
                     illegal_masses.append((1.0 - torch.exp(-illegal_loss)).clamp(0.0, 1.0))
+                    turn_indices.append(local_indices)
                 if not policy_losses:
                     continue
                 old_values = torch.tensor([record.value for record in batch_records], device=self.device)
@@ -567,12 +580,31 @@ class PPOTrainer:
                 value_loss = (
                     0.5 * torch.maximum((values - returns).square(), (clipped_values - returns).square()).mean()
                 )
-                turn_count = max(1, len(batch_records))
-                policy_loss = torch.cat(policy_losses).sum() / turn_count
-                entropy = torch.cat(entropies).sum() / turn_count
-                kl = torch.cat(kls).sum() / turn_count if kls else torch.tensor(0.0, device=self.device)
+                num_turns = len(batch_records)
+                turn_count = max(1, num_turns)
+                flat_indices = torch.cat(turn_indices)
+                turn_action_counts = torch.bincount(flat_indices, minlength=num_turns).clamp_min(1)
+                
+                flat_policy = torch.cat(policy_losses)
+                turn_policy_loss = torch.zeros(num_turns, device=self.device).scatter_add_(0, flat_indices, flat_policy) / turn_action_counts
+                policy_loss = turn_policy_loss.sum() / turn_count
+                
+                flat_entropy = torch.cat(entropies)
+                turn_entropy = torch.zeros(num_turns, device=self.device).scatter_add_(0, flat_indices, flat_entropy) / turn_action_counts
+                entropy = turn_entropy.sum() / turn_count
+                
+                if kls:
+                    flat_kls = torch.cat(kls)
+                    turn_kl = torch.zeros(num_turns, device=self.device).scatter_add_(0, flat_indices, flat_kls) / turn_action_counts
+                    kl = turn_kl.sum() / turn_count
+                else:
+                    kl = torch.tensor(0.0, device=self.device)
+                    
                 bc_loss = self._distillation_anchor_loss(values)
-                illegal_action_loss = torch.cat(illegal_losses).sum() / turn_count
+                
+                flat_illegal = torch.cat(illegal_losses)
+                turn_illegal = torch.zeros(num_turns, device=self.device).scatter_add_(0, flat_indices, flat_illegal) / turn_action_counts
+                illegal_action_loss = turn_illegal.sum() / turn_count
                 loss = (
                     policy_loss
                     + self.config.value_coefficient * value_loss
@@ -584,7 +616,7 @@ class PPOTrainer:
                 if not torch.isfinite(loss):
                     raise FloatingPointError("PPO produced a non-finite loss")
                 
-                if update_count == 0:
+                if record_grad_norms:
                     def _gn() -> float:
                         grads = [p.grad for p in self.actor_critic.policy.encoder.parameters() if p.grad is not None]
                         if not grads: return 0.0
@@ -592,17 +624,24 @@ class PPOTrainer:
                     
                     self.optimizer.zero_grad(set_to_none=True)
                     (self.config.value_coefficient * value_loss).backward(retain_graph=True)
-                    gn_val = _gn()
+                    gn_vals.append(_gn())
                     
                     self.optimizer.zero_grad(set_to_none=True)
                     policy_loss.backward(retain_graph=True)
-                    gn_pol = _gn()
+                    gn_pols.append(_gn())
                     
                     self.optimizer.zero_grad(set_to_none=True)
                     bc_loss_weighted = self.config.bc_coefficient * self.bc_coefficient_multiplier * bc_loss
                     if isinstance(bc_loss_weighted, torch.Tensor) and bc_loss_weighted.requires_grad:
                         bc_loss_weighted.backward(retain_graph=True)
-                        gn_bc = _gn()
+                        gn_bcs.append(_gn())
+                    else:
+                        gn_bcs.append(0.0)
+
+                if self.config.target_kl is not None and approx_kls:
+                    if torch.stack(approx_kls).mean().item() > 1.5 * self.config.target_kl:
+                        early_stop = True
+                        break
 
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -633,18 +672,32 @@ class PPOTrainer:
                 update_count += 1
         if update_count == 0:
             raise ValueError("PPO rollout contained no actionable entities")
-        result = {name: value / update_count for name, value in totals.items()}
-        result.update(
-            {
-                "grad_norm_policy_encoder": gn_pol,
-                "grad_norm_value_encoder": gn_val,
-                "grad_norm_bc_encoder": gn_bc,
-                "episodes": float(len(episodes)),
-                "turns": float(len(records)),
-                "decisions": float(sum(len(record.decisions) for record in records)),
-                "score_rate": sum((episode.outcome + 1.0) * 0.5 for episode in episodes) / len(episodes),
-            }
-        )
+        result = {name: value / update_count for name, value in totals.items() if update_count > 0}
+        result["early_stopped"] = float(early_stop)
+        result["epochs_completed"] = float(epoch_count)
+        
+        updates = {
+            "episodes": float(len(episodes)),
+            "turns": float(len(records)),
+            "decisions": float(sum(len(record.decisions) for record in records)),
+            "score_rate": sum((episode.outcome + 1.0) * 0.5 for episode in episodes) / len(episodes),
+        }
+        
+        if record_grad_norms and gn_pols:
+            import numpy as np
+            updates.update({
+                "grad_norm_policy_mean": float(np.mean(gn_pols)),
+                "grad_norm_policy_max": float(np.max(gn_pols)),
+                "grad_norm_policy_p95": float(np.percentile(gn_pols, 95)),
+                "grad_norm_value_mean": float(np.mean(gn_vals)),
+                "grad_norm_value_max": float(np.max(gn_vals)),
+                "grad_norm_value_p95": float(np.percentile(gn_vals, 95)),
+                "grad_norm_bc_mean": float(np.mean(gn_bcs)),
+                "grad_norm_bc_max": float(np.max(gn_bcs)),
+                "grad_norm_bc_p95": float(np.percentile(gn_bcs, 95)),
+            })
+            
+        result.update(updates)
         return result
 
     def _distillation_anchor_loss(self, zero_source: Tensor) -> Tensor:

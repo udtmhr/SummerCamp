@@ -706,9 +706,9 @@ def test_island3_structural_soft_accepts_compound_training_setting_changes():
         island=3,
     )
     assert canonical_child.inheritance_mode == "policy"
-    assert canonical_child.ppo_config.kl_coefficient == 0.0
+    assert canonical_child.ppo_config.kl_coefficient == 0.5
     assert canonical_child.parameter_constraint_coefficient == 0.0
-    assert {"ppo_config", "parameter_constraint_coefficient"} <= set(report["corrected_fields"])
+    assert {"parameter_constraint_coefficient"} <= set(report["corrected_fields"])
     assert canonical["mutation_manifest"]["changed_paths"]
 
     opponent_proposal = _candidate_proposal(

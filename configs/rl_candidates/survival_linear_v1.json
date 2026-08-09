@@ -12,7 +12,7 @@
     "gae_lambda": 0.98,
     "gamma": 0.995,
     "gradient_clip": 1.0,
-    "kl_coefficient": 0.0,
+    "kl_coefficient": 0.01,
     "learning_rate": 0.00001,
     "minibatch_turns": 32,
     "update_epochs": 2,

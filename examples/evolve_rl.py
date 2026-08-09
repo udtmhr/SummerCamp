@@ -1020,8 +1020,9 @@ def train_candidate(
     update = start_update
     started_at = time.monotonic()
     opponent_episode_counts = dict.fromkeys(("self_base", "other_base", "teacher", "snapshot"), 0)
+    should_early_stop = False
     try:
-        while (
+        while not should_early_stop and (
             cumulative_decisions < decision_budget
             if decision_budget is not None
             else time.monotonic() < deadline or update == 0
@@ -1080,7 +1081,10 @@ def train_candidate(
             actor_critic.train()
             trainer.set_schedule_state(joint_update=joint_update, bc_coefficient_multiplier=bc_coefficient_multiplier)
             ppo_update_started = time.monotonic()
-            metrics = trainer.update(episodes)
+            is_first_update = (update == 0)
+            is_last_update = (decision_budget is not None and target_update_decisions is not None and cumulative_decisions + target_update_decisions >= decision_budget)
+            record_grad_norms = is_first_update or is_last_update
+            metrics = trainer.update(episodes, record_grad_norms=record_grad_norms)
             _synchronize_cuda(device, "PPO update")
             ppo_update_seconds = time.monotonic() - ppo_update_started
             actor_critic.eval()
@@ -1207,7 +1211,7 @@ def train_candidate(
                         
                         if epochs_without_improvement >= 2:
                             print(f"Early stopping at milestone {milestone}. Best: {best_teacher_score_rate:.3f}, Current: {score_rate:.3f}")
-                            decision_budget = 0 # trigger early stop
+                            should_early_stop = True
                             break
             if checkpoint_callback is not None:
                 checkpoint_callback(output_dir, metrics)
@@ -1436,7 +1440,7 @@ def candidate_result(
     output_dir = Path(args.run_dir) / "artifacts" / candidate.candidate_id / stage / base_name
     current_checkpoint = output_dir / "latest_rl.pt"
     prior_short_checkpoint = (
-        Path(args.run_dir) / "artifacts" / candidate.candidate_id / "short-resattn8" / "resattn8" / "latest_rl.pt"
+        Path(args.run_dir) / "artifacts" / candidate.candidate_id / "short-resattn8" / "resattn8" / "best.pt"
     )
     resume_from = current_checkpoint if current_checkpoint.exists() else None
     predecessor_paths = [prior_short_checkpoint] if stage == "medium-resattn8" else []
@@ -1454,7 +1458,7 @@ def candidate_result(
         )
     if stage == "final-unet":
         predecessor_paths.append(
-            Path(args.run_dir) / "artifacts" / candidate.candidate_id / "probe-unet" / "unet" / "latest_rl.pt"
+            Path(args.run_dir) / "artifacts" / candidate.candidate_id / "probe-unet" / "unet" / "best.pt"
         )
     if resume_from is None:
         resume_from = next((path for path in predecessor_paths if path.exists()), None)

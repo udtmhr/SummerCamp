@@ -765,7 +765,7 @@ Hard constraints:
 - The official first-place Teacher is stronger than the distilled bases. Teacher non-regression is a hard objective;
   a self_base gain cannot compensate for a Teacher regression.
 - PPO uses clipping for update stability and the first-place Teacher distillation anchor; it trains on one GPU.
-- Parent-policy KL loss and L2-SP are disabled. Always set ppo_config.kl_coefficient and
+- Parent-policy KL loss and L2-SP are disabled. Always set 
   parameter_constraint_coefficient to 0; do not propose mutations of either field.
 - Opponent weights must sum to exactly 1.0.
 {edit_guidance}
@@ -990,8 +990,6 @@ def candidate_setting_changes(
         parent_reward["derived_metrics"] = []
     parent_ppo = asdict(parent.ppo_config)
     candidate_ppo = asdict(candidate.ppo_config)
-    parent_ppo.pop("kl_coefficient", None)
-    candidate_ppo.pop("kl_coefficient", None)
     parent_settings = {
         "reward_program": parent_reward,
         "ppo_config": parent_ppo,
@@ -1105,7 +1103,6 @@ def _serialized_counter(items: object) -> Counter[str]:
 
 def _active_ppo_settings(config: PPOConfig) -> dict[str, object]:
     value = asdict(config)
-    value.pop("kl_coefficient", None)
     return value
 
 
@@ -1235,7 +1232,6 @@ def canonicalize_candidate_proposal(
 
     canonical = copy.deepcopy(dict(proposal))
     canonical_ppo = dict(canonical["ppo_config"])
-    canonical_ppo["kl_coefficient"] = 0.0
     canonical["ppo_config"] = canonical_ppo
     canonical["parameter_constraint_coefficient"] = 0.0
     canonical["mutation_kind"] = effective_kind
@@ -1876,7 +1872,7 @@ def mutate_candidate(
     reward["version"] = 2
     reward.setdefault("derived_metrics", [])
     ppo = asdict(parent.ppo_config)
-    ppo["kl_coefficient"] = 0.0
+    
     opponent = asdict(parent.opponent_mix)
     changed_paths: list[str] = []
     selected_secondary_ids: list[str] = []
