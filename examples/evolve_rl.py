@@ -7,6 +7,7 @@ import copy
 import gzip
 import hashlib
 import json
+import math
 import os
 import random
 import shutil
@@ -24,6 +25,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch.utils.data import DataLoader, Sampler
 
+from luxai2021.imitation.actions import FIRST_PLACE_ACTION_SCHEMA
 from luxai2021.imitation.agent import BehaviorCloningAgent, FirstPlaceAgent
 from luxai2021.imitation.data import ReplayBatchSampler
 from luxai2021.imitation.distillation import (
@@ -31,7 +33,8 @@ from luxai2021.imitation.distillation import (
     compact_distillation_collate,
     prepared_distillation_cache_path,
 )
-from luxai2021.imitation.model import load_bc_checkpoint
+from luxai2021.imitation.masking import apply_legal_action_mask
+from luxai2021.imitation.model import _entity_logits, load_bc_checkpoint
 from luxai2021.rl.batched_rollout import (
     ActorCriticBatcher,
     BatchedOpponentPool,
@@ -65,6 +68,7 @@ from luxai2021.rl.job_api import JOB_API_VERSION, JobApiClient, JobApiServer, ex
 from luxai2021.rl.notifications import EvolutionNotifier
 from luxai2021.rl.policy import FullTurnActorCritic, RolloutAgent
 from luxai2021.rl.ppo import (
+    ActorLRScheduleConfig,
     PPOTrainer,
     aggregate_episode_timings,
     apply_reward_program,
@@ -95,7 +99,7 @@ _FATAL_CUDA_ERROR_MARKERS = (
 )
 _AUTOMATIC_INFRASTRUCTURE_RETRIES = 2
 _METRIC_SCHEMA_VERSION = 3
-_RUN_MANIFEST_SCHEMA_VERSION = 5
+_RUN_MANIFEST_SCHEMA_VERSION = 8
 _NATIVE_CPU_GATE_MIN_DECISIONS = 40_000
 _NATIVE_CPU_GATE_SHARE = 0.25
 _RETRYABLE_INFRASTRUCTURE_ERROR_MARKERS = (
@@ -139,6 +143,18 @@ _RUN_MANIFEST_ARGUMENTS = (
     "medium_count",
     "final_count",
     "episodes_per_update",
+    "actor_lr_schedule",
+    "actor_lr_floor_ratio",
+    "actor_lr_warmup_updates",
+    "actor_lr_stable_kl_low",
+    "actor_lr_stable_kl_high",
+    "actor_lr_reference_kl_high",
+    "actor_lr_joint_clip_high",
+    "base_action_probe_size",
+    "base_action_agreement_floor",
+    "diagnostic_every_updates",
+    "safety_teacher_regression_wins",
+    "safety_overall_regression_wins",
     "max_turns",
     "screening_seeds",
     "medium_seeds",
@@ -220,6 +236,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--medium-count", type=int, default=8)
     parser.add_argument("--final-count", type=int, default=2)
     parser.add_argument("--episodes-per-update", type=int, default=64)
+    parser.add_argument("--actor-lr-schedule", choices=("constant", "cosine"), default="cosine")
+    parser.add_argument("--actor-lr-floor-ratio", type=float, default=0.10)
+    parser.add_argument("--actor-lr-warmup-updates", type=int, default=2)
+    parser.add_argument(
+        "--actor-lr-stable-kl-low",
+        "--actor-lr-joint-kl-low",
+        dest="actor_lr_stable_kl_low",
+        type=float,
+        default=0.0001,
+    )
+    parser.add_argument(
+        "--actor-lr-stable-kl-high",
+        "--actor-lr-joint-kl-high",
+        dest="actor_lr_stable_kl_high",
+        type=float,
+        default=0.0003,
+    )
+    parser.add_argument("--actor-lr-reference-kl-high", type=float, default=0.002)
+    parser.add_argument("--actor-lr-joint-clip-high", type=float, default=0.08)
+    parser.add_argument("--base-action-probe-size", type=int, default=96)
+    parser.add_argument("--base-action-agreement-floor", type=float, default=0.995)
+    parser.add_argument("--diagnostic-every-updates", type=int, default=1)
+    parser.add_argument("--safety-teacher-regression-wins", type=int, default=1)
+    parser.add_argument("--safety-overall-regression-wins", type=int, default=2)
     parser.add_argument("--max-turns", type=int, default=360)
     parser.add_argument("--screening-seeds", type=int, default=24)
     parser.add_argument("--medium-seeds", type=int, default=24)
@@ -337,6 +377,22 @@ def git_revision(repository: Path) -> str:
         text=True,
     )
     return completed.stdout.strip() if completed.returncode == 0 else "unknown"
+
+
+def training_code_sha256(repository: Path) -> str:
+    digest = hashlib.sha256()
+    for relative in (
+        "examples/evolve_rl.py",
+        "luxai2021/imitation/distillation.py",
+        "luxai2021/rl/evolution.py",
+        "luxai2021/rl/policy.py",
+        "luxai2021/rl/ppo.py",
+        "luxai2021/rl/reward.py",
+    ):
+        path = repository / relative
+        digest.update(relative.encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def _sha256_file(path: Path) -> str:
@@ -610,6 +666,179 @@ class PhaseBalancedBatchSampler(Sampler[list[int]]):
         return self.batch_count
 
 
+class AnchorBatchProvider:
+    """Stateful BC provider whose sampler position survives an exact PPO resume."""
+
+    def __init__(self, loader: DataLoader, batch_sampler: Sampler[list[int]], *, sampling: str) -> None:
+        self.loader = loader
+        self.batch_sampler = batch_sampler
+        self.sampling = sampling
+        self.total_batches = 0
+        self.iterator: Iterator[Mapping[str, torch.Tensor]] = iter(loader)
+
+    def __call__(self) -> Mapping[str, torch.Tensor]:
+        try:
+            batch = next(self.iterator)
+        except StopIteration:
+            self.iterator = iter(self.loader)
+            batch = next(self.iterator)
+        self.total_batches += 1
+        return batch
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "sampling": self.sampling,
+            "total_batches": self.total_batches,
+            "batches_per_epoch": len(self.batch_sampler),
+        }
+
+    def load_state_dict(self, state: Mapping[str, object]) -> None:
+        if int(state.get("schema_version", 0)) != 1 or state.get("sampling") != self.sampling:
+            raise ValueError("BC anchor sampler state does not match")
+        batches_per_epoch = len(self.batch_sampler)
+        if int(state.get("batches_per_epoch", -1)) != batches_per_epoch:
+            raise ValueError("BC anchor sampler length changed")
+        self.total_batches = max(0, int(state.get("total_batches", 0)))
+        epoch, offset = divmod(self.total_batches, batches_per_epoch)
+        if hasattr(self.batch_sampler, "epoch"):
+            self.batch_sampler.epoch = epoch
+        self.iterator = iter(self.loader)
+        for _ in range(offset):
+            next(self.iterator)
+
+    def fixed_probe_batches(self, sample_count: int, *, batch_size: int = 8) -> list[dict[str, torch.Tensor]]:
+        """Build a deterministic phase-balanced probe without advancing the BC sampler."""
+        dataset = self.loader.dataset
+        if not isinstance(dataset, LuxDistillationDataset):
+            raise TypeError("Base action probe requires a LuxDistillationDataset")
+        if isinstance(self.batch_sampler, PhaseBalancedBatchSampler):
+            strata = self.batch_sampler.strata
+            per_stratum = math.ceil(sample_count / len(strata))
+            selected_by_stratum = []
+            for values in strata:
+                step = max(len(values) // per_stratum, 1)
+                selected_by_stratum.append(values[::step][:per_stratum])
+            indices = [
+                values[offset]
+                for offset in range(per_stratum)
+                for values in selected_by_stratum
+                if offset < len(values)
+            ][:sample_count]
+        else:
+            step = max(len(dataset) // sample_count, 1)
+            indices = list(range(0, len(dataset), step))[:sample_count]
+        return [
+            compact_distillation_collate([dataset[index] for index in indices[start : start + batch_size]])
+            for start in range(0, len(indices), batch_size)
+        ]
+
+
+def base_action_agreement(
+    actor_critic: FullTurnActorCritic,
+    reference_policy: FullTurnActorCritic,
+    probe_batches: list[dict[str, torch.Tensor]],
+    *,
+    device: torch.device,
+) -> tuple[float, int]:
+    """Measure legal deterministic action agreement on a fixed, phase-balanced probe."""
+    was_training = actor_critic.training
+    actor_critic.eval()
+    agreements = 0
+    valid_actions = 0
+    with torch.inference_mode():
+        for batch in probe_batches:
+            observations = batch["observation"].to(device, dtype=torch.float32, non_blocking=True)
+            current_output, _ = actor_critic.forward_tta(observations)
+            reference_output, _ = reference_policy.forward_tta(observations)
+            for entity in FIRST_PLACE_ACTION_SCHEMA:
+                positions = batch[f"{entity}_positions"].to(device, non_blocking=True)
+                legal = batch[f"{entity}_legal_mask"].to(device, dtype=torch.bool, non_blocking=True).permute(0, 2, 1)
+                valid = legal.any(dim=1)
+                current = apply_legal_action_mask(
+                    _entity_logits(current_output[entity], positions),
+                    legal,
+                    action_dim=1,
+                ).argmax(dim=1)
+                reference = apply_legal_action_mask(
+                    _entity_logits(reference_output[entity], positions),
+                    legal,
+                    action_dim=1,
+                ).argmax(dim=1)
+                agreements += int(((current == reference) & valid).sum().item())
+                valid_actions += int(valid.sum().item())
+    actor_critic.train(was_training)
+    return agreements / max(valid_actions, 1), valid_actions
+
+
+def _select_update_evaluation(
+    evaluations: list[dict[str, object]],
+    *,
+    base_action_agreement_floor: float,
+) -> dict[str, object] | None:
+    eligible = [
+        evaluation
+        for evaluation in evaluations
+        if evaluation.get("base_action_agreement") is None
+        or float(evaluation["base_action_agreement"]) >= base_action_agreement_floor
+    ]
+    if not eligible:
+        return None
+    maximum_teacher_score = max(float(evaluation["teacher_score_rate"]) for evaluation in eligible)
+    teacher_game_count = max(int(evaluation.get("teacher_game_count", 0)) for evaluation in eligible)
+    one_win_margin = 1.0 / max(teacher_game_count, 1)
+    contenders = [
+        evaluation
+        for evaluation in eligible
+        if float(evaluation["teacher_score_rate"]) >= maximum_teacher_score - one_win_margin - 1e-12
+    ]
+    return max(
+        contenders,
+        key=lambda evaluation: (
+            float(evaluation["overall_score_rate"]),
+            float(evaluation["teacher_score_rate"]),
+            int(evaluation["update"]),
+        ),
+    )
+
+
+def _update_safety_failures(
+    evaluation: Mapping[str, object],
+    accepted: Mapping[str, object] | None,
+    *,
+    base_action_agreement_floor: float,
+    reference_kl_high: float,
+    teacher_regression_wins: int,
+    overall_regression_wins: int,
+) -> list[str]:
+    """Return hard drift and matched-score regressions for an update."""
+    failures: list[str] = []
+    agreement = evaluation.get("base_action_agreement")
+    if agreement is not None and float(agreement) < base_action_agreement_floor:
+        failures.append("base_action_agreement")
+    reference_kl = evaluation.get("reference_kl")
+    if reference_kl is not None and float(reference_kl) > reference_kl_high:
+        failures.append("reference_kl")
+    if accepted is None:
+        return failures
+
+    teacher_games = max(int(evaluation.get("teacher_game_count", 0)), 1)
+    teacher_margin = max(teacher_regression_wins, 0) / teacher_games
+    if (
+        float(evaluation["teacher_score_rate"]) + teacher_margin + 1e-12
+        < float(accepted["teacher_score_rate"])
+    ):
+        failures.append("teacher_regression")
+    overall_games = max(int(evaluation.get("overall_game_count", 0)), 1)
+    overall_margin = max(overall_regression_wins, 0) / overall_games
+    if (
+        float(evaluation["overall_score_rate"]) + overall_margin + 1e-12
+        < float(accepted["overall_score_rate"])
+    ):
+        failures.append("overall_regression")
+    return failures
+
+
 def build_anchor_provider(
     base_checkpoint: Path,
     *,
@@ -620,7 +849,7 @@ def build_anchor_provider(
     seed: int,
     max_turns: int = 0,
     sampling: str = "phase-balanced",
-) -> Callable[[], Mapping[str, torch.Tensor]]:
+) -> AnchorBatchProvider:
     _, checkpoint = load_bc_checkpoint(str(base_checkpoint), "cpu")
     train_paths = [Path(path) for path in checkpoint["split"]["train"]]
     rng = random.Random(seed)
@@ -632,9 +861,7 @@ def build_anchor_provider(
         message = f"BC anchor replay files are missing ({len(missing_replays)}): {preview}"
         raise FileNotFoundError(message)
     missing_cache = [
-        path
-        for path in replay_paths
-        if not prepared_distillation_cache_path(path, prepared_cache_dir).exists()
+        path for path in replay_paths if not prepared_distillation_cache_path(path, prepared_cache_dir).exists()
     ]
     if missing_cache:
         preview = ", ".join(str(path) for path in missing_cache[:8])
@@ -672,17 +899,7 @@ def build_anchor_provider(
         num_workers=0,
         pin_memory=True,
     )
-    iterator: Iterator[Mapping[str, torch.Tensor]] = iter(loader)
-
-    def next_batch() -> Mapping[str, torch.Tensor]:
-        nonlocal iterator
-        try:
-            return next(iterator)
-        except StopIteration:
-            iterator = iter(loader)
-            return next(iterator)
-
-    return next_batch
+    return AnchorBatchProvider(loader, batch_sampler, sampling=sampling)
 
 
 def opponent_factories(
@@ -845,6 +1062,19 @@ def train_candidate(
     rollout_precision: str = "auto",
     rollout_compile: str = "auto",
     rollout_batch_wait_ms: float = 2.0,
+    actor_lr_schedule: str = "constant",
+    actor_lr_floor_ratio: float = 1.0,
+    actor_lr_warmup_updates: int = 2,
+    actor_lr_stable_kl_low: float = 0.0001,
+    actor_lr_stable_kl_high: float = 0.0003,
+    actor_lr_reference_kl_high: float = 0.002,
+    actor_lr_joint_clip_high: float = 0.08,
+    base_action_probe_size: int = 96,
+    base_action_agreement_floor: float = 0.995,
+    diagnostic_every_updates: int = 1,
+    safety_teacher_regression_wins: int = 1,
+    safety_overall_regression_wins: int = 2,
+    training_code_hash: str | None = None,
     reward_mode: str | None = None,
     require_reward_v3: bool = True,
 ) -> tuple[Path, dict[str, object]]:
@@ -875,12 +1105,6 @@ def train_candidate(
     _, base_source = load_bc_checkpoint(str(base_checkpoint), "cpu")
     actor_critic = FullTurnActorCritic.from_checkpoint(base_checkpoint, device)
 
-    # The distilled base remains a diagnostic reference even when its KL is not optimized.
-    reference_policy = FullTurnActorCritic.from_checkpoint(base_checkpoint, device)
-    reference_policy.eval()
-    for param in reference_policy.parameters():
-        param.requires_grad = False
-
     inherited_modules: list[str] = []
     inherited_hash = None
     if inherit_from is not None and resume_from is None:
@@ -895,6 +1119,11 @@ def train_candidate(
             while chunk := checkpoint_input.read(1024 * 1024):
                 digest.update(chunk)
         inherited_hash = digest.hexdigest()
+    # Safety drift is measured from the policy that entered this stage, not from
+    # an older architecture base that may differ after stage inheritance.
+    reference_policy = copy.deepcopy(actor_critic).eval()
+    for param in reference_policy.parameters():
+        param.requires_grad = False
     if device.type == "cuda":
         actor_critic.policy.to(memory_format=torch.channels_last)
     bc_provider = None
@@ -909,7 +1138,49 @@ def train_candidate(
             max_turns=bc_anchor_max_turns,
             sampling=bc_anchor_sampling,
         )
+    base_probe_batches = (
+        bc_provider.fixed_probe_batches(base_action_probe_size) if bc_provider is not None else []
+    )
     curriculum = training_curriculum(curriculum_profile)
+    lr_schedule = ActorLRScheduleConfig(
+        mode=actor_lr_schedule,
+        floor_ratio=actor_lr_floor_ratio,
+        warmup_updates=actor_lr_warmup_updates,
+        stable_kl_low=actor_lr_stable_kl_low,
+        stable_kl_high=actor_lr_stable_kl_high,
+        reference_kl_high=actor_lr_reference_kl_high,
+        joint_clip_high=actor_lr_joint_clip_high,
+    )
+    training_contract = {
+        "decoder_schema": "joint_sequential_v2",
+        "inference_augmentation": "rot180",
+        "budget_unit": budget_unit,
+        "teacher_checkpoint_sha256": teacher_checkpoint_sha256,
+        "training_code_sha256": training_code_hash,
+        "actor_lr_schedule": asdict(lr_schedule),
+        "training_curriculum": curriculum.to_dict(),
+        "bc_anchor": {
+            "enabled": bool(use_bc_anchor and candidate.ppo_config.bc_coefficient > 0),
+            "sampling": bc_anchor_sampling,
+            "batch_size": bc_batch_size,
+            "replays": bc_replays,
+            "max_turns": bc_anchor_max_turns,
+        },
+        "base_action_probe": {
+            "enabled": bool(base_probe_batches),
+            "size": base_action_probe_size,
+            "agreement_floor": base_action_agreement_floor,
+        },
+        "online_safety": {
+            "diagnostic_every_updates": diagnostic_every_updates,
+            "reference_kl_high": actor_lr_reference_kl_high,
+            "teacher_regression_wins": safety_teacher_regression_wins,
+            "overall_regression_wins": safety_overall_regression_wins,
+        },
+    }
+    training_contract_hash = hashlib.sha256(
+        json.dumps(training_contract, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     if budget_unit not in {"games", "decisions"}:
         message = f"Unsupported budget unit: {budget_unit}"
         raise ValueError(message)
@@ -928,6 +1199,7 @@ def train_candidate(
     episode_index = 0
     previous_elapsed_seconds = 0.0
     resumed_metrics: dict[str, object] | None = None
+    resumed_history: list[dict[str, object]] = []
     rng = random.Random(seed)
     curriculum_progress_decisions = max(0, int(curriculum_start_decisions))
     curriculum_progress_games = max(0, int(curriculum_start_games))
@@ -941,6 +1213,7 @@ def train_candidate(
             device,
             reference_policy=reference_policy,
             bc_batch_provider=bc_provider,
+            actor_lr_schedule=lr_schedule,
         )
 
     trainer = make_trainer()
@@ -954,6 +1227,7 @@ def train_candidate(
             legacy_stage_seconds=seconds,
             allow_compatible_source_checkpoint=True,
             budget_unit=budget_unit,
+            training_contract_hash=training_contract_hash,
         )
         resume_metadata = {
             "checkpoint": str(resume_from),
@@ -976,6 +1250,9 @@ def train_candidate(
             int(curriculum_start_games),
         )
         joint_update = resume_state.joint_update
+        resumed_history = list(resume_state.history or [])
+        if bc_provider is not None and resume_state.bc_batch_provider_state is not None:
+            bc_provider.load_state_dict(resume_state.bc_batch_provider_state)
         if resume_budget_progress:
             cumulative_decisions = resume_state.cumulative_decisions
             cumulative_turns = resume_state.cumulative_turns
@@ -984,9 +1261,7 @@ def train_candidate(
         if resume_budget_progress and resume_state.python_random_state is not None:
             rng.setstate(resume_state.python_random_state)
     snapshot = copy.deepcopy(actor_critic).eval().requires_grad_(requires_grad=False)
-    snapshot_states = [
-        {name: value.detach().cpu().clone() for name, value in actor_critic.state_dict().items()}
-    ]
+    snapshot_states = [{name: value.detach().cpu().clone() for name, value in actor_critic.state_dict().items()}]
     candidate_batcher = ActorCriticBatcher(
         actor_critic,
         device,
@@ -1116,13 +1391,135 @@ def train_candidate(
             critic_warmup = warmup_value_head(actor_critic, warmup_episodes, candidate.ppo_config, device)
             trainer = make_trainer()
     deadline = time.monotonic() + max(0.0, seconds - previous_elapsed_seconds)
-    history = []
+    history = resumed_history
     diagnostic_events: list[dict[str, object]] = []
     milestone_dir = output_dir / "milestones"
     milestone_dir.mkdir(exist_ok=True)
     milestone_points = (0.20, 0.40, 0.60, 0.80, 1.00)
     best_teacher_score_rate = -1.0
     epochs_without_improvement = 0
+    update_selection_path = output_dir / "update_selection.json"
+    update_selection: dict[str, object] = {}
+    if update_selection_path.exists():
+        update_selection = json.loads(update_selection_path.read_text(encoding="utf-8"))
+    accepted_training_checkpoint = output_dir / "accepted_rl.pt"
+    if budget_unit == "games" and resume_from is not None and not accepted_training_checkpoint.exists():
+        shutil.copyfile(resume_from, accepted_training_checkpoint)
+    elif budget_unit == "games" and resume_from is None and not accepted_training_checkpoint.exists():
+        initial_metrics: dict[str, object] = {"update": -1, "safety_baseline": True}
+        update_dir = output_dir / "updates"
+        update_dir.mkdir(exist_ok=True)
+        initial_policy_checkpoint = update_dir / "initial.pt"
+        initial_inheritance_checkpoint = update_dir / "initial_pv.pt"
+        actor_critic.export_policy(
+            initial_policy_checkpoint,
+            epoch=-1,
+            metrics={"validation": initial_metrics, "ppo": initial_metrics},
+            split=base_source["split"],
+            metadata={"candidate_id": candidate.candidate_id, "safety_baseline": True},
+        )
+        _save_stage_inheritance_checkpoint(
+            actor_critic,
+            initial_inheritance_checkpoint,
+            update=-1,
+            metrics=initial_metrics,
+        )
+        shutil.copyfile(initial_policy_checkpoint, output_dir / "best.pt")
+        shutil.copyfile(initial_inheritance_checkpoint, output_dir / "best_rl.pt")
+        trainer.save_training_checkpoint(
+            accepted_training_checkpoint,
+            source_checkpoint=str(base_checkpoint),
+            source_checkpoint_sha256=base_checkpoint_sha256,
+            reward_program=candidate.reward_program,
+            update=-1,
+            metrics=initial_metrics,
+            training_state={
+                "cumulative_decisions": cumulative_decisions,
+                "cumulative_turns": cumulative_turns,
+                "cumulative_episodes": episode_index,
+                "elapsed_seconds": previous_elapsed_seconds,
+                "python_random_state": rng.getstate(),
+                "curriculum_progress_decisions": curriculum_progress_decisions,
+                "curriculum_progress_games": curriculum_progress_games,
+                "budget_unit": budget_unit,
+                "joint_update": joint_update,
+                "history": history,
+                "bc_batch_provider_state": bc_provider.state_dict() if bc_provider is not None else None,
+            },
+            training_contract_hash=training_contract_hash,
+        )
+        shutil.copyfile(accepted_training_checkpoint, output_dir / "latest_rl.pt")
+        diagnostic_dir = output_dir / "diagnostic_evaluations"
+        diagnostic_dir.mkdir(exist_ok=True)
+        write_training_progress("safety_baseline", update=-1)
+        initial_diagnostic = evaluate_against_league(
+            LeagueMember("candidate", initial_policy_checkpoint),
+            [
+                LeagueMember("base", base_checkpoint),
+                LeagueMember("first-place", teacher_checkpoint, model_type="first-place"),
+            ],
+            seed_start=eval_seed_start,
+            seed_count=8,
+            device=str(device),
+            max_turns=max_turns,
+        )
+        EvolutionStore.write_json(diagnostic_dir / "initial.json", initial_diagnostic)
+        initial_teacher_games = [
+            game
+            for game in initial_diagnostic["games"]
+            if game.get("anchor") == "first-place" and "outcome" in game
+        ]
+        initial_teacher_score = sum(
+            (float(game["outcome"]) + 1.0) * 0.5 for game in initial_teacher_games
+        ) / max(len(initial_teacher_games), 1)
+        initial_probe_agreement, initial_probe_count = (
+            base_action_agreement(actor_critic, reference_policy, base_probe_batches, device=device)
+            if base_probe_batches
+            else (None, 0)
+        )
+        baseline_evaluation = {
+            "update": -1,
+            "checkpoint": str(initial_policy_checkpoint),
+            "inheritance_checkpoint": str(initial_inheritance_checkpoint),
+            "training_checkpoint": str(accepted_training_checkpoint),
+            "teacher_score_rate": initial_teacher_score,
+            "teacher_game_count": len(initial_teacher_games),
+            "overall_score_rate": float(initial_diagnostic["totals"]["score_rate"]),
+            "overall_game_count": int(initial_diagnostic["totals"]["games"]),
+            "base_action_agreement": initial_probe_agreement,
+            "base_action_count": initial_probe_count,
+            "base_action_probe_passed": True,
+            "reference_kl": 0.0,
+            "accepted": True,
+            "safety_baseline": True,
+            "safety_failures": [],
+        }
+        update_selection = {
+            "schema_version": 3,
+            "selection_policy": "online_accept_then_teacher_one_win_margin_then_overall_then_latest",
+            "status": "baseline",
+            "seed_start": eval_seed_start,
+            "seed_count": 8,
+            "diagnostic_every_updates": diagnostic_every_updates,
+            "base_action_probe_size": base_action_probe_size,
+            "base_action_agreement_floor": base_action_agreement_floor,
+            "reference_kl_high": actor_lr_reference_kl_high,
+            "teacher_regression_wins": safety_teacher_regression_wins,
+            "overall_regression_wins": safety_overall_regression_wins,
+            "teacher_one_win_margin": 1.0 / max(len(initial_teacher_games), 1),
+            "update": -1,
+            "selected_checkpoint": str(initial_policy_checkpoint),
+            "teacher_score_rate": initial_teacher_score,
+            "overall_score_rate": float(initial_diagnostic["totals"]["score_rate"]),
+            "base_action_agreement": initial_probe_agreement,
+            "evaluations": [baseline_evaluation],
+        }
+        EvolutionStore.write_json(update_selection_path, update_selection)
+    accepted_evaluations = [
+        evaluation
+        for evaluation in update_selection.get("evaluations", [])
+        if isinstance(evaluation, Mapping) and bool(evaluation.get("accepted", True))
+    ]
     saved_milestones = {
         point for point in milestone_points if (milestone_dir / f"p{round(point * 100):03d}.pt").exists()
     }
@@ -1146,9 +1543,7 @@ def train_candidate(
             episodes = []
             update_decisions = 0
             target_update_decisions = (
-                decisions_per_update
-                if budget_unit == "decisions" and decision_budget is not None
-                else None
+                decisions_per_update if budget_unit == "decisions" and decision_budget is not None else None
             )
             target_update_games = (
                 min(episodes_per_update, game_budget - episode_index)
@@ -1220,16 +1615,46 @@ def train_candidate(
             _synchronize_cuda(device, "rollout collection")
             rollout_seconds = time.monotonic() - rollout_started
             actor_critic.train()
-            trainer.set_schedule_state(joint_update=joint_update, bc_coefficient_multiplier=bc_coefficient_multiplier)
+            stage_progress = (
+                episode_index / max(game_budget, 1)
+                if budget_unit == "games" and game_budget is not None
+                else (cumulative_decisions + update_decisions) / max(decision_budget or 1, 1)
+            )
+            training_progress_units = (
+                curriculum_progress_games + len(episodes)
+                if budget_unit == "games"
+                else curriculum_progress_decisions + update_decisions
+            )
+            actor_lr_progress = min(max(training_progress_units / curriculum_total, 0.0), 1.0)
+            previous_metrics = history[-1] if history else resumed_metrics or {}
+            trainer.set_schedule_state(
+                joint_update=joint_update,
+                training_progress=actor_lr_progress,
+                bc_coefficient_multiplier=bc_coefficient_multiplier,
+                previous_stable_kl=(
+                    float(previous_metrics["stable_approx_kl"])
+                    if previous_metrics.get("stable_approx_kl") is not None
+                    else None
+                ),
+                previous_reference_kl=(
+                    float(previous_metrics["reference_kl"])
+                    if previous_metrics.get("reference_kl") is not None
+                    else None
+                ),
+                previous_joint_clip_fraction=(
+                    float(previous_metrics["joint_clip_fraction"])
+                    if previous_metrics.get("joint_clip_fraction") is not None
+                    else None
+                ),
+            )
             ppo_update_started = time.monotonic()
-            is_first_update = (update == 0)
+            is_first_update = update == 0
             is_last_update = (
-                (game_budget is not None and target_update_games is not None and episode_index >= game_budget)
-                or (
-                    decision_budget is not None
-                    and target_update_decisions is not None
-                    and cumulative_decisions + target_update_decisions >= decision_budget
-                )
+                game_budget is not None and target_update_games is not None and episode_index >= game_budget
+            ) or (
+                decision_budget is not None
+                and target_update_decisions is not None
+                and cumulative_decisions + target_update_decisions >= decision_budget
             )
             record_grad_norms = is_first_update or is_last_update
             write_training_progress(
@@ -1319,14 +1744,17 @@ def train_candidate(
                     "budget_unit": budget_unit,
                     "joint_update": joint_update,
                     "actor_lr_multiplier": trainer.actor_lr_multiplier,
+                    "actor_learning_rate": candidate.ppo_config.learning_rate * trainer.actor_lr_multiplier,
+                    "actor_lr_schedule_multiplier": trainer.actor_lr_schedule_multiplier,
+                    "actor_lr_feedback_multiplier": trainer.actor_lr_feedback_multiplier,
+                    "actor_lr_feedback_reason": trainer.actor_lr_feedback_reason,
+                    "actor_lr_low_kl_streak": trainer.actor_lr_low_kl_streak,
+                    "actor_lr_progress": actor_lr_progress,
+                    "stage_progress": min(max(stage_progress, 0.0), 1.0),
                     "bc_coefficient_multiplier": bc_coefficient_multiplier,
                 }
             )
             history.append(metrics)
-            snapshot_states.append(
-                {name: value.detach().cpu().clone() for name, value in actor_critic.state_dict().items()}
-            )
-            snapshot_states = snapshot_states[-4:]
             trainer.save_training_checkpoint(
                 output_dir / "latest_rl.pt",
                 source_checkpoint=str(base_checkpoint),
@@ -1344,7 +1772,10 @@ def train_candidate(
                     "curriculum_progress_games": curriculum_progress_games,
                     "budget_unit": budget_unit,
                     "joint_update": joint_update,
+                    "history": history,
+                    "bc_batch_provider_state": bc_provider.state_dict() if bc_provider is not None else None,
                 },
+                training_contract_hash=training_contract_hash,
             )
             write_training_progress(
                 "checkpoint_saved",
@@ -1376,7 +1807,8 @@ def train_candidate(
             )
             if (update + 1) % 4 == 0:
                 shutil.copyfile(output_dir / "latest_rl.pt", update_dir / f"u{update:04d}_rl.pt")
-            if budget_unit == "games" and (update + 1) % 2 == 0:
+            update_accepted = True
+            if budget_unit == "games" and (update + 1) % diagnostic_every_updates == 0:
                 diagnostic_dir = output_dir / "diagnostic_evaluations"
                 diagnostic_dir.mkdir(exist_ok=True)
                 diagnostic = evaluate_against_league(
@@ -1391,6 +1823,109 @@ def train_candidate(
                     max_turns=max_turns,
                 )
                 EvolutionStore.write_json(diagnostic_dir / f"u{update:04d}.json", diagnostic)
+                teacher_games = [
+                    game for game in diagnostic["games"] if game.get("anchor") == "first-place" and "outcome" in game
+                ]
+                teacher_score_rate = sum((float(game["outcome"]) + 1.0) * 0.5 for game in teacher_games) / max(
+                    len(teacher_games), 1
+                )
+                overall_score_rate = float(diagnostic["totals"]["score_rate"])
+                probe_agreement, probe_action_count = (
+                    base_action_agreement(
+                        actor_critic,
+                        reference_policy,
+                        base_probe_batches,
+                        device=device,
+                    )
+                    if base_probe_batches
+                    else (None, 0)
+                )
+                evaluations = list(update_selection.get("evaluations", []))
+                current_evaluation: dict[str, object] = {
+                    "update": update,
+                    "checkpoint": str(update_dir / f"u{update:04d}.pt"),
+                    "inheritance_checkpoint": str(update_dir / f"u{update:04d}_pv.pt"),
+                    "training_checkpoint": str(output_dir / "latest_rl.pt"),
+                    "teacher_score_rate": teacher_score_rate,
+                    "teacher_game_count": len(teacher_games),
+                    "overall_score_rate": overall_score_rate,
+                    "overall_game_count": int(diagnostic["totals"]["games"]),
+                    "base_action_agreement": probe_agreement,
+                    "base_action_count": probe_action_count,
+                    "base_action_probe_passed": (
+                        probe_agreement is None or probe_agreement >= base_action_agreement_floor
+                    ),
+                    "reference_kl": metrics.get("reference_kl"),
+                }
+                accepted_best = _select_update_evaluation(
+                    accepted_evaluations,
+                    base_action_agreement_floor=base_action_agreement_floor,
+                )
+                safety_failures = _update_safety_failures(
+                    current_evaluation,
+                    accepted_best,
+                    base_action_agreement_floor=base_action_agreement_floor,
+                    reference_kl_high=actor_lr_reference_kl_high,
+                    teacher_regression_wins=safety_teacher_regression_wins,
+                    overall_regression_wins=safety_overall_regression_wins,
+                )
+                update_accepted = not safety_failures
+                current_evaluation["accepted"] = update_accepted
+                current_evaluation["safety_failures"] = safety_failures
+                evaluations.append(current_evaluation)
+                if update_accepted:
+                    accepted_evaluations.append(current_evaluation)
+                selected = _select_update_evaluation(
+                    accepted_evaluations,
+                    base_action_agreement_floor=base_action_agreement_floor,
+                )
+                update_selection = {
+                    "schema_version": 3,
+                    "selection_policy": "online_accept_then_teacher_one_win_margin_then_overall_then_latest",
+                    "status": "accepted" if update_accepted else "safety_stopped",
+                    "seed_start": eval_seed_start,
+                    "seed_count": 8,
+                    "diagnostic_every_updates": diagnostic_every_updates,
+                    "base_action_probe_size": base_action_probe_size,
+                    "base_action_agreement_floor": base_action_agreement_floor,
+                    "reference_kl_high": actor_lr_reference_kl_high,
+                    "teacher_regression_wins": safety_teacher_regression_wins,
+                    "overall_regression_wins": safety_overall_regression_wins,
+                    "teacher_one_win_margin": 1.0 / max(len(teacher_games), 1),
+                    "update": int(selected["update"]) if selected is not None else None,
+                    "selected_checkpoint": selected["checkpoint"] if selected is not None else None,
+                    "teacher_score_rate": selected["teacher_score_rate"] if selected is not None else None,
+                    "overall_score_rate": selected["overall_score_rate"] if selected is not None else None,
+                    "base_action_agreement": selected["base_action_agreement"] if selected is not None else None,
+                    "evaluations": evaluations,
+                }
+                if selected is not None:
+                    shutil.copyfile(str(selected["checkpoint"]), output_dir / "best.pt")
+                    shutil.copyfile(str(selected["inheritance_checkpoint"]), output_dir / "best_rl.pt")
+                if update_accepted:
+                    shutil.copyfile(output_dir / "latest_rl.pt", accepted_training_checkpoint)
+                else:
+                    shutil.copyfile(accepted_training_checkpoint, output_dir / "latest_rl.pt")
+                    update_selection["rejected_update"] = update
+                    update_selection["rollback_checkpoint"] = str(accepted_training_checkpoint)
+                    should_early_stop = True
+                    write_training_progress(
+                        "safety_rollback",
+                        update=update,
+                        safety_failures=safety_failures,
+                        checkpoint=str(output_dir / "latest_rl.pt"),
+                    )
+                EvolutionStore.write_json(update_selection_path, update_selection)
+            if update_accepted:
+                snapshot_states.append(
+                    {name: value.detach().cpu().clone() for name, value in actor_critic.state_dict().items()}
+                )
+                snapshot_states = snapshot_states[-4:]
+            else:
+                if checkpoint_callback is not None:
+                    checkpoint_callback(output_dir, metrics)
+                update += 1
+                break
             completed_units = curriculum_progress_games if budget_unit == "games" else curriculum_progress_decisions
             completed_progress = min(max(completed_units / curriculum_total, 0.0), 1.0)
             for milestone in milestone_points:
@@ -1468,9 +2003,7 @@ def train_candidate(
     rollout_runtime = {
         "backend_requested": rollout_backend,
         "backend_effective": resolve_rollout_backend(rollout_backend),
-        "backend_fallback_reason": (
-            "lockstep_acceptance_not_met" if rollout_backend == "auto" else None
-        ),
+        "backend_fallback_reason": ("lockstep_acceptance_not_met" if rollout_backend == "auto" else None),
         "precision_requested": rollout_precision,
         "precision_effective": candidate_runtime.get("precision"),
         "compile_requested": rollout_compile,
@@ -1484,12 +2017,7 @@ def train_candidate(
         "base_name": base_name,
         "base_checkpoint": str(base_checkpoint),
         "base_checkpoint_sha256": base_checkpoint_sha256,
-        "training_contract": {
-            "decoder_schema": "joint_sequential_v2",
-            "inference_augmentation": "rot180",
-            "budget_unit": budget_unit,
-            "teacher_checkpoint_sha256": teacher_checkpoint_sha256,
-        },
+        "training_contract": training_contract,
         "reward_program": candidate.reward_program.to_dict(),
         "effective_reward_program": effective_reward_program.to_dict(),
         "reward_calibration": reward_calibration,
@@ -1511,6 +2039,8 @@ def train_candidate(
         "curriculum_start_games": max(0, int(curriculum_start_games)),
         "budget_unit": budget_unit,
         "curriculum_milestones": [f"p{round(point * 100):03d}.pt" for point in sorted(saved_milestones)],
+        "update_selection": update_selection or {"enabled": False},
+        "actor_lr_schedule": asdict(lr_schedule),
         "bc_anchor": {
             "replays": bc_replays,
             "max_turns": bc_anchor_max_turns,
@@ -1530,20 +2060,19 @@ def train_candidate(
         "final_metrics": final_metrics,
         "diagnostic_events": diagnostic_events,
     }
-    summary["training_contract_hash"] = hashlib.sha256(
-        json.dumps(
-            {
-                "candidate": candidate.to_dict(),
-                "training_contract": summary["training_contract"],
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
+    summary["training_contract_hash"] = training_contract_hash
     (output_dir / "rollout_runtime.json").write_text(
         json.dumps(rollout_runtime, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    if (
+        update_selection.get("evaluations")
+        and update_selection.get("selected_checkpoint") is None
+        and update_selection.get("status") != "safety_stopped"
+    ):
+        message = "No diagnostic update passed the base action agreement probe"
+        write_training_progress("failed", status="failed", update=max(0, update - 1), error=message)
+        raise RuntimeError(message)
     if not (output_dir / "best.pt").exists():
         actor_critic.export_policy(
             output_dir / "best.pt",
@@ -1560,7 +2089,7 @@ def train_candidate(
         )
     (output_dir / "metrics.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     write_training_progress(
-        "completed",
+        "safety_stopped" if update_selection.get("status") == "safety_stopped" else "completed",
         status="completed",
         update=max(0, update - 1),
         cumulative_games=episode_index,
@@ -1775,9 +2304,7 @@ def _stage_checkpoint_sources(
     prior_short_best = stage_best("short-resattn8", "resattn8")
     predecessor_paths = list(prior_short_best) if stage == "medium-resattn8" else []
     if stage == "final-resattn8":
-        predecessor_paths.extend(
-            stage_best("medium-resattn8", "resattn8") + prior_short_best
-        )
+        predecessor_paths.extend(stage_best("medium-resattn8", "resattn8") + prior_short_best)
     if stage == "final-unet":
         predecessor_paths.extend(stage_best("probe-unet", "unet"))
     stage_inherit_from = (
@@ -1786,8 +2313,8 @@ def _stage_checkpoint_sources(
     inheritance = None
     if resume_from is None and stage_inherit_from is None:
         inheritance = _resolve_parent_checkpoint(run_dir, candidate, candidates, base_name)
-    inherit_from = stage_inherit_from if stage_inherit_from is not None else (
-        inheritance[0] if inheritance is not None else None
+    inherit_from = (
+        stage_inherit_from if stage_inherit_from is not None else (inheritance[0] if inheritance is not None else None)
     )
     parent = candidate if stage_inherit_from is not None else (inheritance[1] if inheritance is not None else None)
     return resume_from, inherit_from, parent
@@ -1871,6 +2398,19 @@ def candidate_result(
             rollout_precision=args.rollout_precision,
             rollout_compile=args.rollout_compile,
             rollout_batch_wait_ms=args.rollout_batch_wait_ms,
+            actor_lr_schedule=args.actor_lr_schedule,
+            actor_lr_floor_ratio=args.actor_lr_floor_ratio,
+            actor_lr_warmup_updates=args.actor_lr_warmup_updates,
+            actor_lr_stable_kl_low=args.actor_lr_stable_kl_low,
+            actor_lr_stable_kl_high=args.actor_lr_stable_kl_high,
+            actor_lr_reference_kl_high=args.actor_lr_reference_kl_high,
+            actor_lr_joint_clip_high=args.actor_lr_joint_clip_high,
+            base_action_probe_size=args.base_action_probe_size,
+            base_action_agreement_floor=args.base_action_agreement_floor,
+            diagnostic_every_updates=args.diagnostic_every_updates,
+            safety_teacher_regression_wins=args.safety_teacher_regression_wins,
+            safety_overall_regression_wins=args.safety_overall_regression_wins,
+            training_code_hash=training_code_sha256(Path(__file__).resolve().parents[1]),
             require_reward_v3=not getattr(args, "allow_legacy_reward", False),
         )
         milestone_selection: dict[str, object] = {"enabled": False}
@@ -2015,6 +2555,10 @@ def _apply_coordinator_manifest(args: argparse.Namespace, manifest: Mapping[str,
     for name in _RUN_MANIFEST_ARGUMENTS:
         if name in coordinator_args:
             setattr(args, name, coordinator_args[name])
+    if "actor_lr_schedule" not in coordinator_args:
+        args.actor_lr_schedule = "constant"
+        args.actor_lr_floor_ratio = 1.0
+        args.actor_lr_warmup_updates = 2
     if "curriculum_profile" not in coordinator_args and hasattr(args, "curriculum_profile"):
         args.curriculum_profile = "legacy"
         args.bc_anchor_max_turns = 64
@@ -2041,6 +2585,11 @@ def _apply_coordinator_manifest(args: argparse.Namespace, manifest: Mapping[str,
         )
         if rules_changed:
             raise ValueError("Lux S1 rules summary changed; start a new run directory")
+    expected_code_hash = manifest.get("training_code_sha256")
+    if expected_code_hash is not None:
+        repository = Path(__file__).resolve().parents[1]
+        if expected_code_hash != training_code_sha256(repository):
+            raise ValueError("Training code changed; preserve this run and start a new run directory")
 
 
 def _sync_api_claim(
@@ -2832,9 +3381,7 @@ def main(
         _validate_run_kind(existing_manifest, dry_run=args.dry_run)
         _apply_coordinator_manifest(args, existing_manifest)
     fixed_candidate_paths = _fixed_candidate_paths(args.fixed_candidate)
-    fixed_candidates = [
-        _load_fixed_candidate(path, island=island) for island, path in enumerate(fixed_candidate_paths)
-    ]
+    fixed_candidates = [_load_fixed_candidate(path, island=island) for island, path in enumerate(fixed_candidate_paths)]
     if existing_manifest is not None and fixed_candidate_paths:
         _validate_fixed_candidate_descriptors(fixed_candidate_paths, existing_manifest)
     if fixed_candidates:
@@ -2846,7 +3393,7 @@ def main(
         args.no_codex = True
     if args.islands < 1 or args.initial_per_island < 1 or args.generations < 0:
         raise ValueError("Population sizes must be positive")
-    if args.rollout_envs < 1 or args.decisions_per_update < 1:
+    if args.rollout_envs < 1 or args.decisions_per_update < 1 or args.episodes_per_update < 1:
         raise ValueError("Rollout environment and decision budgets must be positive")
     if args.rollout_batch_wait_ms < 0:
         raise ValueError("Rollout batch wait must be non-negative")
@@ -2856,6 +3403,23 @@ def main(
         raise ValueError("BC anchor max turns must be non-negative")
     if not 0.0 <= args.teacher_noninferiority_margin <= 0.1:
         raise ValueError("Teacher noninferiority margin must be in [0, 0.1]")
+    ActorLRScheduleConfig(
+        mode=args.actor_lr_schedule,
+        floor_ratio=args.actor_lr_floor_ratio,
+        warmup_updates=args.actor_lr_warmup_updates,
+        stable_kl_low=args.actor_lr_stable_kl_low,
+        stable_kl_high=args.actor_lr_stable_kl_high,
+        reference_kl_high=args.actor_lr_reference_kl_high,
+        joint_clip_high=args.actor_lr_joint_clip_high,
+    )
+    if args.base_action_probe_size < 1:
+        raise ValueError("Base action probe size must be positive")
+    if not 0.0 < args.base_action_agreement_floor <= 1.0:
+        raise ValueError("Base action agreement floor must be in (0, 1]")
+    if args.diagnostic_every_updates < 1:
+        raise ValueError("Diagnostic interval must be positive")
+    if args.safety_teacher_regression_wins < 0 or args.safety_overall_regression_wins < 0:
+        raise ValueError("Safety regression margins must be non-negative")
     repository = Path(__file__).resolve().parents[1]
     device = resolve_device(args.device)
     configure_rollout_determinism(device)
@@ -2883,6 +3447,7 @@ def main(
             "metric_schema_version": _METRIC_SCHEMA_VERSION,
             "created_at": time.time(),
             "git_revision": git_revision(repository),
+            "training_code_sha256": training_code_sha256(repository),
             "arguments": vars(args),
             "training_contract": {
                 "decoder_schema": "joint_sequential_v2",
@@ -2893,14 +3458,32 @@ def main(
                     if not args.dry_run and Path(args.teacher_checkpoint).exists()
                     else None
                 ),
+                "actor_lr_schedule": {
+                    "mode": args.actor_lr_schedule,
+                    "floor_ratio": args.actor_lr_floor_ratio,
+                    "warmup_updates": args.actor_lr_warmup_updates,
+                    "stable_kl_low": args.actor_lr_stable_kl_low,
+                    "stable_kl_high": args.actor_lr_stable_kl_high,
+                    "reference_kl_high": args.actor_lr_reference_kl_high,
+                    "joint_clip_high": args.actor_lr_joint_clip_high,
+                },
+                "base_action_probe": {
+                    "size": args.base_action_probe_size,
+                    "agreement_floor": args.base_action_agreement_floor,
+                },
+                "online_safety": {
+                    "diagnostic_every_updates": args.diagnostic_every_updates,
+                    "reference_kl_high": args.actor_lr_reference_kl_high,
+                    "teacher_regression_wins": args.safety_teacher_regression_wins,
+                    "overall_regression_wins": args.safety_overall_regression_wins,
+                },
+                "training_code_sha256": training_code_sha256(repository),
             },
             "device": str(device),
             "rollout_runtime": {
                 "backend_requested": args.rollout_backend,
                 "backend_effective": effective_backend,
-                "backend_fallback_reason": (
-                    "lockstep_acceptance_not_met" if args.rollout_backend == "auto" else None
-                ),
+                "backend_fallback_reason": ("lockstep_acceptance_not_met" if args.rollout_backend == "auto" else None),
                 "precision_requested": args.rollout_precision,
                 "precision_effective": effective_precision,
                 "compile_requested": args.rollout_compile,
@@ -2926,13 +3509,9 @@ def main(
             "training_curriculum": training_curriculum(args.curriculum_profile).to_dict(),
             "checkpoint_descriptors": {} if args.dry_run else _checkpoint_descriptors(args),
             "fixed_candidate_descriptor": (
-                _fixed_candidate_descriptor(fixed_candidate_paths[0])
-                if len(fixed_candidate_paths) == 1
-                else None
+                _fixed_candidate_descriptor(fixed_candidate_paths[0]) if len(fixed_candidate_paths) == 1 else None
             ),
-            "fixed_candidate_descriptors": [
-                _fixed_candidate_descriptor(path) for path in fixed_candidate_paths
-            ],
+            "fixed_candidate_descriptors": [_fixed_candidate_descriptor(path) for path in fixed_candidate_paths],
         }
         manifest["training_contract_hash"] = hashlib.sha256(
             json.dumps(manifest["training_contract"], sort_keys=True, separators=(",", ":")).encode()

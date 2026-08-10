@@ -17,6 +17,7 @@ from torch._inductor import config as inductor_config
 from torch.distributions import Categorical
 
 from examples.evolve_rl import (
+    AnchorBatchProvider,
     PhaseBalancedBatchSampler,
     _active_base_names,
     _apply_coordinator_manifest,
@@ -40,9 +41,11 @@ from examples.evolve_rl import (
     _save_stage_inheritance_checkpoint,
     _select_completed_stage,
     _select_teacher_milestone,
+    _select_update_evaluation,
     _stage_budget,
     _stage_checkpoint_sources,
     _sync_api_claim,
+    _update_safety_failures,
     _validate_candidate_provenance,
     _validate_checkpoint_descriptors,
     _validate_fixed_candidate_descriptor,
@@ -97,6 +100,7 @@ from luxai2021.rl.job_api import JobApiClient, JobApiServer
 from luxai2021.rl.metrics import GameMetrics, MetricContext, metrics_from_game
 from luxai2021.rl.policy import FullTurnActorCritic, RolloutAgent, _action_statistics
 from luxai2021.rl.ppo import (
+    ActorLRScheduleConfig,
     PPOConfig,
     PPOTrainer,
     _checkpoint_cuda_rng_state,
@@ -252,9 +256,7 @@ def test_normalized_reward_rejects_terminal_scale_that_shaping_can_reverse():
     with pytest.raises(ValueError, match="must exceed"):
         RewardProgram.from_dict(
             {
-                "components": [
-                    {"name": "signal", "expression": {"op": "metric", "name": "city_tiles"}, "weight": 5}
-                ],
+                "components": [{"name": "signal", "expression": {"op": "metric", "name": "city_tiles"}, "weight": 5}],
                 "reward_scale": 0.5,
                 "gamma": 0.995,
                 "terminal_reward_scale": 4.0,
@@ -487,9 +489,7 @@ def test_stranded_fuel_is_zero_for_no_city_and_one_connected_city():
     own_city = next(city for city in game.cities.values() if city.team == 0)
     origin = own_city.city_cells[0].pos
     adjacent = next(
-        cell
-        for cell in game.map.get_adjacent_cells(game.map.get_cell(origin.x, origin.y))
-        if not cell.is_city_tile()
+        cell for cell in game.map.get_adjacent_cells(game.map.get_cell(origin.x, origin.y)) if not cell.is_city_tile()
     )
     game.spawn_city_tile(0, adjacent.pos.x, adjacent.pos.y)
     assert len([city for city in game.cities.values() if city.team == 0]) == 1
@@ -587,9 +587,7 @@ def test_reward_and_ppo_gamma_must_match():
 def test_discounted_terminal_outcome_dominates_extreme_potential_shaping(horizon):
     program = RewardProgram.from_dict(
         {
-            "components": [
-                {"name": "signal", "expression": {"op": "metric", "name": "city_tiles"}, "weight": 5.0}
-            ],
+            "components": [{"name": "signal", "expression": {"op": "metric", "name": "city_tiles"}, "weight": 5.0}],
             "reward_scale": 0.35,
             "gamma": 0.999,
             "terminal_reward_scale": 10.0,
@@ -930,9 +928,7 @@ def test_canonicalization_classifies_feature_and_pure_crossover():
     feature["reward_program"]["components"].append(
         {"name": "added_units", "expression": {"op": "metric", "name": "units"}, "weight": 0.1}
     )
-    _, feature_candidate, feature_report = canonicalize_candidate_proposal(
-        feature, [parent], generation=1, island=3
-    )
+    _, feature_candidate, feature_report = canonicalize_candidate_proposal(feature, [parent], generation=1, island=3)
     assert feature_candidate.mutation_kind == "feature_existing"
     assert feature_report["mutation_scale"] == "feature"
 
@@ -1110,11 +1106,13 @@ def test_dense_shaping_curriculum_maintains_shaping_and_decays_bc():
     proposed = OpponentMix()
 
     assert curriculum.shaping_multiplier(0.0) == pytest.approx(1.0)
-    assert curriculum.shaping_multiplier(0.5) == pytest.approx(0.7)
+    assert curriculum.shaping_multiplier(0.24) == pytest.approx(0.8)
+    assert curriculum.shaping_multiplier(0.5) == pytest.approx(0.6304347826)
     assert curriculum.shaping_multiplier(1.0) == pytest.approx(0.25)
 
     assert curriculum.bc_coefficient_multiplier(0.0) == pytest.approx(1.0)
-    assert curriculum.bc_coefficient_multiplier(0.2) == pytest.approx(1.0)
+    assert curriculum.bc_coefficient_multiplier(0.24) == pytest.approx(0.9)
+    assert curriculum.bc_coefficient_multiplier(0.5) == pytest.approx(0.8434782609)
     assert curriculum.bc_coefficient_multiplier(0.7) == pytest.approx(0.8)
     assert curriculum.bc_coefficient_multiplier(1.0) == pytest.approx(0.2)
 
@@ -1152,14 +1150,7 @@ def test_game_budget_stage_offsets_and_budgets():
 def test_stage_checkpoint_sources_separate_inference_inheritance_from_exact_resume(tmp_path):
     candidate = initial_candidate(island=0, seed=7)
     candidates = {candidate.candidate_id: candidate}
-    short_best = (
-        tmp_path
-        / "artifacts"
-        / candidate.candidate_id
-        / "short-resattn8"
-        / "resattn8"
-        / "best.pt"
-    )
+    short_best = tmp_path / "artifacts" / candidate.candidate_id / "short-resattn8" / "resattn8" / "best.pt"
     short_best.parent.mkdir(parents=True)
     short_best.write_bytes(b"inference-only")
 
@@ -1187,14 +1178,7 @@ def test_stage_checkpoint_sources_separate_inference_inheritance_from_exact_resu
     assert inherit == short_best_rl
     assert parent == candidate
 
-    medium_latest = (
-        tmp_path
-        / "artifacts"
-        / candidate.candidate_id
-        / "medium-resattn8"
-        / "resattn8"
-        / "latest_rl.pt"
-    )
+    medium_latest = tmp_path / "artifacts" / candidate.candidate_id / "medium-resattn8" / "resattn8" / "latest_rl.pt"
     medium_latest.parent.mkdir(parents=True)
     medium_latest.write_bytes(b"optimizer-resume")
     resume, inherit, parent = _stage_checkpoint_sources(
@@ -1238,8 +1222,7 @@ def test_stage_best_rl_inherits_policy_and_value_without_optimizer_resume(tmp_pa
 
     assert modules == ["policy", "value_head"]
     assert all(
-        torch.equal(value, target.policy.state_dict()[name])
-        for name, value in source.policy.state_dict().items()
+        torch.equal(value, target.policy.state_dict()[name]) for name, value in source.policy.state_dict().items()
     )
     assert all(
         torch.equal(value, target.value_head.state_dict()[name])
@@ -1296,10 +1279,7 @@ def test_legacy_manifest_requires_a_new_run_for_metric_schema_change():
 def test_phase_balanced_sampler_covers_all_turn_strata():
     class Dataset:
         def __init__(self) -> None:
-            self.samples = [
-                (Path("r.json"), turn, 0)
-                for turn in (0, 30, 90, 110, 180, 190, 280, 310)
-            ]
+            self.samples = [(Path("r.json"), turn, 0) for turn in (0, 30, 90, 110, 180, 190, 280, 310)]
 
         def __len__(self) -> int:
             return len(self.samples)
@@ -1308,11 +1288,48 @@ def test_phase_balanced_sampler_covers_all_turn_strata():
     sampler = PhaseBalancedBatchSampler(dataset, 8, seed=7)
     batch = next(iter(sampler))
     strata = {
-        min(dataset.samples[index][1] // 90, 3) * 2 + int(dataset.samples[index][1] % 40 >= 30)
-        for index in batch
+        min(dataset.samples[index][1] // 90, 3) * 2 + int(dataset.samples[index][1] % 40 >= 30) for index in batch
     }
 
     assert strata == set(range(8))
+
+
+def test_anchor_batch_provider_restores_exact_sampler_position():
+    class EpochSampler:
+        def __init__(self) -> None:
+            self.epoch = 0
+
+        def __iter__(self) -> object:
+            order = list(range(6))
+            if self.epoch % 2:
+                order.reverse()
+            self.epoch += 1
+            yield from ([index] for index in order)
+
+        def __len__(self) -> int:
+            return 6
+
+    dataset = [{"value": torch.tensor(index)} for index in range(6)]
+    first_sampler = EpochSampler()
+    first = AnchorBatchProvider(
+        torch.utils.data.DataLoader(dataset, batch_sampler=first_sampler),
+        first_sampler,
+        sampling="test",
+    )
+    for _ in range(8):
+        first()
+    state = first.state_dict()
+    expected = first()["value"]
+
+    resumed_sampler = EpochSampler()
+    resumed = AnchorBatchProvider(
+        torch.utils.data.DataLoader(dataset, batch_sampler=resumed_sampler),
+        resumed_sampler,
+        sampling="test",
+    )
+    resumed.load_state_dict(state)
+
+    assert torch.equal(resumed()["value"], expected)
 
 
 def test_codex_generator_records_all_failure_types(tmp_path, monkeypatch):
@@ -1678,7 +1695,7 @@ def test_ppo_logs_approximate_kl_before_early_stopping():
         device=torch.device("cpu"),
         seed=31,
         opponent_name="small",
-        max_turns=4,
+        max_turns=8,
     )
     for record in episode.records:
         for decision in record.decisions:
@@ -1686,15 +1703,19 @@ def test_ppo_logs_approximate_kl_before_early_stopping():
         record.old_joint_log_prob += 0.5 * len(record.decisions)
     trainer = PPOTrainer(
         actor,
-        PPOConfig(update_epochs=2, minibatch_turns=4, bc_coefficient=0.0, target_kl=1e-6),
+        PPOConfig(update_epochs=1, minibatch_turns=1, bc_coefficient=0.0, target_kl=1e-6),
         torch.device("cpu"),
     )
 
     metrics = trainer.update([episode])
 
     assert metrics["approx_kl"] > 0.0
+    assert metrics["stable_approx_kl"] > 0.0
     assert metrics["early_stopped"] == 1.0
+    assert metrics["early_stop_reason"] == "stable_per_action_kl"
     assert metrics["epochs_completed"] == 1.0
+    assert metrics["minibatches_completed"] < metrics["minibatches_planned"]
+    assert metrics["early_stop_kl"] > metrics["early_stop_threshold"]
 
 
 def test_online_teacher_kl_calibrates_once_and_stays_in_bounds():
@@ -1737,6 +1758,138 @@ def test_parent_kl_and_parameter_constraint_are_absent_from_trainer():
     trainer.set_schedule_state(joint_update=3)
 
 
+def test_actor_lr_cosine_schedule_uses_global_progress_and_stable_kl_feedback():
+    schedule = ActorLRScheduleConfig(mode="cosine", floor_ratio=0.1, warmup_updates=2)
+    trainer = PPOTrainer(
+        FullTurnActorCritic(_small_policy()),
+        PPOConfig(),
+        torch.device("cpu"),
+        actor_lr_schedule=schedule,
+    )
+
+    trainer.set_schedule_state(joint_update=0, training_progress=0.0)
+    assert trainer.actor_lr_multiplier == pytest.approx(0.25)
+    groups = {group["group_name"]: group for group in trainer.optimizer.param_groups}
+    assert groups["policy"]["lr"] == pytest.approx(0.25 * trainer.config.learning_rate)
+    assert groups["value"]["lr"] == pytest.approx(trainer.config.learning_rate)
+
+    short_progress = 384 / (384 + 1536 + 6144)
+    trainer.set_schedule_state(joint_update=2, training_progress=short_progress)
+    assert trainer.actor_lr_multiplier > 0.99
+
+    trainer.set_schedule_state(joint_update=2, training_progress=0.5)
+    assert trainer.actor_lr_multiplier == pytest.approx(0.55)
+
+    trainer.set_schedule_state(
+        joint_update=3,
+        training_progress=0.5,
+        previous_stable_kl=0.02,
+        previous_joint_clip_fraction=0.10,
+    )
+    assert trainer.actor_lr_feedback_multiplier == pytest.approx(0.5)
+    assert trainer.actor_lr_multiplier == pytest.approx(0.275)
+
+    reference_guarded = PPOTrainer(
+        FullTurnActorCritic(_small_policy()),
+        PPOConfig(),
+        torch.device("cpu"),
+        actor_lr_schedule=schedule,
+    )
+    reference_guarded.set_schedule_state(
+        joint_update=2,
+        training_progress=0.0,
+        previous_stable_kl=0.0002,
+        previous_reference_kl=0.007,
+        previous_joint_clip_fraction=0.01,
+    )
+    assert reference_guarded.actor_lr_feedback_multiplier == pytest.approx(0.5)
+    assert reference_guarded.actor_lr_multiplier == pytest.approx(0.5)
+    assert reference_guarded.actor_lr_feedback_reason == "decay:reference_kl"
+
+
+def test_update_selection_uses_probe_gate_and_one_teacher_win_margin():
+    evaluations = [
+        {
+            "update": 3,
+            "teacher_score_rate": 0.125,
+            "teacher_game_count": 16,
+            "overall_score_rate": 0.34375,
+            "base_action_agreement": 0.984,
+        },
+        {
+            "update": 7,
+            "teacher_score_rate": 0.1875,
+            "teacher_game_count": 16,
+            "overall_score_rate": 0.28125,
+            "base_action_agreement": 0.981,
+        },
+        {
+            "update": 9,
+            "teacher_score_rate": 0.25,
+            "teacher_game_count": 16,
+            "overall_score_rate": 0.5,
+            "base_action_agreement": 0.97,
+        },
+    ]
+
+    selected = _select_update_evaluation(evaluations, base_action_agreement_floor=0.98)
+
+    assert selected is not None
+    assert selected["update"] == 3
+
+
+def test_online_update_safety_rejects_cumulative_drift_and_score_regression():
+    accepted = {
+        "teacher_score_rate": 0.25,
+        "overall_score_rate": 0.4375,
+    }
+    current = {
+        "teacher_score_rate": 0.0,
+        "teacher_game_count": 16,
+        "overall_score_rate": 0.21875,
+        "overall_game_count": 32,
+        "base_action_agreement": 0.9776,
+        "reference_kl": 0.0055,
+    }
+
+    failures = _update_safety_failures(
+        current,
+        accepted,
+        base_action_agreement_floor=0.995,
+        reference_kl_high=0.002,
+        teacher_regression_wins=1,
+        overall_regression_wins=2,
+    )
+
+    assert failures == [
+        "base_action_agreement",
+        "reference_kl",
+        "teacher_regression",
+        "overall_regression",
+    ]
+
+
+def test_online_update_safety_allows_bounded_matched_noise():
+    accepted = {"teacher_score_rate": 0.25, "overall_score_rate": 0.4375}
+    current = {
+        "teacher_score_rate": 0.1875,
+        "teacher_game_count": 16,
+        "overall_score_rate": 0.375,
+        "overall_game_count": 32,
+        "base_action_agreement": 0.996,
+        "reference_kl": 0.0015,
+    }
+
+    assert not _update_safety_failures(
+        current,
+        accepted,
+        base_action_agreement_floor=0.995,
+        reference_kl_high=0.002,
+        teacher_regression_wins=1,
+        overall_regression_wins=2,
+    )
+
+
 def test_critic_warmup_never_changes_policy_parameters():
     actor = FullTurnActorCritic(_small_policy())
     snapshot = copy.deepcopy(actor).eval()
@@ -1776,13 +1929,17 @@ def test_training_checkpoint_v2_restores_budget_progress_and_legacy_estimate(tmp
             "elapsed_seconds": 25.0,
             "constraint_progress": 789,
             "joint_update": 2,
+            "history": [{"update": 2}, {"update": 3}],
+            "bc_batch_provider_state": {"schema_version": 1, "total_batches": 17},
         },
+        training_contract_hash="contract-a",
     )
 
     restored = trainer.load_training_state(
         checkpoint_path,
         source_checkpoint="base.pt",
         reward_program=default_reward_program(),
+        training_contract_hash="contract-a",
     )
 
     assert restored.next_update == 4
@@ -1791,10 +1948,19 @@ def test_training_checkpoint_v2_restores_budget_progress_and_legacy_estimate(tmp
     assert restored.cumulative_episodes == 7
     assert restored.curriculum_progress_decisions == 789
     assert restored.joint_update == 2
+    assert restored.history == [{"update": 2}, {"update": 3}]
+    assert restored.bc_batch_provider_state == {"schema_version": 1, "total_batches": 17}
     trainer.set_schedule_state(
         joint_update=restored.joint_update,
     )
     assert trainer.actor_lr_multiplier == 1.0
+    with pytest.raises(ValueError, match="training contract"):
+        trainer.load_training_state(
+            checkpoint_path,
+            source_checkpoint="base.pt",
+            reward_program=default_reward_program(),
+            training_contract_hash="contract-b",
+        )
 
     legacy = torch.load(checkpoint_path, weights_only=False)
     legacy["schema_version"] = 1
@@ -1994,10 +2160,7 @@ def test_rollout_overlaps_teacher_and_candidate_without_changing_stored_logits()
         def submit_team_async(self, _snapshot, _team):
             self.async_calls += 1
             return ImmediateFuture(
-                {
-                    entity: torch.zeros(1, len(actions), 32, 32)
-                    for entity, actions in FIRST_PLACE_ACTION_SCHEMA.items()
-                }
+                {entity: torch.zeros(1, len(actions), 32, 32) for entity, actions in FIRST_PLACE_ACTION_SCHEMA.items()}
             )
 
     actor = FullTurnActorCritic(_small_policy()).eval()
@@ -2020,11 +2183,7 @@ def test_rollout_overlaps_teacher_and_candidate_without_changing_stored_logits()
         candidate.close()
     assert teacher.async_calls == len(episode.records)
     assert teacher.sync_calls == 0
-    assert all(
-        decision.teacher_logits is not None
-        for record in episode.records
-        for decision in record.decisions
-    )
+    assert all(decision.teacher_logits is not None for record in episode.records for decision in record.decisions)
 
 
 def test_batched_joint_margins_match_scalar_reference():
@@ -2032,12 +2191,7 @@ def test_batched_joint_margins_match_scalar_reference():
     masks = torch.tensor([[True, False, True], [True, False, False]])
 
     actual = BehaviorCloningAgent._joint_margins(logits, masks)
-    expected = torch.tensor(
-        [
-            BehaviorCloningAgent._joint_margin(row, mask)
-            for row, mask in zip(logits, masks)
-        ]
-    )
+    expected = torch.tensor([BehaviorCloningAgent._joint_margin(row, mask) for row, mask in zip(logits, masks)])
 
     assert torch.equal(actual, expected)
 
@@ -2391,9 +2545,7 @@ def test_teacher_guard_rejects_base_gain_that_regresses_teacher():
     ("candidate_stranded", "passes"),
     [(0.119, True), (0.121, False)],
 )
-def test_stranded_fuel_promotion_gate_uses_two_percent_noninferiority_margin(
-    candidate_stranded, passes
-):
+def test_stranded_fuel_promotion_gate_uses_two_percent_noninferiority_margin(candidate_stranded, passes):
     def evaluation(outcomes, stranded):
         games = [
             {
@@ -3154,15 +3306,15 @@ def test_infrastructure_failures_are_retryable_but_candidate_errors_are_not(tmp_
 
 
 def test_opponent_mix_allocate_counts_and_shuffles():
-    mix = OpponentMix(self_base=0.40, other_base=0.10, teacher=0.10, snapshot=0.40)
+    mix = OpponentMix(self_base=0.20, other_base=0.05, teacher=0.25, snapshot=0.50)
     rng = random.Random(42)  # noqa: S311
-    allocated = mix.allocate(16, rng)
+    allocated = [name for _ in range(1000) for name in mix.allocate(8, rng)]
 
-    assert len(allocated) == 16
-    assert allocated.count("self_base") == 6
-    assert allocated.count("snapshot") == 6
-    assert allocated.count("teacher") == 2
-    assert allocated.count("other_base") == 2
+    assert len(allocated) == 8000
+    assert allocated.count("self_base") / len(allocated) == pytest.approx(0.20, abs=0.015)
+    assert allocated.count("other_base") / len(allocated) == pytest.approx(0.05, abs=0.015)
+    assert allocated.count("teacher") / len(allocated) == pytest.approx(0.25, abs=0.015)
+    assert allocated.count("snapshot") / len(allocated) == pytest.approx(0.50, abs=0.015)
 
 
 def test_reward_program_modes():

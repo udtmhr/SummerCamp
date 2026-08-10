@@ -785,7 +785,15 @@ critic: AlphaStar applies it to a separate win/loss baseline, while using it her
 trajectories and could reinforce the City-expansion exploit. Add a separate terminal-only critic before enabling UPGO.
 
 `--resattn8-only` disables UNet opponents, probes, training, baselines, and final evaluation. New runs default to
-384/1,536/6,144 completed games for short/medium/final, with exactly 64 games per PPO update. Use
+384/1,536/6,144 completed games for short/medium/final, with 64 games per PPO update. The actor uses a two-update
+warmup followed by cosine decay to 10% of the candidate learning rate over the combined short+medium+final budget.
+Stable per-action KL above 0.0003, cumulative distilled-base reference KL above 0.006, or a joint clip fraction above
+0.08 halves the feedback multiplier for later updates. The default PPO early-stop target is 0.00025.
+PPO early stopping uses that non-negative per-action KL averaged over a complete epoch, rather than a single noisy
+joint-turn minibatch. Effective actor learning rate, completed/planned minibatches, and any stop reason are recorded
+in every update checkpoint. Diagnostic update selection rejects checkpoints below 98% action agreement on a fixed
+96-state phase-balanced base probe; among the remaining checkpoints, Teacher scores within one game are treated as
+tied and overall score breaks the tie. Use `--actor-lr-schedule constant` only for a controlled ablation. Use
 `--budget-unit decisions` with the legacy decision flags only for old manifests. A candidate runs
 8 Lux environments concurrently by default. `--rollout-backend lockstep` selects a rendezvous: candidate and opponent
 requests wait for all active games and then run as one fixed-size GPU batch. Games that finish early leave the rendezvous before
@@ -874,15 +882,24 @@ uv run --locked python examples/evolve_rl.py \
 Candidate definitions, failures, training checkpoints, league games, and the promotion report are written under the
 run directory so an interrupted search remains inspectable and resumable. Before the first checkpoint,
 `training_progress.json` reports initialization, reward calibration, critic warm-up, rollout waves, and PPO update
-phases; the same heartbeat is printed to the terminal. `latest_rl.pt` uses checkpoint schema v4 and
-stores cumulative decisions, turns, episodes, optimizer/RNG state, constraint progress, and the joint-update ramp.
+phases; the same heartbeat is printed to the terminal. `latest_rl.pt` uses checkpoint schema v6 and
+stores cumulative decisions, turns, episodes, optimizer/RNG state, curriculum progress, LR feedback state, history,
+and BC sampler position.
+Games-budget stages use one PPO epoch with 256-turn minibatches by default. The stage-entry policy is evaluated first;
+after every update, the same fixed base/Teacher seeds and stage-entry action probe are evaluated again. The update is rejected when stage-entry action
+agreement falls below 99.5%, reference KL exceeds 0.002, or matched Teacher/overall scores regress beyond the configured
+one-/two-win margins. Rejection restores `latest_rl.pt` from `accepted_rl.pt`, preserves the rejected diagnostic under
+`diagnostic_evaluations/`, and ends the stage; only accepted checkpoints can become `best.pt`/`best_rl.pt` or feed the
+next rollout. Start these settings in a new run directory because they are part of the immutable training contract.
+Use `configs/rl_candidates/terminal_only_v1.json` as a fixed control candidate when separating PPO/terminal credit
+assignment from dense-shaping misspecification; its shaping scale is exactly zero.
 Re-running a stage resumes its remaining decision budget. Each Teacher-selected inference `best.pt` has a matching
 `best_rl.pt`; short-to-medium and medium-to-final inheritance loads its policy and value head, resets optimizer/RNG and
 stage counters, then calibrates the critic before deciding whether warm-up is needed. Older runs without `best_rl.pt`
-fall back to policy-only `best.pt`. Schema-v1/v2 checkpoints remain loadable; a v1 checkpoint's
-consumed budget is conservatively estimated from its recorded elapsed-time fraction.
+fall back to policy-only `best.pt`. Schema-v5 and older training checkpoints remain usable for policy/value stage
+inheritance, but cannot exact-resume optimizer state because the policy and value optimizer groups changed.
 
-The first coordinator invocation owns the schema-v5 run manifest: later invocations reuse its checkpoint paths,
+The first coordinator invocation owns the schema-v8 run manifest: later invocations reuse its checkpoint paths,
 SHA-256 descriptors, Codex/deterministic generation mode, model, and training budgets instead of overwriting them with
 new CLI defaults. Runs without metric schema v3 remain untouched but must use a new run directory after this metric
 change. Every candidate has a separate immutable record under `provenance/`; accepted Codex outputs retain

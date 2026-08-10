@@ -81,14 +81,21 @@ class OpponentMix:
         if count <= 0:
             return []
         values = asdict(self)
-        raw_counts = {name: round(weight * count) for name, weight in values.items()}
-        current_sum = sum(raw_counts.values())
-        if current_sum != count:
-            diff = count - current_sum
-            sorted_names = sorted(values.keys(), key=lambda k: values[k], reverse=True)
-            for i in range(abs(diff)):
-                target_name = sorted_names[i % len(sorted_names)]
-                raw_counts[target_name] += 1 if diff > 0 else -1
+        exact_counts = {name: weight * count for name, weight in values.items()}
+        raw_counts = {name: math.floor(value) for name, value in exact_counts.items()}
+        fractional = {name: exact_counts[name] - raw_counts[name] for name in values}
+        for _ in range(count - sum(raw_counts.values())):
+            total = sum(fractional.values())
+            draw = rng.random() * total
+            cumulative = 0.0
+            selected = next(name for name, value in fractional.items() if value > 0.0)
+            for name, value in fractional.items():
+                cumulative += value
+                if draw <= cumulative:
+                    selected = name
+                    break
+            raw_counts[selected] += 1
+            fractional[selected] = 0.0
         allocated = []
         for name, n in raw_counts.items():
             allocated.extend([name] * max(0, n))
@@ -170,9 +177,9 @@ def training_curriculum(name: str) -> TrainingCurriculum:
         return TrainingCurriculum(
             name,
             ((0.0, 0.10), (1.0, 0.10)),
-            ((0.0, 1.0), (0.20, 1.0), (0.70, 0.50), (1.0, 0.25)),
+            ((0.0, 1.0), (0.10, 1.0), (0.24, 0.80), (0.70, 0.50), (1.0, 0.25)),
             snapshot_floor=0.10,
-            bc_coefficient_points=((0.0, 1.0), (0.20, 1.0), (0.70, 0.80), (1.0, 0.20)),
+            bc_coefficient_points=((0.0, 1.0), (0.10, 1.0), (0.24, 0.90), (0.70, 0.80), (1.0, 0.20)),
         )
     raise ValueError(f"Unknown curriculum profile: {name}")
 
@@ -757,9 +764,7 @@ def build_codex_prompt(
             "min_city_survival": "minimum individual-City survival; use for local collapse",
             "night_fuel_deficit": "relative signal oriented so larger is better",
             "own_night_fuel_deficit": "absolute own-team deficit; lower is better",
-            "stranded_fuel": (
-                "relative avoidable fuel concentration across disconnected Cities; larger is better"
-            ),
+            "stranded_fuel": ("relative avoidable fuel concentration across disconnected Cities; larger is better"),
             "own_stranded_fuel": (
                 "absolute own-team fuel simultaneously surplus in one City and needed by another; lower is better"
             ),
@@ -963,9 +968,7 @@ def _codex_result_feedback(result: CandidateResult) -> dict[str, Any]:
         "league_totals": evaluation.get("totals") if isinstance(evaluation, Mapping) else None,
         "diagnostics": {
             "city_tile_loss_turn_ranges": compress_turn_ranges(diagnostics.get("city_tile_loss_turns", ())),
-            "night_fuel_shortage_turn_ranges": compress_turn_ranges(
-                diagnostics.get("night_fuel_shortage_turns", ())
-            ),
+            "night_fuel_shortage_turn_ranges": compress_turn_ranges(diagnostics.get("night_fuel_shortage_turns", ())),
             "city_event_count": diagnostics.get("city_event_count", len(city_events)),
             "city_tiles_lost": diagnostics.get("city_tiles_lost", 0),
             "max_fuel_deficit": diagnostics.get(
@@ -1329,9 +1332,7 @@ def _max_night_start_stranded_snapshot(
 ) -> Mapping[str, Any] | None:
     night_starts = [event for event in fuel_snapshots if bool(event.get("night_start", False))]
     return (
-        max(night_starts, key=lambda event: float(event.get("stranded_fuel_fraction", 0.0)))
-        if night_starts
-        else None
+        max(night_starts, key=lambda event: float(event.get("stranded_fuel_fraction", 0.0))) if night_starts else None
     )
 
 
@@ -1365,12 +1366,9 @@ def summarize_diagnostic_events(metrics: Mapping[str, Any]) -> dict[str, object]
         "max_night_start_stranded_fuel_fraction": (
             float(max_stranded.get("stranded_fuel_fraction", 0.0)) if max_stranded is not None else None
         ),
-        "max_night_start_stranded_fuel_turn": (
-            int(max_stranded.get("turn", 0)) if max_stranded is not None else None
-        ),
+        "max_night_start_stranded_fuel_turn": (int(max_stranded.get("turn", 0)) if max_stranded is not None else None),
         "last_night_city_zero_count": sum(
-            int(event.get("turn", -1)) >= 350 and int(event.get("city_tiles", 0)) == 0
-            for event in fuel_snapshots
+            int(event.get("turn", -1)) >= 350 and int(event.get("city_tiles", 0)) == 0 for event in fuel_snapshots
         ),
         "city_loss_events": _representative_city_events(city_events),
         "illegal_action_turns": sorted({int(event["turn"]) for event in illegal_events}),
@@ -1423,9 +1421,7 @@ def compact_candidate_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
                         default=None,
                     ),
                     "max_night_start_stranded_fuel_fraction": (
-                        float(max_stranded.get("stranded_fuel_fraction", 0.0))
-                        if max_stranded is not None
-                        else None
+                        float(max_stranded.get("stranded_fuel_fraction", 0.0)) if max_stranded is not None else None
                     ),
                     "max_night_start_stranded_fuel_turn": (
                         int(max_stranded.get("turn", 0)) if max_stranded is not None else None

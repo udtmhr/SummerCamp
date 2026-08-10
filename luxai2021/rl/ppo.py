@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 # ruff: noqa: C901, EM102, FBT003, PLC0415, PLR0912, PLR0913, PLR0915, PLR2004, TC001, TC003
+import math
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, suppress
 from dataclasses import asdict, dataclass
@@ -25,7 +27,7 @@ from luxai2021.rl.policy import (
 )
 from luxai2021.rl.reward import RewardProgram
 
-TRAINING_CHECKPOINT_SCHEMA_VERSION = 4
+TRAINING_CHECKPOINT_SCHEMA_VERSION = 6
 AUTO_ROLLOUT_BACKEND = "threaded"
 
 
@@ -34,8 +36,9 @@ def resolve_rollout_backend(requested: str) -> str:
         raise ValueError(f"Unsupported rollout backend: {requested}")
     return AUTO_ROLLOUT_BACKEND if requested == "auto" else requested
 
+
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping
+    from collections.abc import Callable, Iterable
 
     from luxai2021.env.agent import Agent
 
@@ -51,11 +54,11 @@ class PPOConfig:
     entropy_coefficient: float = 0.001
     value_coefficient: float = 0.5
     kl_coefficient: float = 0.0
-    target_kl: float | None = 0.01
+    target_kl: float | None = 0.00025
     bc_coefficient: float = 0.05
     gradient_clip: float = 1.0
-    update_epochs: int = 2
-    minibatch_turns: int = 64
+    update_epochs: int = 1
+    minibatch_turns: int = 256
     illegal_action_coefficient: float = 0.01
     joint_action_policy: bool = True
     joint_loss_reference_actions: int = 32
@@ -85,12 +88,46 @@ class PPOConfig:
                 raise ValueError(f"{name} must be in [{low}, {high}]")
         if self.update_epochs < 1 or self.minibatch_turns < 1:
             raise ValueError("PPO update sizes must be positive")
+        if self.target_kl is not None and self.target_kl <= 0.0:
+            raise ValueError("target_kl must be positive when enabled")
         if self.joint_loss_reference_actions < 1:
             raise ValueError("joint_loss_reference_actions must be positive")
         if not 0.0 < self.teacher_kl_target_grad_ratio <= 2.0:
             raise ValueError("teacher_kl_target_grad_ratio must be in (0, 2]")
         if not 0.0 <= self.teacher_kl_coefficient_min <= self.teacher_kl_coefficient_max <= 1.0:
             raise ValueError("invalid teacher KL coefficient bounds")
+
+
+@dataclass(frozen=True)
+class ActorLRScheduleConfig:
+    mode: str = "constant"
+    floor_ratio: float = 1.0
+    warmup_updates: int = 2
+    stable_kl_low: float = 0.0001
+    stable_kl_high: float = 0.0003
+    reference_kl_high: float = 0.002
+    joint_clip_high: float = 0.08
+    feedback_decay: float = 0.5
+    feedback_growth: float = 1.2
+    feedback_patience: int = 3
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"constant", "cosine"}:
+            raise ValueError(f"Unsupported actor LR schedule: {self.mode}")
+        if not 0.0 < self.floor_ratio <= 1.0:
+            raise ValueError("actor LR floor ratio must be in (0, 1]")
+        if self.warmup_updates < 0:
+            raise ValueError("actor LR warmup updates must be non-negative")
+        if not 0.0 <= self.stable_kl_low < self.stable_kl_high:
+            raise ValueError("actor LR stable KL thresholds are invalid")
+        if self.reference_kl_high <= 0.0:
+            raise ValueError("actor LR reference KL threshold must be positive")
+        if not 0.0 < self.joint_clip_high <= 1.0:
+            raise ValueError("actor LR joint clip threshold must be in (0, 1]")
+        if not 0.0 < self.feedback_decay <= 1.0 or self.feedback_growth < 1.0:
+            raise ValueError("actor LR feedback factors are invalid")
+        if self.feedback_patience < 1:
+            raise ValueError("actor LR feedback patience must be positive")
 
 
 @dataclass(frozen=True)
@@ -110,6 +147,8 @@ class TrainingResumeState:
     source_checkpoint_mismatch: bool = False
     source_checkpoint_sha256: str | None = None
     source_checkpoint_sha256_mismatch: bool = False
+    history: list[dict[str, Any]] | None = None
+    bc_batch_provider_state: dict[str, Any] | None = None
 
 
 def _checkpoint_cuda_rng_state(checkpoint: Mapping[str, Any], device_index: int) -> torch.Tensor | None:
@@ -503,22 +542,38 @@ class PPOTrainer:
         reference_policy: torch.nn.Module | None = None,
         bc_batch_provider: Callable[[], Mapping[str, Tensor]] | None = None,
         illegal_action_coefficient: float | None = None,
+        actor_lr_schedule: ActorLRScheduleConfig | None = None,
     ) -> None:
         self.actor_critic = actor_critic
         self.reference_policy = reference_policy
         self.config = config
         self.device = device
         self.bc_batch_provider = bc_batch_provider
+        self.actor_lr_schedule = actor_lr_schedule or ActorLRScheduleConfig()
         self.illegal_action_coefficient = float(
-            config.illegal_action_coefficient
-            if illegal_action_coefficient is None
-            else illegal_action_coefficient
+            config.illegal_action_coefficient if illegal_action_coefficient is None else illegal_action_coefficient
         )
         self.actor_lr_multiplier = 1.0
+        self.actor_lr_schedule_multiplier = 1.0
+        self.actor_lr_feedback_multiplier = 1.0
+        self.actor_lr_feedback_reason = "initial"
+        self.actor_lr_low_kl_streak = 0
         self.bc_coefficient_multiplier = 1.0
         self.effective_teacher_kl_coefficient: float | None = None
+        self._teacher_kl_calibrated_this_update = False
         self.optimizer = torch.optim.AdamW(
-            actor_critic.parameters(),
+            [
+                {
+                    "params": list(actor_critic.policy.parameters()),
+                    "lr": config.learning_rate,
+                    "group_name": "policy",
+                },
+                {
+                    "params": list(actor_critic.value_head.parameters()),
+                    "lr": config.learning_rate,
+                    "group_name": "value",
+                },
+            ],
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
             fused=device.type == "cuda",
@@ -561,7 +616,7 @@ class PPOTrainer:
         return float(torch.sqrt(sum(gradient.float().square().sum() for gradient in finite)).detach())
 
     def _calibrate_teacher_kl(self, policy_loss: Tensor, teacher_kl: Tensor) -> None:
-        if self.effective_teacher_kl_coefficient is not None or not teacher_kl.requires_grad:
+        if self._teacher_kl_calibrated_this_update or not teacher_kl.requires_grad:
             return
         parameters = list(self.actor_critic.policy.encoder.parameters())
         policy_norm = self._gradient_norm(policy_loss, parameters)
@@ -569,10 +624,14 @@ class PPOTrainer:
         if not torch.isfinite(torch.tensor([policy_norm, teacher_norm])).all() or teacher_norm <= 0.0:
             raise FloatingPointError("Online teacher KL calibration produced an invalid gradient norm")
         coefficient = self.config.teacher_kl_target_grad_ratio * policy_norm / teacher_norm
-        self.effective_teacher_kl_coefficient = min(
+        calibrated = min(
             self.config.teacher_kl_coefficient_max,
             max(self.config.teacher_kl_coefficient_min, coefficient),
         )
+        if self.effective_teacher_kl_coefficient is not None:
+            calibrated = 0.8 * self.effective_teacher_kl_coefficient + 0.2 * calibrated
+        self.effective_teacher_kl_coefficient = calibrated
+        self._teacher_kl_calibrated_this_update = True
 
     def _priority_log_prob_and_entropy(
         self,
@@ -689,15 +748,11 @@ class PPOTrainer:
 
             priority_masks = torch.stack(
                 [
-                    decision.priority_legal_mask
-                    if decision.priority_legal_mask is not None
-                    else decision.legal_mask
+                    decision.priority_legal_mask if decision.priority_legal_mask is not None else decision.legal_mask
                     for _, decision in entity_decisions
                 ]
             ).to(self.device, dtype=torch.bool)
-            priority_distribution = Categorical(
-                logits=apply_legal_action_mask(logits, priority_masks).float()
-            )
+            priority_distribution = Categorical(logits=apply_legal_action_mask(logits, priority_masks).float())
             top = torch.topk(priority_distribution.probs, min(2, logits.shape[-1]), dim=-1).values
             margins = top[:, 0] - top[:, 1] if top.shape[-1] > 1 else top[:, 0]
             margins = torch.where(priority_masks.sum(dim=-1) <= 1, margins.new_full((), 20.0), margins)
@@ -753,11 +808,16 @@ class PPOTrainer:
             "teacher_kl": turn_teacher_kl,
             "reference_kl": turn_reference_kl,
             "illegal_loss": turn_illegal_loss,
-            "illegal_masses": torch.cat(illegal_masses),
+            "illegal_masses": torch.cat(illegal_masses) if illegal_masses else values.new_zeros(1),
             "action_counts": action_counts,
         }
 
-    def update(self, episodes: list[EpisodeTrajectory], *, record_grad_norms: bool = False) -> dict[str, float]:
+    def update(
+        self,
+        episodes: list[EpisodeTrajectory],
+        *,
+        record_grad_norms: bool = False,
+    ) -> dict[str, float | str | None]:
         records = calculate_gae(episodes, self.config)
         if not records:
             raise ValueError("Cannot update PPO without rollout turns")
@@ -771,11 +831,19 @@ class PPOTrainer:
         sampled_reference_kls: list[float] = []
         bc_anchor_seconds = 0.0
         early_stop = False
+        early_stop_reason: str | None = None
+        early_stop_kl = 0.0
+        early_stop_kl_max = 0.0
         epoch_count = 0
+        minibatches_per_epoch = math.ceil(len(records) / self.config.minibatch_turns)
+        minibatches_planned = minibatches_per_epoch * self.config.update_epochs
+        self._teacher_kl_calibrated_this_update = False
         for _ in range(self.config.update_epochs):
             if early_stop:
                 break
             epoch_count += 1
+            epoch_kl_sum = 0.0
+            epoch_kl_samples = 0
             order = torch.randperm(len(records), generator=generator).tolist()
             for start in range(0, len(order), self.config.minibatch_turns):
                 indices = order[start : start + self.config.minibatch_turns]
@@ -786,8 +854,11 @@ class PPOTrainer:
                 )
                 output, values = self.actor_critic.forward_tta(observations)
                 reference_output = None
+                # A single random minibatch was too noisy to act as a cumulative
+                # safety signal. Sample several minibatches even when reference KL
+                # is diagnostic-only.
                 measure_reference_kl = self.reference_policy is not None and (
-                    self.config.kl_coefficient > 0 or not sampled_reference_kls
+                    self.config.kl_coefficient > 0 or len(sampled_reference_kls) < 8
                 )
                 if measure_reference_kl:
                     with torch.no_grad():
@@ -806,10 +877,7 @@ class PPOTrainer:
                     [
                         record.old_joint_log_prob
                         if record.old_joint_log_prob is not None
-                        else sum(
-                            decision.old_log_prob + decision.priority_log_prob
-                            for decision in record.decisions
-                        )
+                        else sum(decision.old_log_prob + decision.priority_log_prob for decision in record.decisions)
                         for record in batch_records
                     ],
                     device=self.device,
@@ -818,10 +886,13 @@ class PPOTrainer:
                 ratios_tensor = torch.exp(log_ratios)
                 active_advantages = batch_advantages[active]
                 unclipped = ratios_tensor * active_advantages
-                clipped = ratios_tensor.clamp(
-                    1 - self.config.clip_range,
-                    1 + self.config.clip_range,
-                ) * active_advantages
+                clipped = (
+                    ratios_tensor.clamp(
+                        1 - self.config.clip_range,
+                        1 + self.config.clip_range,
+                    )
+                    * active_advantages
+                )
                 scale = float(self.config.joint_loss_reference_actions)
                 policy_loss = (-torch.minimum(unclipped, clipped) / scale).mean()
                 entropy = (statistics["entropy"][active] / scale).mean()
@@ -832,6 +903,14 @@ class PPOTrainer:
                 joint_approx_kls = -log_ratios
                 approx_kl = per_action_approx_kls.mean()
                 joint_kl = joint_approx_kls.mean()
+                # (ratio - 1) - log(ratio) is non-negative and considerably less
+                # sensitive to sampling noise than the signed -log(ratio) estimate.
+                # Normalize the full-turn ratio by the number of actions so the stop
+                # threshold does not depend on map size or the number of active units.
+                stable_per_action_kls = (
+                    ratios_tensor - 1.0 - log_ratios
+                ) / statistics["action_counts"][active].clamp_min(1)
+                stable_approx_kl = stable_per_action_kls.mean()
                 illegal_masses_tensor = statistics["illegal_masses"]
                 old_values = torch.tensor([record.value for record in batch_records], device=self.device)
                 returns = torch.tensor([record.return_value for record in batch_records], device=self.device)
@@ -848,9 +927,7 @@ class PPOTrainer:
                 if reference_output is not None:
                     sampled_reference_kls.append(float(kl.detach()))
                 if self.config.online_teacher_kl and any(
-                    decision.teacher_logits is not None
-                    for record in batch_records
-                    for decision in record.decisions
+                    decision.teacher_logits is not None for record in batch_records for decision in record.decisions
                 ):
                     self._calibrate_teacher_kl(policy_loss, teacher_kl)
                 teacher_coefficient = self.effective_teacher_kl_coefficient or 0.0
@@ -870,6 +947,7 @@ class PPOTrainer:
                 # One representative minibatch is sufficient; repeating this for every
                 # minibatch made the first/last update several times slower than training.
                 if record_grad_norms and not gn_pols:
+
                     def _gn() -> float:
                         grads = [p.grad for p in self.actor_critic.policy.encoder.parameters() if p.grad is not None]
                         if not grads:
@@ -903,10 +981,6 @@ class PPOTrainer:
 
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                if self.actor_lr_multiplier != 1.0:
-                    for parameter in self.actor_critic.policy.parameters():
-                        if parameter.grad is not None:
-                            parameter.grad.mul_(self.actor_lr_multiplier)
                 gradient_norm = torch.nn.utils.clip_grad_norm_(
                     self.actor_critic.parameters(),
                     self.config.gradient_clip,
@@ -919,6 +993,7 @@ class PPOTrainer:
                     "entropy": entropy,
                     "kl": kl,
                     "approx_kl": approx_kl,
+                    "stable_approx_kl": stable_approx_kl,
                     "joint_kl": joint_kl,
                     "joint_clip_fraction": ((ratios_tensor - 1.0).abs() > self.config.clip_range).float().mean(),
                     "joint_log_ratio_p95": torch.quantile(joint_approx_kls.abs(), 0.95),
@@ -936,12 +1011,30 @@ class PPOTrainer:
                 for name, value in batch_metrics.items():
                     totals[name] = totals.get(name, 0.0) + float(value.detach())
                 update_count += 1
+                active_turns = int(active.sum().item())
+                epoch_kl_sum += float(stable_approx_kl.detach()) * active_turns
+                epoch_kl_samples += active_turns
+                early_stop_kl_max = max(early_stop_kl_max, float(stable_approx_kl.detach()))
+                # Check a running epoch average after enough minibatches to avoid
+                # reacting to the noisy first batch. This remains effective when
+                # update_epochs=1, unlike an epoch-boundary-only check.
+                minimum_kl_check_batches = max(4, math.ceil(minibatches_per_epoch * 0.25))
                 if (
                     self.config.target_kl is not None
-                    and approx_kl.item() > 1.5 * self.config.target_kl
+                    and update_count >= minimum_kl_check_batches
+                    and update_count % minimum_kl_check_batches == 0
                 ):
-                    early_stop = True
-                    break
+                    running_kl = epoch_kl_sum / max(epoch_kl_samples, 1)
+                    if running_kl > 1.5 * self.config.target_kl:
+                        early_stop = True
+                        early_stop_reason = "stable_per_action_kl"
+                        break
+            # Evaluate KL only after a complete epoch. Stopping on one noisy
+            # full-turn minibatch caused every v4 update to terminate early.
+            early_stop_kl = epoch_kl_sum / max(epoch_kl_samples, 1)
+            if self.config.target_kl is not None and early_stop_kl > 1.5 * self.config.target_kl:
+                early_stop = True
+                early_stop_reason = "stable_per_action_kl"
         if update_count == 0:
             raise ValueError("PPO rollout contained no actionable entities")
         result = {name: value / update_count for name, value in totals.items() if update_count > 0}
@@ -950,7 +1043,15 @@ class PPOTrainer:
         # Preserve the legacy metric name while separating it from PPO's old/current approximate KL.
         result["kl"] = reference_kl
         result["early_stopped"] = float(early_stop)
+        result["early_stop_reason"] = early_stop_reason
+        result["early_stop_kl"] = early_stop_kl
+        result["early_stop_kl_max"] = early_stop_kl_max
+        result["early_stop_threshold"] = (
+            1.5 * self.config.target_kl if self.config.target_kl is not None else None
+        )
         result["epochs_completed"] = float(epoch_count)
+        result["minibatches_completed"] = float(update_count)
+        result["minibatches_planned"] = float(minibatches_planned)
         result["bc_anchor_seconds"] = bc_anchor_seconds
 
         updates = {
@@ -962,28 +1063,31 @@ class PPOTrainer:
 
         if record_grad_norms and gn_pols:
             import numpy as np
-            updates.update({
-                "grad_norm_samples": float(len(gn_pols)),
-                "grad_norm_policy_mean": float(np.mean(gn_pols)),
-                "grad_norm_policy_max": float(np.max(gn_pols)),
-                "grad_norm_policy_p95": float(np.percentile(gn_pols, 95)),
-                "grad_norm_value_mean": float(np.mean(gn_vals)),
-                "grad_norm_value_max": float(np.max(gn_vals)),
-                "grad_norm_value_p95": float(np.percentile(gn_vals, 95)),
-                "grad_norm_bc_mean": float(np.mean(gn_bcs)),
-                "grad_norm_bc_max": float(np.max(gn_bcs)),
-                "grad_norm_bc_p95": float(np.percentile(gn_bcs, 95)),
-                "grad_norm_teacher_mean": float(np.mean(gn_teachers)) if gn_teachers else 0.0,
-                "grad_norm_teacher_to_policy_ratio": (
-                    float(np.mean(gn_teachers)) / max(float(np.mean(gn_pols)), 1e-12) if gn_teachers else 0.0
-                ),
-                "grad_norm_illegal_mean": float(np.mean(gn_illegals)),
-                "grad_norm_illegal_max": float(np.max(gn_illegals)),
-                "grad_norm_illegal_p95": float(np.percentile(gn_illegals, 95)),
-                "grad_norm_policy_to_bc_ratio": float(np.mean(gn_pols)) / max(float(np.mean(gn_bcs)), 1e-12),
-                "grad_norm_policy_to_illegal_ratio": float(np.mean(gn_pols))
-                / max(float(np.mean(gn_illegals)), 1e-12),
-            })
+
+            updates.update(
+                {
+                    "grad_norm_samples": float(len(gn_pols)),
+                    "grad_norm_policy_mean": float(np.mean(gn_pols)),
+                    "grad_norm_policy_max": float(np.max(gn_pols)),
+                    "grad_norm_policy_p95": float(np.percentile(gn_pols, 95)),
+                    "grad_norm_value_mean": float(np.mean(gn_vals)),
+                    "grad_norm_value_max": float(np.max(gn_vals)),
+                    "grad_norm_value_p95": float(np.percentile(gn_vals, 95)),
+                    "grad_norm_bc_mean": float(np.mean(gn_bcs)),
+                    "grad_norm_bc_max": float(np.max(gn_bcs)),
+                    "grad_norm_bc_p95": float(np.percentile(gn_bcs, 95)),
+                    "grad_norm_teacher_mean": float(np.mean(gn_teachers)) if gn_teachers else 0.0,
+                    "grad_norm_teacher_to_policy_ratio": (
+                        float(np.mean(gn_teachers)) / max(float(np.mean(gn_pols)), 1e-12) if gn_teachers else 0.0
+                    ),
+                    "grad_norm_illegal_mean": float(np.mean(gn_illegals)),
+                    "grad_norm_illegal_max": float(np.max(gn_illegals)),
+                    "grad_norm_illegal_p95": float(np.percentile(gn_illegals, 95)),
+                    "grad_norm_policy_to_bc_ratio": float(np.mean(gn_pols)) / max(float(np.mean(gn_bcs)), 1e-12),
+                    "grad_norm_policy_to_illegal_ratio": float(np.mean(gn_pols))
+                    / max(float(np.mean(gn_illegals)), 1e-12),
+                }
+            )
 
         result.update(updates)
         return result
@@ -1004,8 +1108,62 @@ class PPOTrainer:
             hard_label_weight=0.0,
         )["loss"]
 
-    def set_schedule_state(self, *, joint_update: int, bc_coefficient_multiplier: float = 1.0) -> None:
-        self.actor_lr_multiplier = (0.25, 0.5, 1.0)[min(max(int(joint_update), 0), 2)]
+    def set_schedule_state(
+        self,
+        *,
+        joint_update: int,
+        training_progress: float = 0.0,
+        bc_coefficient_multiplier: float = 1.0,
+        previous_stable_kl: float | None = None,
+        previous_reference_kl: float | None = None,
+        previous_joint_clip_fraction: float | None = None,
+    ) -> None:
+        schedule = self.actor_lr_schedule
+        self.actor_lr_feedback_reason = "hold"
+        if previous_stable_kl is not None and previous_joint_clip_fraction is not None:
+            decay_reasons = []
+            if previous_stable_kl > schedule.stable_kl_high:
+                decay_reasons.append("stable_kl")
+            if previous_reference_kl is not None and previous_reference_kl > schedule.reference_kl_high:
+                decay_reasons.append("reference_kl")
+            if previous_joint_clip_fraction > schedule.joint_clip_high:
+                decay_reasons.append("joint_clip")
+            if decay_reasons:
+                self.actor_lr_feedback_multiplier *= schedule.feedback_decay
+                self.actor_lr_feedback_reason = "decay:" + "+".join(decay_reasons)
+                self.actor_lr_low_kl_streak = 0
+            elif previous_stable_kl < schedule.stable_kl_low:
+                self.actor_lr_low_kl_streak += 1
+                self.actor_lr_feedback_reason = "low_kl_wait"
+                if self.actor_lr_low_kl_streak >= schedule.feedback_patience:
+                    self.actor_lr_feedback_multiplier = min(
+                        1.0,
+                        self.actor_lr_feedback_multiplier * schedule.feedback_growth,
+                    )
+                    self.actor_lr_feedback_reason = "low_kl_recovery"
+                    self.actor_lr_low_kl_streak = 0
+            else:
+                self.actor_lr_low_kl_streak = 0
+
+        progress = min(max(float(training_progress), 0.0), 1.0)
+        if schedule.mode == "cosine":
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            self.actor_lr_schedule_multiplier = schedule.floor_ratio + (1.0 - schedule.floor_ratio) * cosine
+        else:
+            self.actor_lr_schedule_multiplier = 1.0
+        warmup = (0.25, 0.5, 1.0)[min(max(int(joint_update), 0), 2)] if schedule.warmup_updates else 1.0
+        if schedule.warmup_updates not in {0, 2}:
+            warmup = min(1.0, (max(int(joint_update), 0) + 1) / (schedule.warmup_updates + 1))
+        multiplier = warmup * self.actor_lr_schedule_multiplier * self.actor_lr_feedback_multiplier
+        self.actor_lr_multiplier = (
+            max(schedule.floor_ratio, multiplier) if int(joint_update) >= schedule.warmup_updates else multiplier
+        )
+        for group in self.optimizer.param_groups:
+            group["lr"] = (
+                self.config.learning_rate * self.actor_lr_multiplier
+                if group.get("group_name") == "policy"
+                else self.config.learning_rate
+            )
         self.bc_coefficient_multiplier = float(bc_coefficient_multiplier)
 
     def save_training_checkpoint(
@@ -1018,6 +1176,7 @@ class PPOTrainer:
         update: int,
         metrics: dict[str, Any],
         training_state: Mapping[str, Any] | None = None,
+        training_contract_hash: str | None = None,
     ) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         cuda_rng_state = (
@@ -1034,6 +1193,8 @@ class PPOTrainer:
                 "value_head": self.actor_critic.value_head.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
                 "ppo_config": asdict(self.config),
+                "actor_lr_schedule": asdict(self.actor_lr_schedule),
+                "training_contract_hash": training_contract_hash,
                 "reward_program": reward_program.to_dict(),
                 "update": update,
                 "metrics": metrics,
@@ -1041,6 +1202,8 @@ class PPOTrainer:
                 "decoder_schema": "joint_sequential_v2",
                 "inference_augmentation": "rot180",
                 "effective_teacher_kl_coefficient": self.effective_teacher_kl_coefficient,
+                "actor_lr_feedback_multiplier": self.actor_lr_feedback_multiplier,
+                "actor_lr_low_kl_streak": self.actor_lr_low_kl_streak,
                 "torch_rng_state": torch.get_rng_state(),
                 "cuda_rng_state": cuda_rng_state,
                 # Keep the old field readable by schema-v3 consumers without coupling it to visible GPU count.
@@ -1060,14 +1223,15 @@ class PPOTrainer:
         legacy_stage_seconds: int | None = None,
         allow_compatible_source_checkpoint: bool = False,
         budget_unit: str = "decisions",
+        training_contract_hash: str | None = None,
     ) -> TrainingResumeState:
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         schema_version = int(checkpoint.get("schema_version", 1))
-        if schema_version not in {1, 2, 3, TRAINING_CHECKPOINT_SCHEMA_VERSION}:
+        if schema_version not in {1, 2, 3, 4, 5, TRAINING_CHECKPOINT_SCHEMA_VERSION}:
             raise ValueError("Unsupported RL training checkpoint schema")
         if schema_version < TRAINING_CHECKPOINT_SCHEMA_VERSION:
             raise ValueError(
-                "RL checkpoint schema v3 or earlier cannot resume optimizer state; use policy/value stage inheritance"
+                "RL checkpoint schema v5 or earlier cannot resume optimizer state; use policy/value stage inheritance"
             )
         if checkpoint.get("decoder_schema") != "joint_sequential_v2":
             raise ValueError("RL resume decoder schema does not match")
@@ -1087,6 +1251,11 @@ class PPOTrainer:
             raise ValueError("RL resume source checkpoint SHA-256 does not match")
         if checkpoint.get("reward_program") != reward_program.to_dict():
             raise ValueError("RL resume reward program does not match")
+        if checkpoint.get("actor_lr_schedule") != asdict(self.actor_lr_schedule):
+            raise ValueError("RL resume actor LR schedule does not match")
+        if training_contract_hash is not None and checkpoint.get("training_contract_hash") != training_contract_hash:
+            message = "RL resume training contract does not match; preserve this run and start a new run directory"
+            raise ValueError(message)
         stored_ppo_config = dict(checkpoint.get("ppo_config", {}))
         # Schema-v3 checkpoints predate the explicit auxiliary-loss field.
         stored_ppo_config.setdefault("illegal_action_coefficient", 0.01)
@@ -1097,6 +1266,8 @@ class PPOTrainer:
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         coefficient = checkpoint.get("effective_teacher_kl_coefficient")
         self.effective_teacher_kl_coefficient = float(coefficient) if coefficient is not None else None
+        self.actor_lr_feedback_multiplier = float(checkpoint.get("actor_lr_feedback_multiplier", 1.0))
+        self.actor_lr_low_kl_streak = int(checkpoint.get("actor_lr_low_kl_streak", 0))
         if checkpoint.get("torch_rng_state") is not None:
             torch.set_rng_state(checkpoint["torch_rng_state"].to(device="cpu", dtype=torch.uint8))
         if self.device.type == "cuda" and torch.cuda.is_available():
@@ -1140,6 +1311,12 @@ class PPOTrainer:
             source_checkpoint_mismatch=source_checkpoint_mismatch,
             source_checkpoint_sha256=str(stored_source_sha256) if stored_source_sha256 is not None else None,
             source_checkpoint_sha256_mismatch=source_sha256_mismatch,
+            history=[dict(value) for value in state.get("history", [])],
+            bc_batch_provider_state=(
+                dict(state["bc_batch_provider_state"])
+                if isinstance(state.get("bc_batch_provider_state"), Mapping)
+                else None
+            ),
         )
 
     def load_training_checkpoint(
