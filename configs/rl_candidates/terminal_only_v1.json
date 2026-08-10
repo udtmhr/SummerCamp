@@ -6,6 +6,7 @@
     "teacher": 0.25
   },
   "ppo_config": {
+    "actionwise_clipping": true,
     "bc_coefficient": 0.05,
     "clip_range": 0.2,
     "entropy_coefficient": 0.001,

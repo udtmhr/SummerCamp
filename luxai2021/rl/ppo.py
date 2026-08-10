@@ -61,6 +61,7 @@ class PPOConfig:
     minibatch_turns: int = 256
     illegal_action_coefficient: float = 0.01
     joint_action_policy: bool = True
+    actionwise_clipping: bool = True
     joint_loss_reference_actions: int = 32
     online_teacher_kl: bool = True
     teacher_kl_target_grad_ratio: float = 0.33
@@ -149,6 +150,25 @@ class TrainingResumeState:
     source_checkpoint_sha256_mismatch: bool = False
     history: list[dict[str, Any]] | None = None
     bc_batch_provider_state: dict[str, Any] | None = None
+
+
+def _actionwise_clipped_surrogate(
+    new_log_probs: Tensor,
+    old_log_probs: Tensor,
+    turn_indices: Tensor,
+    turn_advantages: Tensor,
+    *,
+    clip_range: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Clip each valid decision factor and average over the minibatch factors."""
+    log_ratios = new_log_probs - old_log_probs
+    ratios = torch.exp(log_ratios)
+    advantages = turn_advantages[turn_indices]
+    unclipped = ratios * advantages
+    clipped = ratios.clamp(1.0 - clip_range, 1.0 + clip_range) * advantages
+    decision_surrogates = torch.minimum(unclipped, clipped)
+    loss = -decision_surrogates.mean()
+    return loss, log_ratios, ratios
 
 
 def _checkpoint_cuda_rng_state(checkpoint: Mapping[str, Any], device_index: int) -> torch.Tensor | None:
@@ -688,6 +708,8 @@ class PPOTrainer:
         action_counts = values.new_zeros(num_turns)
         illegal_masses: list[Tensor] = []
         priority_margins: dict[int, Tensor] = {}
+        decision_action_log_probs: dict[int, Tensor] = {}
+        decision_priority_log_probs: dict[int, Tensor] = {}
 
         for entity in output:
             entity_decisions = [
@@ -712,6 +734,9 @@ class PPOTrainer:
             distribution = Categorical(logits=apply_legal_action_mask(logits, masks).float())
             actions = torch.tensor([decision.action for _, decision in entity_decisions], device=self.device)
             selected_log_probs = distribution.log_prob(actions)
+            decision_action_log_probs.update(
+                {id(decision): selected_log_probs[index] for index, (_, decision) in enumerate(entity_decisions)}
+            )
             turn_action_log_prob = turn_action_log_prob.scatter_add(0, local_indices, selected_log_probs)
             turn_action_entropy = turn_action_entropy.scatter_add(0, local_indices, distribution.entropy())
             action_counts = action_counts.scatter_add(0, local_indices, torch.ones_like(selected_log_probs))
@@ -760,7 +785,7 @@ class PPOTrainer:
                 {id(decision): margins[index] for index, (_, decision) in enumerate(entity_decisions)}
             )
 
-        group_rows: list[tuple[int, list[Tensor]]] = []
+        group_rows: list[tuple[int, list[object], list[Tensor]]] = []
         for local_index, record in enumerate(batch_records):
             groups = {decision.priority_group for decision in record.decisions if decision.priority_group}
             for group in groups:
@@ -768,12 +793,14 @@ class PPOTrainer:
                     (decision for decision in record.decisions if decision.priority_group == group),
                     key=lambda decision: decision.priority_index,
                 )
-                group_rows.append((local_index, [priority_margins[id(decision)] for decision in ordered]))
+                group_rows.append(
+                    (local_index, ordered, [priority_margins[id(decision)] for decision in ordered])
+                )
 
         turn_priority_log_prob = values.new_zeros(num_turns)
         turn_priority_entropy = values.new_zeros(num_turns)
         if group_rows:
-            maximum = max(len(scores) for _, scores in group_rows)
+            maximum = max(len(scores) for _, _, scores in group_rows)
             padded = torch.stack(
                 [
                     torch.nn.functional.pad(
@@ -781,16 +808,21 @@ class PPOTrainer:
                         (0, maximum - len(scores)),
                         value=-1e9,
                     )
-                    for _, scores in group_rows
+                    for _, _, scores in group_rows
                 ]
             )
-            lengths = torch.tensor([len(scores) for _, scores in group_rows], device=self.device)
-            group_turns = torch.tensor([turn for turn, _ in group_rows], device=self.device)
+            lengths = torch.tensor([len(scores) for _, _, scores in group_rows], device=self.device)
+            group_turns = torch.tensor([turn for turn, _, _ in group_rows], device=self.device)
             positions = torch.arange(maximum, device=self.device)[None]
             valid = positions < lengths[:, None]
             suffix_logsumexp = torch.logcumsumexp(padded.flip(dims=(1,)), dim=1).flip(dims=(1,))
-            group_log_prob = ((padded - suffix_logsumexp) * valid).sum(dim=1)
+            selected_priority_log_probs = padded - suffix_logsumexp
+            group_log_prob = (selected_priority_log_probs * valid).sum(dim=1)
             turn_priority_log_prob = turn_priority_log_prob.scatter_add(0, group_turns, group_log_prob)
+            for row_index, (_, ordered, _) in enumerate(group_rows):
+                for position, decision in enumerate(ordered):
+                    if position + 1 < len(ordered):
+                        decision_priority_log_probs[id(decision)] = selected_priority_log_probs[row_index, position]
             for position in range(maximum):
                 active = lengths > position
                 if not bool(active.any()):
@@ -802,6 +834,21 @@ class PPOTrainer:
                     stage_distribution.entropy(),
                 )
 
+        decision_log_probs = []
+        decision_old_log_probs = []
+        decision_turn_indices = []
+        for local_index, record in enumerate(batch_records):
+            for decision in record.decisions:
+                action_log_prob = decision_action_log_probs[id(decision)]
+                decision_log_probs.append(action_log_prob)
+                decision_old_log_probs.append(float(decision.old_log_prob))
+                decision_turn_indices.append(local_index)
+                priority_log_prob = decision_priority_log_probs.get(id(decision))
+                if priority_log_prob is not None:
+                    decision_log_probs.append(priority_log_prob)
+                    decision_old_log_probs.append(float(decision.priority_log_prob))
+                    decision_turn_indices.append(local_index)
+
         return {
             "joint_log_prob": turn_action_log_prob + turn_priority_log_prob,
             "entropy": turn_action_entropy + turn_priority_entropy,
@@ -810,6 +857,9 @@ class PPOTrainer:
             "illegal_loss": turn_illegal_loss,
             "illegal_masses": torch.cat(illegal_masses) if illegal_masses else values.new_zeros(1),
             "action_counts": action_counts,
+            "decision_log_probs": torch.stack(decision_log_probs) if decision_log_probs else values.new_zeros(0),
+            "decision_old_log_probs": values.new_tensor(decision_old_log_probs),
+            "decision_turn_indices": torch.tensor(decision_turn_indices, device=self.device, dtype=torch.long),
         }
 
     def update(
@@ -885,31 +935,39 @@ class PPOTrainer:
                 log_ratios = statistics["joint_log_prob"][active] - old_joint_log_probs[active]
                 ratios_tensor = torch.exp(log_ratios)
                 active_advantages = batch_advantages[active]
-                unclipped = ratios_tensor * active_advantages
-                clipped = (
-                    ratios_tensor.clamp(
-                        1 - self.config.clip_range,
-                        1 + self.config.clip_range,
-                    )
-                    * active_advantages
-                )
                 scale = float(self.config.joint_loss_reference_actions)
-                policy_loss = (-torch.minimum(unclipped, clipped) / scale).mean()
+                if self.config.actionwise_clipping:
+                    policy_loss, action_log_ratios, action_ratios = _actionwise_clipped_surrogate(
+                        statistics["decision_log_probs"],
+                        statistics["decision_old_log_probs"],
+                        statistics["decision_turn_indices"],
+                        batch_advantages,
+                        clip_range=self.config.clip_range,
+                    )
+                else:
+                    unclipped = ratios_tensor * active_advantages
+                    clipped = (
+                        ratios_tensor.clamp(
+                            1 - self.config.clip_range,
+                            1 + self.config.clip_range,
+                        )
+                        * active_advantages
+                    )
+                    policy_loss = (-torch.minimum(unclipped, clipped) / scale).mean()
+                    action_log_ratios = log_ratios / statistics["action_counts"][active].clamp_min(1)
+                    action_ratios = torch.exp(action_log_ratios)
                 entropy = (statistics["entropy"][active] / scale).mean()
                 teacher_kl = (statistics["teacher_kl"][active] / scale).mean()
                 kl = (statistics["reference_kl"][active] / scale).mean()
                 illegal_action_loss = (statistics["illegal_loss"][active] / scale).mean()
-                per_action_approx_kls = -log_ratios / statistics["action_counts"][active].clamp_min(1)
                 joint_approx_kls = -log_ratios
-                approx_kl = per_action_approx_kls.mean()
+                approx_kl = (-action_log_ratios).mean()
                 joint_kl = joint_approx_kls.mean()
                 # (ratio - 1) - log(ratio) is non-negative and considerably less
                 # sensitive to sampling noise than the signed -log(ratio) estimate.
                 # Normalize the full-turn ratio by the number of actions so the stop
                 # threshold does not depend on map size or the number of active units.
-                stable_per_action_kls = (
-                    ratios_tensor - 1.0 - log_ratios
-                ) / statistics["action_counts"][active].clamp_min(1)
+                stable_per_action_kls = action_ratios - 1.0 - action_log_ratios
                 stable_approx_kl = stable_per_action_kls.mean()
                 illegal_masses_tensor = statistics["illegal_masses"]
                 old_values = torch.tensor([record.value for record in batch_records], device=self.device)
@@ -996,9 +1054,23 @@ class PPOTrainer:
                     "stable_approx_kl": stable_approx_kl,
                     "joint_kl": joint_kl,
                     "joint_clip_fraction": ((ratios_tensor - 1.0).abs() > self.config.clip_range).float().mean(),
+                    "action_clip_fraction": ((action_ratios - 1.0).abs() > self.config.clip_range).float().mean(),
+                    "policy_factor_clip_fraction": (
+                        ((action_ratios - 1.0).abs() > self.config.clip_range).float().mean()
+                    ),
+                    "clip_fraction": (
+                        ((action_ratios - 1.0).abs() > self.config.clip_range).float().mean()
+                        if self.config.actionwise_clipping
+                        else ((ratios_tensor - 1.0).abs() > self.config.clip_range).float().mean()
+                    ),
                     "joint_log_ratio_p95": torch.quantile(joint_approx_kls.abs(), 0.95),
                     "joint_log_ratio_max": joint_approx_kls.abs().max(),
+                    "action_log_ratio_p95": torch.quantile(action_log_ratios.abs(), 0.95),
+                    "action_log_ratio_max": action_log_ratios.abs().max(),
                     "actions_per_turn": statistics["action_counts"][active].mean(),
+                    "policy_factors_per_turn": action_log_ratios.new_tensor(
+                        action_log_ratios.numel() / max(int(active.sum().item()), 1)
+                    ),
                     "bc_loss": bc_loss,
                     "online_teacher_kl": teacher_kl,
                     "online_teacher_kl_coefficient": torch.tensor(teacher_coefficient, device=self.device),
@@ -1119,15 +1191,16 @@ class PPOTrainer:
         previous_joint_clip_fraction: float | None = None,
     ) -> None:
         schedule = self.actor_lr_schedule
+        # Retained in the resume/call API for old manifests; reference KL is
+        # diagnostic-only and must not influence LR feedback.
+        _ = previous_reference_kl
         self.actor_lr_feedback_reason = "hold"
         if previous_stable_kl is not None and previous_joint_clip_fraction is not None:
             decay_reasons = []
             if previous_stable_kl > schedule.stable_kl_high:
                 decay_reasons.append("stable_kl")
-            if previous_reference_kl is not None and previous_reference_kl > schedule.reference_kl_high:
-                decay_reasons.append("reference_kl")
             if previous_joint_clip_fraction > schedule.joint_clip_high:
-                decay_reasons.append("joint_clip")
+                decay_reasons.append("action_clip")
             if decay_reasons:
                 self.actor_lr_feedback_multiplier *= schedule.feedback_decay
                 self.actor_lr_feedback_reason = "decay:" + "+".join(decay_reasons)
@@ -1259,6 +1332,9 @@ class PPOTrainer:
         stored_ppo_config = dict(checkpoint.get("ppo_config", {}))
         # Schema-v3 checkpoints predate the explicit auxiliary-loss field.
         stored_ppo_config.setdefault("illegal_action_coefficient", 0.01)
+        # Older checkpoints used turn-joint clipping. Keep them readable, but
+        # require stage inheritance rather than silently changing the objective.
+        stored_ppo_config.setdefault("actionwise_clipping", False)
         if stored_ppo_config != asdict(self.config):
             raise ValueError("RL resume PPO configuration does not match")
         self.actor_critic.policy.load_state_dict(checkpoint["policy"])

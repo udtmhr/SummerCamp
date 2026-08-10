@@ -609,6 +609,8 @@ def proposal_schema() -> dict[str, Any]:
         field: (
             {"type": "number", "const": 0.0}
             if field == "kl_coefficient"
+            else {"type": "boolean", "const": True}
+            if field == "actionwise_clipping"
             else {"type": "boolean"}
             if field in {"joint_action_policy", "online_teacher_kl"}
             else {

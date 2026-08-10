@@ -103,6 +103,7 @@ from luxai2021.rl.ppo import (
     ActorLRScheduleConfig,
     PPOConfig,
     PPOTrainer,
+    _actionwise_clipped_surrogate,
     _checkpoint_cuda_rng_state,
     calculate_gae,
     collect_episode,
@@ -1058,6 +1059,7 @@ def test_codex_proposal_schema_uses_supported_structured_output_constructs():
     visit(schema)
     assert schema["properties"]["reward_program"]["properties"]["version"]["type"] == "integer"
     assert schema["properties"]["ppo_config"]["properties"]["kl_coefficient"]["const"] == 0.0
+    assert schema["properties"]["ppo_config"]["properties"]["actionwise_clipping"]["const"] is True
     assert schema["properties"]["parameter_constraint_coefficient"]["const"] == 0.0
     encoded = json.dumps(schema)
     assert "own_at_risk_city_tiles" in encoded
@@ -1650,6 +1652,7 @@ def test_short_full_turn_ppo_smoke_updates_finite_parameters(tmp_path):
     assert "approx_kl" in metrics
     assert abs(metrics["approx_kl"]) <= 1e-6
     assert metrics["joint_clip_fraction"] == pytest.approx(0.0)
+    assert metrics["action_clip_fraction"] == pytest.approx(0.0)
     assert "parameter_constraint_loss" not in metrics
     assert "parameter_constraint_coefficient" not in metrics
     checkpoint_path = tmp_path / "latest_rl.pt"
@@ -1716,6 +1719,76 @@ def test_ppo_logs_approximate_kl_before_early_stopping():
     assert metrics["epochs_completed"] == 1.0
     assert metrics["minibatches_completed"] < metrics["minibatches_planned"]
     assert metrics["early_stop_kl"] > metrics["early_stop_threshold"]
+
+
+def test_actionwise_clipping_avoids_joint_ratio_amplification():
+    new_log_probs = torch.full((32,), float(np.log(1.01)), requires_grad=True)
+    old_log_probs = torch.zeros(32)
+    turn_indices = torch.zeros(32, dtype=torch.long)
+    advantages = torch.ones(1)
+
+    loss, log_ratios, ratios = _actionwise_clipped_surrogate(
+        new_log_probs,
+        old_log_probs,
+        turn_indices,
+        advantages,
+        clip_range=0.2,
+    )
+
+    assert torch.exp(log_ratios.sum()) > 1.2
+    assert not bool(((ratios - 1.0).abs() > 0.2).any())
+    assert loss.item() == pytest.approx(-1.01)
+    loss.backward()
+    assert torch.isfinite(new_log_probs.grad).all()
+
+
+def test_actionwise_surrogate_averages_over_all_valid_minibatch_factors():
+    loss, _, _ = _actionwise_clipped_surrogate(
+        torch.zeros(4),
+        torch.zeros(4),
+        torch.tensor([0, 1, 1, 1]),
+        torch.tensor([1.0, 3.0]),
+        clip_range=0.2,
+    )
+
+    assert loss.item() == pytest.approx(-(1.0 + 3.0 + 3.0 + 3.0) / 4.0)
+
+
+def test_decision_factors_reconstruct_joint_log_probability_with_priority():
+    actor = FullTurnActorCritic(_small_policy())
+    snapshot = copy.deepcopy(actor).eval()
+    episode = collect_episode(
+        actor,
+        lambda: RolloutAgent(snapshot, device="cpu", deterministic=False),
+        default_reward_program(),
+        device=torch.device("cpu"),
+        seed=43,
+        opponent_name="small",
+        max_turns=4,
+    )
+    records = [record for record in episode.records if record.decisions]
+    observations = torch.stack([record.observation for record in records])
+    output, values = actor.forward_tta(observations)
+    trainer = PPOTrainer(actor, PPOConfig(), torch.device("cpu"))
+
+    statistics = trainer._vectorized_turn_statistics(output, values, records, None)
+    reconstructed = values.new_zeros(len(records)).scatter_add(
+        0,
+        statistics["decision_turn_indices"],
+        statistics["decision_log_probs"],
+    )
+    old_reconstructed = values.new_zeros(len(records)).scatter_add(
+        0,
+        statistics["decision_turn_indices"],
+        statistics["decision_old_log_probs"],
+    )
+
+    assert torch.allclose(reconstructed, statistics["joint_log_prob"], atol=1e-6)
+    assert torch.allclose(
+        old_reconstructed,
+        torch.tensor([record.old_joint_log_prob for record in records]),
+        atol=1e-6,
+    )
 
 
 def test_online_teacher_kl_calibrates_once_and_stays_in_bounds():
@@ -1789,25 +1862,25 @@ def test_actor_lr_cosine_schedule_uses_global_progress_and_stable_kl_feedback():
     assert trainer.actor_lr_feedback_multiplier == pytest.approx(0.5)
     assert trainer.actor_lr_multiplier == pytest.approx(0.275)
 
-    reference_guarded = PPOTrainer(
+    reference_diagnostic = PPOTrainer(
         FullTurnActorCritic(_small_policy()),
         PPOConfig(),
         torch.device("cpu"),
         actor_lr_schedule=schedule,
     )
-    reference_guarded.set_schedule_state(
+    reference_diagnostic.set_schedule_state(
         joint_update=2,
         training_progress=0.0,
         previous_stable_kl=0.0002,
         previous_reference_kl=0.007,
         previous_joint_clip_fraction=0.01,
     )
-    assert reference_guarded.actor_lr_feedback_multiplier == pytest.approx(0.5)
-    assert reference_guarded.actor_lr_multiplier == pytest.approx(0.5)
-    assert reference_guarded.actor_lr_feedback_reason == "decay:reference_kl"
+    assert reference_diagnostic.actor_lr_feedback_multiplier == pytest.approx(1.0)
+    assert reference_diagnostic.actor_lr_multiplier == pytest.approx(1.0)
+    assert reference_diagnostic.actor_lr_feedback_reason == "hold"
 
 
-def test_update_selection_uses_probe_gate_and_one_teacher_win_margin():
+def test_update_selection_uses_win_rates_not_base_drift_diagnostics():
     evaluations = [
         {
             "update": 3,
@@ -1832,13 +1905,13 @@ def test_update_selection_uses_probe_gate_and_one_teacher_win_margin():
         },
     ]
 
-    selected = _select_update_evaluation(evaluations, base_action_agreement_floor=0.98)
+    selected = _select_update_evaluation(evaluations)
 
     assert selected is not None
-    assert selected["update"] == 3
+    assert selected["update"] == 9
 
 
-def test_online_update_safety_rejects_cumulative_drift_and_score_regression():
+def test_online_update_safety_rejects_only_score_regression():
     accepted = {
         "teacher_score_rate": 0.25,
         "overall_score_rate": 0.4375,
@@ -1855,18 +1928,30 @@ def test_online_update_safety_rejects_cumulative_drift_and_score_regression():
     failures = _update_safety_failures(
         current,
         accepted,
-        base_action_agreement_floor=0.995,
-        reference_kl_high=0.002,
         teacher_regression_wins=1,
         overall_regression_wins=2,
     )
 
-    assert failures == [
-        "base_action_agreement",
-        "reference_kl",
-        "teacher_regression",
-        "overall_regression",
-    ]
+    assert failures == ["teacher_regression", "overall_regression"]
+
+
+def test_online_update_safety_ignores_base_agreement_and_reference_kl_drift():
+    accepted = {"teacher_score_rate": 0.25, "overall_score_rate": 0.4375}
+    current = {
+        "teacher_score_rate": 0.25,
+        "teacher_game_count": 16,
+        "overall_score_rate": 0.4375,
+        "overall_game_count": 32,
+        "base_action_agreement": 0.5,
+        "reference_kl": 1.0,
+    }
+
+    assert not _update_safety_failures(
+        current,
+        accepted,
+        teacher_regression_wins=1,
+        overall_regression_wins=2,
+    )
 
 
 def test_online_update_safety_allows_bounded_matched_noise():
@@ -1883,8 +1968,6 @@ def test_online_update_safety_allows_bounded_matched_noise():
     assert not _update_safety_failures(
         current,
         accepted,
-        base_action_agreement_floor=0.995,
-        reference_kl_high=0.002,
         teacher_regression_wins=1,
         overall_regression_wins=2,
     )

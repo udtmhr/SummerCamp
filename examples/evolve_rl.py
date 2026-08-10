@@ -99,7 +99,7 @@ _FATAL_CUDA_ERROR_MARKERS = (
 )
 _AUTOMATIC_INFRASTRUCTURE_RETRIES = 2
 _METRIC_SCHEMA_VERSION = 3
-_RUN_MANIFEST_SCHEMA_VERSION = 8
+_RUN_MANIFEST_SCHEMA_VERSION = 11
 _NATIVE_CPU_GATE_MIN_DECISIONS = 40_000
 _NATIVE_CPU_GATE_SHARE = 0.25
 _RETRYABLE_INFRASTRUCTURE_ERROR_MARKERS = (
@@ -253,8 +253,19 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0003,
     )
-    parser.add_argument("--actor-lr-reference-kl-high", type=float, default=0.002)
-    parser.add_argument("--actor-lr-joint-clip-high", type=float, default=0.08)
+    parser.add_argument(
+        "--actor-lr-reference-kl-high",
+        type=float,
+        default=0.002,
+        help="Diagnostic reference-KL alert threshold; does not change LR or stop training.",
+    )
+    parser.add_argument(
+        "--actor-lr-action-clip-high",
+        "--actor-lr-joint-clip-high",
+        dest="actor_lr_joint_clip_high",
+        type=float,
+        default=0.08,
+    )
     parser.add_argument("--base-action-probe-size", type=int, default=96)
     parser.add_argument("--base-action-agreement-floor", type=float, default=0.995)
     parser.add_argument("--diagnostic-every-updates", type=int, default=1)
@@ -773,23 +784,15 @@ def base_action_agreement(
 
 def _select_update_evaluation(
     evaluations: list[dict[str, object]],
-    *,
-    base_action_agreement_floor: float,
 ) -> dict[str, object] | None:
-    eligible = [
-        evaluation
-        for evaluation in evaluations
-        if evaluation.get("base_action_agreement") is None
-        or float(evaluation["base_action_agreement"]) >= base_action_agreement_floor
-    ]
-    if not eligible:
+    if not evaluations:
         return None
-    maximum_teacher_score = max(float(evaluation["teacher_score_rate"]) for evaluation in eligible)
-    teacher_game_count = max(int(evaluation.get("teacher_game_count", 0)) for evaluation in eligible)
+    maximum_teacher_score = max(float(evaluation["teacher_score_rate"]) for evaluation in evaluations)
+    teacher_game_count = max(int(evaluation.get("teacher_game_count", 0)) for evaluation in evaluations)
     one_win_margin = 1.0 / max(teacher_game_count, 1)
     contenders = [
         evaluation
-        for evaluation in eligible
+        for evaluation in evaluations
         if float(evaluation["teacher_score_rate"]) >= maximum_teacher_score - one_win_margin - 1e-12
     ]
     return max(
@@ -806,19 +809,11 @@ def _update_safety_failures(
     evaluation: Mapping[str, object],
     accepted: Mapping[str, object] | None,
     *,
-    base_action_agreement_floor: float,
-    reference_kl_high: float,
     teacher_regression_wins: int,
     overall_regression_wins: int,
 ) -> list[str]:
-    """Return hard drift and matched-score regressions for an update."""
+    """Return matched win/loss regressions for an update."""
     failures: list[str] = []
-    agreement = evaluation.get("base_action_agreement")
-    if agreement is not None and float(agreement) < base_action_agreement_floor:
-        failures.append("base_action_agreement")
-    reference_kl = evaluation.get("reference_kl")
-    if reference_kl is not None and float(reference_kl) > reference_kl_high:
-        failures.append("reference_kl")
     if accepted is None:
         return failures
 
@@ -1153,11 +1148,20 @@ def train_candidate(
     )
     training_contract = {
         "decoder_schema": "joint_sequential_v2",
+        "ppo_objective": (
+            "actionwise_clipped_global_factor_mean_v2"
+            if candidate.ppo_config.actionwise_clipping
+            else "joint_clipped_turn_advantage_v1"
+        ),
         "inference_augmentation": "rot180",
         "budget_unit": budget_unit,
         "teacher_checkpoint_sha256": teacher_checkpoint_sha256,
         "training_code_sha256": training_code_hash,
-        "actor_lr_schedule": asdict(lr_schedule),
+        "actor_lr_schedule": {
+            **asdict(lr_schedule),
+            "clip_metric": "action_clip_fraction",
+            "reference_kl_enforcement": "diagnostic_only",
+        },
         "training_curriculum": curriculum.to_dict(),
         "bc_anchor": {
             "enabled": bool(use_bc_anchor and candidate.ppo_config.bc_coefficient > 0),
@@ -1170,10 +1174,10 @@ def train_candidate(
             "enabled": bool(base_probe_batches),
             "size": base_action_probe_size,
             "agreement_floor": base_action_agreement_floor,
+            "enforcement": "diagnostic_only",
         },
         "online_safety": {
             "diagnostic_every_updates": diagnostic_every_updates,
-            "reference_kl_high": actor_lr_reference_kl_high,
             "teacher_regression_wins": safety_teacher_regression_wins,
             "overall_regression_wins": safety_overall_regression_wins,
         },
@@ -1496,14 +1500,15 @@ def train_candidate(
         }
         update_selection = {
             "schema_version": 3,
-            "selection_policy": "online_accept_then_teacher_one_win_margin_then_overall_then_latest",
+            "selection_policy": "online_win_loss_accept_then_teacher_one_win_margin_then_overall_then_latest",
             "status": "baseline",
             "seed_start": eval_seed_start,
             "seed_count": 8,
             "diagnostic_every_updates": diagnostic_every_updates,
             "base_action_probe_size": base_action_probe_size,
             "base_action_agreement_floor": base_action_agreement_floor,
-            "reference_kl_high": actor_lr_reference_kl_high,
+            "drift_metrics_enforcement": "diagnostic_only",
+            "stop_metrics": ["teacher_score_rate", "overall_score_rate"],
             "teacher_regression_wins": safety_teacher_regression_wins,
             "overall_regression_wins": safety_overall_regression_wins,
             "teacher_one_win_margin": 1.0 / max(len(initial_teacher_games), 1),
@@ -1642,8 +1647,9 @@ def train_candidate(
                     else None
                 ),
                 previous_joint_clip_fraction=(
-                    float(previous_metrics["joint_clip_fraction"])
-                    if previous_metrics.get("joint_clip_fraction") is not None
+                    float(previous_metrics.get("action_clip_fraction", previous_metrics.get("joint_clip_fraction")))
+                    if previous_metrics.get("action_clip_fraction") is not None
+                    or previous_metrics.get("joint_clip_fraction") is not None
                     else None
                 ),
             )
@@ -1857,15 +1863,10 @@ def train_candidate(
                     ),
                     "reference_kl": metrics.get("reference_kl"),
                 }
-                accepted_best = _select_update_evaluation(
-                    accepted_evaluations,
-                    base_action_agreement_floor=base_action_agreement_floor,
-                )
+                accepted_best = _select_update_evaluation(accepted_evaluations)
                 safety_failures = _update_safety_failures(
                     current_evaluation,
                     accepted_best,
-                    base_action_agreement_floor=base_action_agreement_floor,
-                    reference_kl_high=actor_lr_reference_kl_high,
                     teacher_regression_wins=safety_teacher_regression_wins,
                     overall_regression_wins=safety_overall_regression_wins,
                 )
@@ -1875,20 +1876,18 @@ def train_candidate(
                 evaluations.append(current_evaluation)
                 if update_accepted:
                     accepted_evaluations.append(current_evaluation)
-                selected = _select_update_evaluation(
-                    accepted_evaluations,
-                    base_action_agreement_floor=base_action_agreement_floor,
-                )
+                selected = _select_update_evaluation(accepted_evaluations)
                 update_selection = {
                     "schema_version": 3,
-                    "selection_policy": "online_accept_then_teacher_one_win_margin_then_overall_then_latest",
+                    "selection_policy": "online_win_loss_accept_then_teacher_one_win_margin_then_overall_then_latest",
                     "status": "accepted" if update_accepted else "safety_stopped",
                     "seed_start": eval_seed_start,
                     "seed_count": 8,
                     "diagnostic_every_updates": diagnostic_every_updates,
                     "base_action_probe_size": base_action_probe_size,
                     "base_action_agreement_floor": base_action_agreement_floor,
-                    "reference_kl_high": actor_lr_reference_kl_high,
+                    "drift_metrics_enforcement": "diagnostic_only",
+                    "stop_metrics": ["teacher_score_rate", "overall_score_rate"],
                     "teacher_regression_wins": safety_teacher_regression_wins,
                     "overall_regression_wins": safety_overall_regression_wins,
                     "teacher_one_win_margin": 1.0 / max(len(teacher_games), 1),
@@ -2065,14 +2064,6 @@ def train_candidate(
         json.dumps(rollout_runtime, indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    if (
-        update_selection.get("evaluations")
-        and update_selection.get("selected_checkpoint") is None
-        and update_selection.get("status") != "safety_stopped"
-    ):
-        message = "No diagnostic update passed the base action agreement probe"
-        write_training_progress("failed", status="failed", update=max(0, update - 1), error=message)
-        raise RuntimeError(message)
     if not (output_dir / "best.pt").exists():
         actor_critic.export_policy(
             output_dir / "best.pt",
@@ -2353,6 +2344,7 @@ def candidate_result(
     )
     curriculum_total_decisions = args.short_decisions + args.medium_decisions + args.final_decisions
     curriculum_total_games = args.short_games + args.medium_games + args.final_games
+    formal_evaluation_started = False
     try:
         checkpoint, training = train_candidate(
             candidate,
@@ -2425,6 +2417,20 @@ def candidate_result(
                 max_turns=args.max_turns,
             )
         anchors = _evaluation_anchors(args)
+        formal_evaluation_started = True
+        evaluation_progress_path = output_dir / "evaluation_progress.json"
+        EvolutionStore.write_json(
+            evaluation_progress_path,
+            {
+                "schema_version": 1,
+                "status": "running",
+                "phase": "formal_evaluation",
+                "checkpoint": str(checkpoint),
+                "seed_start": eval_seed_start,
+                "seed_count": eval_seeds,
+                "updated_at_unix": time.time(),
+            },
+        )
         evaluation = evaluate_against_league(
             LeagueMember(f"{candidate.candidate_id}-{base_name}", checkpoint),
             anchors,
@@ -2467,6 +2473,20 @@ def candidate_result(
             "milestone_selection": milestone_selection,
             "diagnostics_artifact": diagnostics_path.name,
         }
+        EvolutionStore.write_json(
+            evaluation_progress_path,
+            {
+                "schema_version": 1,
+                "status": "completed",
+                "phase": "formal_evaluation",
+                "checkpoint": str(checkpoint),
+                "seed_start": eval_seed_start,
+                "seed_count": eval_seeds,
+                "score_rate": score_rate,
+                "teacher_score_rate": teacher_score_rate,
+                "updated_at_unix": time.time(),
+            },
+        )
         return CandidateResult(
             candidate.candidate_id,
             stage,
@@ -2478,6 +2498,17 @@ def candidate_result(
             metrics,
         )
     except Exception as error:
+        if formal_evaluation_started:
+            EvolutionStore.write_json(
+                output_dir / "evaluation_progress.json",
+                {
+                    "schema_version": 1,
+                    "status": "failed",
+                    "phase": "formal_evaluation",
+                    "error": f"{type(error).__name__}: {error}",
+                    "updated_at_unix": time.time(),
+                },
+            )
         if _is_fatal_cuda_error(error):
             raise
         return CandidateResult(
@@ -3451,6 +3482,7 @@ def main(
             "arguments": vars(args),
             "training_contract": {
                 "decoder_schema": "joint_sequential_v2",
+                "ppo_objective": "actionwise_clipped_global_factor_mean_v2",
                 "inference_augmentation": "rot180",
                 "budget_unit": args.budget_unit,
                 "teacher_checkpoint_sha256": (
@@ -3466,14 +3498,16 @@ def main(
                     "stable_kl_high": args.actor_lr_stable_kl_high,
                     "reference_kl_high": args.actor_lr_reference_kl_high,
                     "joint_clip_high": args.actor_lr_joint_clip_high,
+                    "clip_metric": "action_clip_fraction",
+                    "reference_kl_enforcement": "diagnostic_only",
                 },
                 "base_action_probe": {
                     "size": args.base_action_probe_size,
                     "agreement_floor": args.base_action_agreement_floor,
+                    "enforcement": "diagnostic_only",
                 },
                 "online_safety": {
                     "diagnostic_every_updates": args.diagnostic_every_updates,
-                    "reference_kl_high": args.actor_lr_reference_kl_high,
                     "teacher_regression_wins": args.safety_teacher_regression_wins,
                     "overall_regression_wins": args.safety_overall_regression_wins,
                 },
