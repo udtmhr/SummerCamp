@@ -24,7 +24,7 @@
     "value_coefficient": 0.5,
     "weight_decay": 0.00001
   },
-  "rationale": "Rewards only night-survivable City expansion, prioritizes the weakest City, and penalizes deficit, stranded fuel, and linearly normalized cumulative night loss. TD(lambda) is used instead of UPGO.",
+  "rationale": "Keeps actionwise PPO but caps the actor LR at 1e-6, tightens per-factor clipping to 0.03, and relies on joint-policy drift guards plus matched base/Teacher evaluation to prevent forgetting.",
   "reward_program": {
     "components": [
       {"expression": {"name": "safe_city_tiles", "op": "metric"}, "name": "safe_city_tiles", "weight": 1.2},

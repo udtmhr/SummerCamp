@@ -45,11 +45,11 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class PPOConfig:
-    learning_rate: float = 5e-6
+    learning_rate: float = 1e-6
     weight_decay: float = 1e-5
     gamma: float = 0.999
     gae_lambda: float = 0.995
-    clip_range: float = 0.2
+    clip_range: float = 0.03
     value_clip_range: float = 0.2
     entropy_coefficient: float = 0.001
     value_coefficient: float = 0.5
@@ -74,7 +74,7 @@ class PPOConfig:
             "weight_decay": (0.0, 0.1),
             "gamma": (0.9, 1.0),
             "gae_lambda": (0.8, 1.0),
-            "clip_range": (0.05, 0.4),
+            "clip_range": (0.02, 0.4),
             "value_clip_range": (0.05, 0.5),
             "entropy_coefficient": (0.0, 0.1),
             "value_coefficient": (0.0, 2.0),
@@ -102,12 +102,14 @@ class PPOConfig:
 @dataclass(frozen=True)
 class ActorLRScheduleConfig:
     mode: str = "constant"
-    floor_ratio: float = 1.0
-    warmup_updates: int = 2
+    floor_ratio: float = 0.1
+    warmup_updates: int = 0
     stable_kl_low: float = 0.0001
     stable_kl_high: float = 0.0003
     reference_kl_high: float = 0.002
     joint_clip_high: float = 0.08
+    joint_kl_high: float = 0.01
+    joint_log_ratio_p95_high: float = 0.20
     feedback_decay: float = 0.5
     feedback_growth: float = 1.2
     feedback_patience: int = 3
@@ -125,6 +127,10 @@ class ActorLRScheduleConfig:
             raise ValueError("actor LR reference KL threshold must be positive")
         if not 0.0 < self.joint_clip_high <= 1.0:
             raise ValueError("actor LR joint clip threshold must be in (0, 1]")
+        if self.joint_kl_high <= 0.0:
+            raise ValueError("actor LR joint KL threshold must be positive")
+        if self.joint_log_ratio_p95_high <= 0.0:
+            raise ValueError("actor LR joint log-ratio p95 threshold must be positive")
         if not 0.0 < self.feedback_decay <= 1.0 or self.feedback_growth < 1.0:
             raise ValueError("actor LR feedback factors are invalid")
         if self.feedback_patience < 1:
@@ -1189,23 +1195,32 @@ class PPOTrainer:
         previous_stable_kl: float | None = None,
         previous_reference_kl: float | None = None,
         previous_joint_clip_fraction: float | None = None,
+        previous_joint_kl: float | None = None,
+        previous_joint_log_ratio_p95: float | None = None,
     ) -> None:
         schedule = self.actor_lr_schedule
         # Retained in the resume/call API for old manifests; reference KL is
         # diagnostic-only and must not influence LR feedback.
         _ = previous_reference_kl
         self.actor_lr_feedback_reason = "hold"
-        if previous_stable_kl is not None and previous_joint_clip_fraction is not None:
-            decay_reasons = []
-            if previous_stable_kl > schedule.stable_kl_high:
-                decay_reasons.append("stable_kl")
-            if previous_joint_clip_fraction > schedule.joint_clip_high:
-                decay_reasons.append("action_clip")
-            if decay_reasons:
-                self.actor_lr_feedback_multiplier *= schedule.feedback_decay
-                self.actor_lr_feedback_reason = "decay:" + "+".join(decay_reasons)
-                self.actor_lr_low_kl_streak = 0
-            elif previous_stable_kl < schedule.stable_kl_low:
+        decay_reasons = []
+        if previous_stable_kl is not None and previous_stable_kl > schedule.stable_kl_high:
+            decay_reasons.append("stable_kl")
+        if previous_joint_clip_fraction is not None and previous_joint_clip_fraction > schedule.joint_clip_high:
+            decay_reasons.append("action_clip")
+        if previous_joint_kl is not None and abs(previous_joint_kl) > schedule.joint_kl_high:
+            decay_reasons.append("joint_kl")
+        if (
+            previous_joint_log_ratio_p95 is not None
+            and previous_joint_log_ratio_p95 > schedule.joint_log_ratio_p95_high
+        ):
+            decay_reasons.append("joint_log_ratio_p95")
+        if decay_reasons:
+            self.actor_lr_feedback_multiplier *= schedule.feedback_decay
+            self.actor_lr_feedback_reason = "decay:" + "+".join(decay_reasons)
+            self.actor_lr_low_kl_streak = 0
+        elif previous_stable_kl is not None and previous_joint_clip_fraction is not None:
+            if previous_stable_kl < schedule.stable_kl_low:
                 self.actor_lr_low_kl_streak += 1
                 self.actor_lr_feedback_reason = "low_kl_wait"
                 if self.actor_lr_low_kl_streak >= schedule.feedback_patience:

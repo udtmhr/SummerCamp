@@ -99,7 +99,7 @@ _FATAL_CUDA_ERROR_MARKERS = (
 )
 _AUTOMATIC_INFRASTRUCTURE_RETRIES = 2
 _METRIC_SCHEMA_VERSION = 3
-_RUN_MANIFEST_SCHEMA_VERSION = 11
+_RUN_MANIFEST_SCHEMA_VERSION = 12
 _NATIVE_CPU_GATE_MIN_DECISIONS = 40_000
 _NATIVE_CPU_GATE_SHARE = 0.25
 _RETRYABLE_INFRASTRUCTURE_ERROR_MARKERS = (
@@ -150,6 +150,8 @@ _RUN_MANIFEST_ARGUMENTS = (
     "actor_lr_stable_kl_high",
     "actor_lr_reference_kl_high",
     "actor_lr_joint_clip_high",
+    "actor_lr_joint_kl_high",
+    "actor_lr_joint_log_ratio_p95_high",
     "base_action_probe_size",
     "base_action_agreement_floor",
     "diagnostic_every_updates",
@@ -236,9 +238,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--medium-count", type=int, default=8)
     parser.add_argument("--final-count", type=int, default=2)
     parser.add_argument("--episodes-per-update", type=int, default=64)
-    parser.add_argument("--actor-lr-schedule", choices=("constant", "cosine"), default="cosine")
+    parser.add_argument("--actor-lr-schedule", choices=("constant", "cosine"), default="constant")
     parser.add_argument("--actor-lr-floor-ratio", type=float, default=0.10)
-    parser.add_argument("--actor-lr-warmup-updates", type=int, default=2)
+    parser.add_argument("--actor-lr-warmup-updates", type=int, default=0)
     parser.add_argument(
         "--actor-lr-stable-kl-low",
         "--actor-lr-joint-kl-low",
@@ -266,6 +268,13 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.08,
     )
+    parser.add_argument(
+        "--actor-lr-turn-joint-kl-high",
+        dest="actor_lr_joint_kl_high",
+        type=float,
+        default=0.01,
+    )
+    parser.add_argument("--actor-lr-joint-log-ratio-p95-high", type=float, default=0.20)
     parser.add_argument("--base-action-probe-size", type=int, default=96)
     parser.add_argument("--base-action-agreement-floor", type=float, default=0.995)
     parser.add_argument("--diagnostic-every-updates", type=int, default=1)
@@ -809,27 +818,29 @@ def _update_safety_failures(
     evaluation: Mapping[str, object],
     accepted: Mapping[str, object] | None,
     *,
+    joint_kl_high: float,
+    joint_log_ratio_p95_high: float,
     teacher_regression_wins: int,
     overall_regression_wins: int,
 ) -> list[str]:
-    """Return matched win/loss regressions for an update."""
+    """Return joint-policy drift or matched win/loss regressions for an update."""
     failures: list[str] = []
+    joint_kl = evaluation.get("joint_kl")
+    if joint_kl is not None and abs(float(joint_kl)) > joint_kl_high:
+        failures.append("joint_kl")
+    joint_log_ratio_p95 = evaluation.get("joint_log_ratio_p95")
+    if joint_log_ratio_p95 is not None and float(joint_log_ratio_p95) > joint_log_ratio_p95_high:
+        failures.append("joint_log_ratio_p95")
     if accepted is None:
         return failures
 
     teacher_games = max(int(evaluation.get("teacher_game_count", 0)), 1)
     teacher_margin = max(teacher_regression_wins, 0) / teacher_games
-    if (
-        float(evaluation["teacher_score_rate"]) + teacher_margin + 1e-12
-        < float(accepted["teacher_score_rate"])
-    ):
+    if float(evaluation["teacher_score_rate"]) + teacher_margin + 1e-12 < float(accepted["teacher_score_rate"]):
         failures.append("teacher_regression")
     overall_games = max(int(evaluation.get("overall_game_count", 0)), 1)
     overall_margin = max(overall_regression_wins, 0) / overall_games
-    if (
-        float(evaluation["overall_score_rate"]) + overall_margin + 1e-12
-        < float(accepted["overall_score_rate"])
-    ):
+    if float(evaluation["overall_score_rate"]) + overall_margin + 1e-12 < float(accepted["overall_score_rate"]):
         failures.append("overall_regression")
     return failures
 
@@ -1058,12 +1069,14 @@ def train_candidate(
     rollout_compile: str = "auto",
     rollout_batch_wait_ms: float = 2.0,
     actor_lr_schedule: str = "constant",
-    actor_lr_floor_ratio: float = 1.0,
-    actor_lr_warmup_updates: int = 2,
+    actor_lr_floor_ratio: float = 0.1,
+    actor_lr_warmup_updates: int = 0,
     actor_lr_stable_kl_low: float = 0.0001,
     actor_lr_stable_kl_high: float = 0.0003,
     actor_lr_reference_kl_high: float = 0.002,
     actor_lr_joint_clip_high: float = 0.08,
+    actor_lr_joint_kl_high: float = 0.01,
+    actor_lr_joint_log_ratio_p95_high: float = 0.20,
     base_action_probe_size: int = 96,
     base_action_agreement_floor: float = 0.995,
     diagnostic_every_updates: int = 1,
@@ -1145,6 +1158,8 @@ def train_candidate(
         stable_kl_high=actor_lr_stable_kl_high,
         reference_kl_high=actor_lr_reference_kl_high,
         joint_clip_high=actor_lr_joint_clip_high,
+        joint_kl_high=actor_lr_joint_kl_high,
+        joint_log_ratio_p95_high=actor_lr_joint_log_ratio_p95_high,
     )
     training_contract = {
         "decoder_schema": "joint_sequential_v2",
@@ -1161,6 +1176,8 @@ def train_candidate(
             **asdict(lr_schedule),
             "clip_metric": "action_clip_fraction",
             "reference_kl_enforcement": "diagnostic_only",
+            "joint_kl_high": actor_lr_joint_kl_high,
+            "joint_log_ratio_p95_high": actor_lr_joint_log_ratio_p95_high,
         },
         "training_curriculum": curriculum.to_dict(),
         "bc_anchor": {
@@ -1178,6 +1195,8 @@ def train_candidate(
         },
         "online_safety": {
             "diagnostic_every_updates": diagnostic_every_updates,
+            "joint_kl_high": actor_lr_joint_kl_high,
+            "joint_log_ratio_p95_high": actor_lr_joint_log_ratio_p95_high,
             "teacher_regression_wins": safety_teacher_regression_wins,
             "overall_regression_wins": safety_overall_regression_wins,
         },
@@ -1499,7 +1518,7 @@ def train_candidate(
             "safety_failures": [],
         }
         update_selection = {
-            "schema_version": 3,
+            "schema_version": 4,
             "selection_policy": "online_win_loss_accept_then_teacher_one_win_margin_then_overall_then_latest",
             "status": "baseline",
             "seed_start": eval_seed_start,
@@ -1507,8 +1526,16 @@ def train_candidate(
             "diagnostic_every_updates": diagnostic_every_updates,
             "base_action_probe_size": base_action_probe_size,
             "base_action_agreement_floor": base_action_agreement_floor,
-            "drift_metrics_enforcement": "diagnostic_only",
-            "stop_metrics": ["teacher_score_rate", "overall_score_rate"],
+            "base_reference_drift_enforcement": "diagnostic_only",
+            "joint_drift_enforcement": "rollback_and_stage_stop",
+            "joint_kl_high": actor_lr_joint_kl_high,
+            "joint_log_ratio_p95_high": actor_lr_joint_log_ratio_p95_high,
+            "stop_metrics": [
+                "joint_kl",
+                "joint_log_ratio_p95",
+                "teacher_score_rate",
+                "overall_score_rate",
+            ],
             "teacher_regression_wins": safety_teacher_regression_wins,
             "overall_regression_wins": safety_overall_regression_wins,
             "teacher_one_win_margin": 1.0 / max(len(initial_teacher_games), 1),
@@ -1650,6 +1677,14 @@ def train_candidate(
                     float(previous_metrics.get("action_clip_fraction", previous_metrics.get("joint_clip_fraction")))
                     if previous_metrics.get("action_clip_fraction") is not None
                     or previous_metrics.get("joint_clip_fraction") is not None
+                    else None
+                ),
+                previous_joint_kl=(
+                    float(previous_metrics["joint_kl"]) if previous_metrics.get("joint_kl") is not None else None
+                ),
+                previous_joint_log_ratio_p95=(
+                    float(previous_metrics["joint_log_ratio_p95"])
+                    if previous_metrics.get("joint_log_ratio_p95") is not None
                     else None
                 ),
             )
@@ -1862,11 +1897,15 @@ def train_candidate(
                         probe_agreement is None or probe_agreement >= base_action_agreement_floor
                     ),
                     "reference_kl": metrics.get("reference_kl"),
+                    "joint_kl": metrics.get("joint_kl"),
+                    "joint_log_ratio_p95": metrics.get("joint_log_ratio_p95"),
                 }
                 accepted_best = _select_update_evaluation(accepted_evaluations)
                 safety_failures = _update_safety_failures(
                     current_evaluation,
                     accepted_best,
+                    joint_kl_high=actor_lr_joint_kl_high,
+                    joint_log_ratio_p95_high=actor_lr_joint_log_ratio_p95_high,
                     teacher_regression_wins=safety_teacher_regression_wins,
                     overall_regression_wins=safety_overall_regression_wins,
                 )
@@ -1878,7 +1917,7 @@ def train_candidate(
                     accepted_evaluations.append(current_evaluation)
                 selected = _select_update_evaluation(accepted_evaluations)
                 update_selection = {
-                    "schema_version": 3,
+                    "schema_version": 4,
                     "selection_policy": "online_win_loss_accept_then_teacher_one_win_margin_then_overall_then_latest",
                     "status": "accepted" if update_accepted else "safety_stopped",
                     "seed_start": eval_seed_start,
@@ -1886,8 +1925,16 @@ def train_candidate(
                     "diagnostic_every_updates": diagnostic_every_updates,
                     "base_action_probe_size": base_action_probe_size,
                     "base_action_agreement_floor": base_action_agreement_floor,
-                    "drift_metrics_enforcement": "diagnostic_only",
-                    "stop_metrics": ["teacher_score_rate", "overall_score_rate"],
+                    "base_reference_drift_enforcement": "diagnostic_only",
+                    "joint_drift_enforcement": "rollback_and_stage_stop",
+                    "joint_kl_high": actor_lr_joint_kl_high,
+                    "joint_log_ratio_p95_high": actor_lr_joint_log_ratio_p95_high,
+                    "stop_metrics": [
+                        "joint_kl",
+                        "joint_log_ratio_p95",
+                        "teacher_score_rate",
+                        "overall_score_rate",
+                    ],
                     "teacher_regression_wins": safety_teacher_regression_wins,
                     "overall_regression_wins": safety_overall_regression_wins,
                     "teacher_one_win_margin": 1.0 / max(len(teacher_games), 1),
@@ -2397,6 +2444,8 @@ def candidate_result(
             actor_lr_stable_kl_high=args.actor_lr_stable_kl_high,
             actor_lr_reference_kl_high=args.actor_lr_reference_kl_high,
             actor_lr_joint_clip_high=args.actor_lr_joint_clip_high,
+            actor_lr_joint_kl_high=args.actor_lr_joint_kl_high,
+            actor_lr_joint_log_ratio_p95_high=args.actor_lr_joint_log_ratio_p95_high,
             base_action_probe_size=args.base_action_probe_size,
             base_action_agreement_floor=args.base_action_agreement_floor,
             diagnostic_every_updates=args.diagnostic_every_updates,
@@ -3442,6 +3491,8 @@ def main(
         stable_kl_high=args.actor_lr_stable_kl_high,
         reference_kl_high=args.actor_lr_reference_kl_high,
         joint_clip_high=args.actor_lr_joint_clip_high,
+        joint_kl_high=args.actor_lr_joint_kl_high,
+        joint_log_ratio_p95_high=args.actor_lr_joint_log_ratio_p95_high,
     )
     if args.base_action_probe_size < 1:
         raise ValueError("Base action probe size must be positive")
@@ -3500,6 +3551,8 @@ def main(
                     "joint_clip_high": args.actor_lr_joint_clip_high,
                     "clip_metric": "action_clip_fraction",
                     "reference_kl_enforcement": "diagnostic_only",
+                    "joint_kl_high": args.actor_lr_joint_kl_high,
+                    "joint_log_ratio_p95_high": args.actor_lr_joint_log_ratio_p95_high,
                 },
                 "base_action_probe": {
                     "size": args.base_action_probe_size,
@@ -3508,6 +3561,8 @@ def main(
                 },
                 "online_safety": {
                     "diagnostic_every_updates": args.diagnostic_every_updates,
+                    "joint_kl_high": args.actor_lr_joint_kl_high,
+                    "joint_log_ratio_p95_high": args.actor_lr_joint_log_ratio_p95_high,
                     "teacher_regression_wins": args.safety_teacher_regression_wins,
                     "overall_regression_wins": args.safety_overall_regression_wins,
                 },

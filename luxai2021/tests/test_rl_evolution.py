@@ -1911,7 +1911,7 @@ def test_update_selection_uses_win_rates_not_base_drift_diagnostics():
     assert selected["update"] == 9
 
 
-def test_online_update_safety_rejects_only_score_regression():
+def test_online_update_safety_rejects_score_regression_without_joint_drift():
     accepted = {
         "teacher_score_rate": 0.25,
         "overall_score_rate": 0.4375,
@@ -1928,6 +1928,8 @@ def test_online_update_safety_rejects_only_score_regression():
     failures = _update_safety_failures(
         current,
         accepted,
+        joint_kl_high=0.01,
+        joint_log_ratio_p95_high=0.20,
         teacher_regression_wins=1,
         overall_regression_wins=2,
     )
@@ -1949,6 +1951,8 @@ def test_online_update_safety_ignores_base_agreement_and_reference_kl_drift():
     assert not _update_safety_failures(
         current,
         accepted,
+        joint_kl_high=0.01,
+        joint_log_ratio_p95_high=0.20,
         teacher_regression_wins=1,
         overall_regression_wins=2,
     )
@@ -1968,9 +1972,52 @@ def test_online_update_safety_allows_bounded_matched_noise():
     assert not _update_safety_failures(
         current,
         accepted,
+        joint_kl_high=0.01,
+        joint_log_ratio_p95_high=0.20,
         teacher_regression_wins=1,
         overall_regression_wins=2,
     )
+
+
+def test_joint_policy_drift_decays_lr_and_rejects_update():
+    schedule = ActorLRScheduleConfig(
+        floor_ratio=0.1,
+        joint_kl_high=0.01,
+        joint_log_ratio_p95_high=0.20,
+    )
+    trainer = PPOTrainer(
+        FullTurnActorCritic(_small_policy()),
+        PPOConfig(learning_rate=1e-6),
+        torch.device("cpu"),
+        actor_lr_schedule=schedule,
+    )
+    trainer.set_schedule_state(
+        joint_update=3,
+        previous_joint_kl=0.013,
+        previous_joint_log_ratio_p95=0.32,
+    )
+
+    assert trainer.actor_lr_feedback_multiplier == pytest.approx(0.5)
+    assert trainer.actor_lr_feedback_reason == "decay:joint_kl+joint_log_ratio_p95"
+    policy_group = next(group for group in trainer.optimizer.param_groups if group["group_name"] == "policy")
+    assert policy_group["lr"] <= 0.5e-6
+
+    failures = _update_safety_failures(
+        {
+            "joint_kl": 0.013,
+            "joint_log_ratio_p95": 0.32,
+            "teacher_score_rate": 0.25,
+            "teacher_game_count": 16,
+            "overall_score_rate": 0.5,
+            "overall_game_count": 32,
+        },
+        None,
+        joint_kl_high=0.01,
+        joint_log_ratio_p95_high=0.20,
+        teacher_regression_wins=1,
+        overall_regression_wins=2,
+    )
+    assert failures == ["joint_kl", "joint_log_ratio_p95"]
 
 
 def test_critic_warmup_never_changes_policy_parameters():
